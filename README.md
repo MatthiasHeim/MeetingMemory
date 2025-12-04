@@ -199,5 +199,85 @@ The source code of the editor can be found here: [https://github.com/kaixxx/noSc
 ## Other Software
 If you are interested in open source software for the analysis of qualitative data, take a look at [QualCoder](https://github.com/ccbogel/QualCoder) and [Taguette](https://www.taguette.org/).
 
+---
+
+## MeetingRecorder (macOS)
+
+**MeetingRecorder** is an optional companion tool that provides automatic recording and transcription of meetings, podcasts, or any audio playing on your Mac.
+
+### Features
+
+- **Menu bar app** for easy start/stop recording control
+- **Records both system audio AND microphone** simultaneously
+- **Automatic transcription** - recordings are automatically transcribed using noScribe
+- **Speaker detection** - identifies different speakers in the transcript
+- **Background service** - runs automatically at login
+
+### Requirements
+
+- macOS 14 (Sonoma) or newer with Apple Silicon (M1-M4)
+- [Background Music](https://github.com/kyleneideck/BackgroundMusic) app for system audio capture with volume control
+- noScribe installed from source (this repository)
+
+### Quick Start
+
+1. **Install Background Music:**
+   ```bash
+   brew install --cask background-music
+   ```
+
+2. **Create an Aggregate Device** in Audio MIDI Setup:
+   - Open `/Applications/Utilities/Audio MIDI Setup.app`
+   - Click `+` → Create Aggregate Device
+   - Check: Background Music (2ch) + your microphone
+   - Set sample rate to 48000 Hz
+
+3. **Install MeetingRecorder:**
+   ```bash
+   cd tools
+   ./install.sh
+   ```
+
+4. **Configure** `~/Documents/MeetingRecorder/config.yaml`:
+   ```yaml
+   audio:
+     device: "Aggregate Device"
+     sample_rate: 48000
+     channels: 3
+
+   noscribe:
+     path: "/path/to/noScribe/noScribe.py"
+     speaker_detection: "auto"
+   ```
+
+5. **Set Background Music output:**
+   - Click the Background Music icon in the menu bar
+   - Select your speakers/headphones as the output device
+
+### Usage
+
+- **Start recording:** Click the menu bar icon → Start Recording
+- **Stop recording:** Click the menu bar icon → Stop Recording
+- Recordings are saved to `~/Documents/MeetingRecorder/Recordings/`
+- Transcripts appear automatically in `~/Documents/MeetingRecorder/Transcripts/`
+
+### Components
+
+| File | Description |
+|------|-------------|
+| `tools/meeting_recorder.py` | Menu bar app for recording control |
+| `tools/transcribe_watcher.py` | Background service for automatic transcription |
+| `tools/install.sh` | Installation script |
+| `tools/uninstall.sh` | Uninstallation script |
+
+### Logs
+
+Check logs if something isn't working:
+```bash
+tail -f ~/Documents/MeetingRecorder/logs/watcher.log
+```
+
+For detailed audio setup instructions, see [tools/BLACKHOLE_SETUP.md](tools/BLACKHOLE_SETUP.md).
+
 
 

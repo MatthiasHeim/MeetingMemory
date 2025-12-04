@@ -1,0 +1,10 @@
+# Exclude macOS app bundles (they should be built locally)
+*.app/
+
+# Exclude test files
+test_*.py
+TEST_COMMANDS.md
+
+# Python cache
+__pycache__/
+*.pyc

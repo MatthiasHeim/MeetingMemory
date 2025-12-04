@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.meetingrecorder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Matthias/noScribe/venv/bin/python</string>
+        <string>/Users/Matthias/noScribe/tools/meeting_recorder.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Matthias/Documents/MeetingRecorder/logs/recorder_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Matthias/Documents/MeetingRecorder/logs/recorder_stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Matthias/noScribe</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
