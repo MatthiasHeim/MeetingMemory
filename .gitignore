@@ -23,6 +23,9 @@ models/precise/*
 models/fast/*
 !models/fast/NOSCRIBE_README.txt
 
+# Old requirement files
+environments/marked_for_deletion/
+
 .DS_Store
 stuff/
 output/
@@ -40,3 +43,10 @@ diarize_x86_64_mod_unsigned
 .python-version
 /pyinstaller/win_installer
 /.history-memo
+.mcp.json
+.env
+.env.mcp
+.env.example
+workflows/
+transcript-mcp-server/
+.claude/

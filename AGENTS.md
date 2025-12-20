@@ -1,1 +1,0 @@
-Main app is in noScribe.py
