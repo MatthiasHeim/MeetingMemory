@@ -117,6 +117,38 @@ git clone https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo mo
 python3 ./noScribe.py
 ```
 
+#### macOS Apple Silicon From Source
+
+For macOS with Apple Silicon (M1-M4), the setup is similar to Linux but uses the macOS-specific requirements file.
+
+**Prerequisites:**
+- Python 3.12 (install via Homebrew: `brew install python@3.12`)
+- Rosetta 2 for the bundled ffmpeg: `softwareupdate --install-rosetta`
+
+```bash
+git clone https://github.com/kaixxx/noScribe.git
+cd noScribe
+
+# Install noScribeEdit
+rm -rf noScribeEdit/
+git clone https://github.com/kaixxx/noScribeEditor.git noScribeEdit
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies (use macOS ARM requirements)
+pip install -r environments/requirements_macOS_arm64.txt
+pip install -r noScribeEdit/environments/requirements.txt
+
+# Download model files
+rm -rf models/fast models/precise
+git clone https://huggingface.co/mukowaty/faster-whisper-int8 models/fast
+git clone https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo models/precise
+
+# Run noScribe
+python3 ./noScribe.py
+```
 
 ### Old versions:
 - [https://drive.switch.ch/index.php/s/EIVup04qkSHb54j](https://drive.switch.ch/index.php/s/EIVup04qkSHb54j)
@@ -278,6 +310,57 @@ tail -f ~/Documents/MeetingRecorder/logs/watcher.log
 ```
 
 For detailed audio setup instructions, see [tools/BLACKHOLE_SETUP.md](tools/BLACKHOLE_SETUP.md).
+
+### n8n Workflow Integration (Optional)
+
+MeetingRecorder can optionally send completed transcripts to an n8n workflow for automated processing. This enables features like:
+
+- **Automatic meeting summaries** using LLM analysis
+- **Action item extraction** from meeting content
+- **Database storage** of meetings, topics, and participants
+- **Email notifications** with meeting recaps
+
+#### Setup
+
+1. **Install n8n** (self-hosted or cloud):
+   ```bash
+   # Docker (recommended)
+   docker run -d --name n8n -p 5678:5678 n8nio/n8n
+
+   # Or npm
+   npm install -g n8n && n8n start
+   ```
+
+2. **Create a webhook workflow** in n8n that accepts POST requests with:
+   ```json
+   {
+     "transcript_path": "/path/to/transcript.html",
+     "transcript_html": "<html>...</html>",
+     "started_at": "2025-01-01T00:00:00Z",
+     "audio_duration_seconds": 3600
+   }
+   ```
+
+3. **Configure the webhook URL** in `~/Documents/MeetingRecorder/config.yaml`:
+   ```yaml
+   webhook:
+     url: "http://localhost:5678/webhook/transcript-processor"
+   ```
+
+4. **Set up a PostgreSQL database** (optional, for storing meeting data):
+   - Use [Neon](https://neon.tech) (serverless Postgres) or local PostgreSQL
+   - Create tables for meetings, topics, action_items, clients, etc.
+   - Connect n8n to the database using the Postgres node
+
+#### Example Workflow
+
+A typical n8n workflow for transcript processing:
+1. **Webhook trigger** - receives transcript from MeetingRecorder
+2. **LLM analysis** - extract summary, topics, decisions, action items
+3. **Database storage** - save to PostgreSQL
+4. **Email notification** - send meeting recap to participants
+
+The transcript watcher (`tools/transcribe_watcher.py`) automatically sends transcripts to your configured webhook URL after each successful transcription.
 
 
 
