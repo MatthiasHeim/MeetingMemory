@@ -1,4 +1,70 @@
-﻿# noScribe
+# MeetingMemory
+
+> **AI-Powered Meeting Transcription, Analysis & Intelligence**
+
+MeetingMemory is an enhanced fork of [noScribe](https://github.com/kaixxx/noScribe) by Kai Dröge that adds automated meeting recording, intelligent processing, and AI-powered meeting retrieval.
+
+## What Makes MeetingMemory Different?
+
+| Feature | Original noScribe | MeetingMemory |
+|---------|-------------------|---------------|
+| Local transcription | ✅ | ✅ |
+| Speaker diarization | ✅ | ✅ |
+| GUI editor | ✅ | ✅ |
+| Automatic recording | ❌ | ✅ macOS menu bar app |
+| Auto-transcription | ❌ | ✅ Background service |
+| LLM analysis | ❌ | ✅ Summaries, key points, sentiment |
+| Database storage | ❌ | ✅ PostgreSQL with vector search |
+| Calendar integration | ❌ | ✅ Google Calendar correlation |
+| AI chat access | ❌ | ✅ MCP server for Claude/AI assistants |
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            MeetingMemory System                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐    ┌───────────────┐    ┌──────────────────────────────┐  │
+│  │   Recording  │    │ Transcription │    │      N8N Processing          │  │
+│  │              │    │               │    │                              │  │
+│  │ Menu Bar App │───>│   noScribe    │───>│  Webhook ──> LLM Analysis    │  │
+│  │   (macOS)    │    │  (Whisper +   │    │     │           │            │  │
+│  │              │    │   pyannote)   │    │     v           v            │  │
+│  └──────────────┘    └───────────────┘    │  Calendar   PostgreSQL       │  │
+│         │                    │            │  Lookup     + Embeddings     │  │
+│         v                    v            └──────────────────────────────┘  │
+│  ~/MeetingRecorder/   ~/MeetingRecorder/           │                        │
+│    Recordings/          Transcripts/               v                        │
+│                                           ┌──────────────────────────────┐  │
+│                                           │      AI Chat Access          │  │
+│                                           │                              │  │
+│                                           │  MCP Server ──> Claude Code  │  │
+│                                           │       │                      │  │
+│                                           │       v                      │  │
+│                                           │  "What did we discuss        │  │
+│                                           │   in yesterday's meeting?"   │  │
+│                                           └──────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Quick Start
+
+### Option 1: Full Automation Stack (Recommended)
+
+1. **Install noScribe from source** (see [Installation from Source](#macos-apple-silicon-from-source))
+2. **Install MeetingRecorder** for automatic recording/transcription
+3. **Set up N8N workflow** for intelligent processing
+4. **Configure MCP server** for AI chat access
+
+### Option 2: Just Transcription
+
+Use noScribe standalone for manual audio transcription - see [noScribe Usage](#noscribe-usage) below.
+
+---
+
+# noScribe
+
 > ## Cutting Edge AI Technology for Automated Audio Transcription
 
 ## What is noScribe?
@@ -24,7 +90,7 @@
 ## Why the Name "noScribe"?
 The [urban dictionary](https://www.urbandictionary.com/define.php?term=Scribe) defines **scribe** as *"a person whose entire miserable existence has been reduced to academic grunge and pain".* I hope this software will make your academic life a little less painful and grungy, hence the name noScribe :)
 
-## About Me
+## About the Original Author
 **Kai Dröge**, PhD in sociology (with a background in computer science), qualitative researcher and teacher, [Lucerne University for Applied Science (Switzerland)](https://www.hslu.ch/de-ch/hochschule-luzern/ueber-uns/personensuche/profile/?pid=823) and [Institute for Social Research, Frankfurt/M. (Germany)](https://www.ifs.uni-frankfurt.de/personendetails/kai-droege.html).
 
 ## Download and Installation
@@ -33,9 +99,9 @@ The [urban dictionary](https://www.urbandictionary.com/define.php?term=Scribe) d
 > All releases are hosted on SWITCHdrive, a secure data sharing platform for Swiss universities.
 
 ### Windows
-- The **general purpose version** for normal PCs without a NVIDIA graphics card: [https://drive.switch.ch/index.php/s/HtKDKYRZRNaYBeI?path=%2FWindows%2Fnormal2](https://drive.switch.ch/index.php/s/HtKDKYRZRNaYBeI?path=%2FWindows%2Fnormal2) 
+- The **general purpose version** for normal PCs without a NVIDIA graphics card: [https://drive.switch.ch/index.php/s/HtKDKYRZRNaYBeI?path=%2FWindows%2Fnormal2](https://drive.switch.ch/index.php/s/HtKDKYRZRNaYBeI?path=%2FWindows%2Fnormal2)
 - A special version using **CUDA acceleration on NVIDIA graphics cards** with at least 6 GB of VRAM: [https://drive.switch.ch/index.php/s/HtKDKYRZRNaYBeI?path=%2FWindows%2Fcuda1](https://drive.switch.ch/index.php/s/HtKDKYRZRNaYBeI?path=%2FWindows%2Fcuda1). Make sure that your NVIDIA drivers are on version 570.65 or higher. You must also install the [CUDA toolkit from here](https://developer.nvidia.com/cuda-downloads?target_os=Windows) (a reboot is required afterwards).
-- **Installation**: 
+- **Installation**:
     - Start the downloaded setup file. This may take a while, be patient.
     - If you get a warning that "Windows protected your PC" and the app comes from an "Unknown publisher", you have to trust us and click "Run anyway"
     - To do a silent install on a larger group of computers, start the setup with the argument `/S`.
@@ -156,7 +222,7 @@ python3 ./noScribe.py
 ## Citation (APA Style)
 Dröge, K. (2024). noScribe. AI-powered Audio Transcription (Version XXX) [Computer software]. https://github.com/kaixxx/noScribe
 
-## Usage
+## noScribe Usage
 ### Settings
 <img align="left" src="img/noScribe_settings.png" width="300">
 
@@ -223,7 +289,7 @@ The source code of the editor can be found here: [https://github.com/kaixxx/noSc
 
 ### Translations
 - The noScribe UI has already been translated into many languages (thanks mlynar-czyk).
-- Since most of the translations have been created with ChatGPT, there will be problems. Please report any errors that you’ll find and make – if possible – a pull request with a better translation.
+- Since most of the translations have been created with ChatGPT, there will be problems. Please report any errors that you'll find and make – if possible – a pull request with a better translation.
 - You will find the language files in the folder "trans".
 - If you change anything in the language files, make sure to follow the conventions of the YAML language.
 - If you want to change the language of the user interface, you have to change the value of the "locale" setting in the advanced settings (see above).
@@ -233,11 +299,11 @@ If you are interested in open source software for the analysis of qualitative da
 
 ---
 
-## MeetingRecorder (macOS)
+# MeetingRecorder (macOS)
 
 **MeetingRecorder** is an optional companion tool that provides automatic recording and transcription of meetings, podcasts, or any audio playing on your Mac.
 
-### Features
+## Features
 
 - **Menu bar app** for easy start/stop recording control
 - **Records both system audio AND microphone** simultaneously
@@ -245,13 +311,13 @@ If you are interested in open source software for the analysis of qualitative da
 - **Speaker detection** - identifies different speakers in the transcript
 - **Background service** - runs automatically at login
 
-### Requirements
+## Requirements
 
 - macOS 14 (Sonoma) or newer with Apple Silicon (M1-M4)
 - [Background Music](https://github.com/kyleneideck/BackgroundMusic) app for system audio capture with volume control
 - noScribe installed from source (this repository)
 
-### Quick Start
+## Quick Start
 
 1. **Install Background Music:**
    ```bash
@@ -286,14 +352,14 @@ If you are interested in open source software for the analysis of qualitative da
    - Click the Background Music icon in the menu bar
    - Select your speakers/headphones as the output device
 
-### Usage
+## Usage
 
 - **Start recording:** Click the menu bar icon → Start Recording
 - **Stop recording:** Click the menu bar icon → Stop Recording
 - Recordings are saved to `~/Documents/MeetingRecorder/Recordings/`
 - Transcripts appear automatically in `~/Documents/MeetingRecorder/Transcripts/`
 
-### Components
+## Components
 
 | File | Description |
 |------|-------------|
@@ -302,7 +368,7 @@ If you are interested in open source software for the analysis of qualitative da
 | `tools/install.sh` | Installation script |
 | `tools/uninstall.sh` | Uninstallation script |
 
-### Logs
+## Logs
 
 Check logs if something isn't working:
 ```bash
@@ -311,56 +377,322 @@ tail -f ~/Documents/MeetingRecorder/logs/watcher.log
 
 For detailed audio setup instructions, see [tools/BLACKHOLE_SETUP.md](tools/BLACKHOLE_SETUP.md).
 
-### n8n Workflow Integration (Optional)
+---
 
-MeetingRecorder can optionally send completed transcripts to an n8n workflow for automated processing. This enables features like:
+# N8N Workflow Integration
 
-- **Automatic meeting summaries** using LLM analysis
-- **Action item extraction** from meeting content
-- **Database storage** of meetings, topics, and participants
-- **Email notifications** with meeting recaps
+MeetingRecorder automatically sends completed transcripts to an n8n workflow for intelligent processing. This transforms raw transcripts into searchable, analyzed meeting data.
 
-#### Setup
+## What the Workflow Does
 
-1. **Install n8n** (self-hosted or cloud):
-   ```bash
-   # Docker (recommended)
-   docker run -d --name n8n -p 5678:5678 n8nio/n8n
+```
+Transcript Received (Webhook)
+       │
+       ▼
+┌──────────────────┐
+│ Extract Payload  │  Parse transcript HTML, timestamps, duration
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ Calendar Lookup  │  Find matching Google Calendar events
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  LLM Analysis    │  Gemini 2.5 Flash extracts:
+│                  │  • Title & summary
+│                  │  • Key points & action items
+│                  │  • Participants & sentiment
+│                  │  • Meeting type classification
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ Store in DB      │  PostgreSQL with full text + metadata
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ Create Embeddings│  OpenAI text-embedding-3-small
+│ & Store Chunks   │  For semantic search
+└──────────────────┘
+```
 
-   # Or npm
-   npm install -g n8n && n8n start
-   ```
+## Setup
 
-2. **Create a webhook workflow** in n8n that accepts POST requests with:
-   ```json
-   {
-     "transcript_path": "/path/to/transcript.html",
-     "transcript_html": "<html>...</html>",
-     "started_at": "2025-01-01T00:00:00Z",
-     "audio_duration_seconds": 3600
-   }
-   ```
+### 1. Install n8n
 
-3. **Configure the webhook URL** in `~/Documents/MeetingRecorder/config.yaml`:
-   ```yaml
-   webhook:
-     url: "http://localhost:5678/webhook/transcript-processor"
-   ```
+```bash
+# Docker (recommended)
+docker run -d --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n n8nio/n8n
 
-4. **Set up a PostgreSQL database** (optional, for storing meeting data):
-   - Use [Neon](https://neon.tech) (serverless Postgres) or local PostgreSQL
-   - Create tables for meetings, topics, action_items, clients, etc.
-   - Connect n8n to the database using the Postgres node
+# Or npm
+npm install -g n8n && n8n start
+```
 
-#### Example Workflow
+### 2. Import the Workflow
 
-A typical n8n workflow for transcript processing:
-1. **Webhook trigger** - receives transcript from MeetingRecorder
-2. **LLM analysis** - extract summary, topics, decisions, action items
-3. **Database storage** - save to PostgreSQL
-4. **Email notification** - send meeting recap to participants
+1. Open n8n at `http://localhost:5678`
+2. Go to **Workflows** → **Import from File**
+3. Select `workflows/transcript-processor-mvp.json`
+4. Configure credentials:
+   - **PostgreSQL**: Your Neon or local PostgreSQL database
+   - **Google Calendar** (optional): OAuth2 for calendar integration
+   - **OpenRouter**: API key for LLM analysis (uses Gemini 2.5 Flash)
+   - **OpenAI**: API key for embeddings
 
-The transcript watcher (`tools/transcribe_watcher.py`) automatically sends transcripts to your configured webhook URL after each successful transcription.
+### 3. Set Up the Database
 
+Create a PostgreSQL database (we recommend [Neon](https://neon.tech) for serverless Postgres) with pgvector extension:
 
+```sql
+-- Enable pgvector for embeddings
+CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Main conversations table
+CREATE TABLE conversations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  started_at TIMESTAMPTZ NOT NULL,
+  ended_at TIMESTAMPTZ,
+  duration_minutes INTEGER,
+  source_path TEXT,
+  source_tool TEXT DEFAULT 'MeetingRecorder',
+
+  -- Full transcript
+  transcript_html TEXT,
+  transcript_text TEXT,
+
+  -- LLM-extracted metadata
+  title TEXT,
+  llm_summary TEXT,
+  llm_key_points TEXT[],
+  llm_tags TEXT[],
+  llm_coaching_feedback TEXT,
+  llm_metadata JSONB,
+
+  -- Parsed fields
+  participants_detected JSONB,
+  sentiment VARCHAR(20),  -- positive, neutral, negative, mixed
+  meeting_type VARCHAR(50),  -- client_call, internal, sales, support, etc.
+
+  -- Processing
+  processing_status TEXT DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Text chunks with vector embeddings for semantic search
+CREATE TABLE conversation_chunks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  token_count INTEGER,
+  embedding VECTOR(1536),  -- OpenAI text-embedding-3-small dimensions
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for fast queries
+CREATE INDEX idx_conversations_started_at ON conversations(started_at DESC);
+CREATE INDEX idx_conversations_meeting_type ON conversations(meeting_type);
+CREATE INDEX idx_chunks_conversation ON conversation_chunks(conversation_id);
+
+-- Vector similarity search index (for semantic queries)
+CREATE INDEX idx_chunks_embedding ON conversation_chunks
+  USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+```
+
+### 4. Configure the Webhook
+
+Add the webhook URL to `~/Documents/MeetingRecorder/config.yaml`:
+
+```yaml
+webhook:
+  url: "http://localhost:5678/webhook/transcript-mvp"
+```
+
+The watcher will automatically POST transcripts with this payload:
+
+```json
+{
+  "transcript_path": "/path/to/transcript.html",
+  "transcript_html": "<html>...</html>",
+  "started_at": "2025-01-15T14:30:00Z",
+  "audio_duration_seconds": 3600
+}
+```
+
+## Workflow Nodes Explained
+
+| Node | Purpose |
+|------|---------|
+| **Webhook Trigger** | Receives POST at `/webhook/transcript-mvp` |
+| **Extract Payload** | Parses incoming JSON, normalizes fields |
+| **Get Calendar Events** | Queries Google Calendar ±5 min of meeting time |
+| **Merge Calendar Data** | Enriches with attendees, organizer, meeting link |
+| **Parse HTML to Text** | Strips HTML, extracts clean text |
+| **Analyze Transcript** | LLM chain using Gemini 2.5 Flash |
+| **Parse LLM Response** | Validates JSON, prepares SQL-safe values |
+| **Insert Conversation** | Stores main record in PostgreSQL |
+| **Create Text Chunks** | Splits into 2000-char overlapping chunks |
+| **Generate Embeddings** | OpenAI text-embedding-3-small |
+| **Insert Chunks** | Stores chunks with vectors for search |
+| **Success Response** | Returns confirmation to webhook |
+
+---
+
+# MCP Integration (AI Chat Access)
+
+MeetingMemory includes MCP (Model Context Protocol) server configuration for accessing your meeting data directly from AI assistants like Claude.
+
+## What is MCP?
+
+MCP allows AI assistants to interact with external tools and data sources. With MeetingMemory's MCP configuration, you can:
+
+- Query your meeting history from Claude Code or other MCP-compatible AI
+- Search transcripts semantically using vector embeddings
+- Manage n8n workflows programmatically
+
+## Available MCP Servers
+
+### 1. n8n-mcp
+
+Interact with your n8n instance programmatically:
+
+```json
+{
+  "mcpServers": {
+    "n8n-mcp": {
+      "command": "npx",
+      "args": ["-y", "n8n-mcp"],
+      "env": {
+        "N8N_API_URL": "http://localhost:5678/api/v1",
+        "N8N_API_KEY": "your-n8n-api-key"
+      }
+    }
+  }
+}
+```
+
+**Capabilities:**
+- List and manage workflows
+- View execution history
+- Trigger workflows manually
+- Inspect node configurations
+
+### 2. Transcript MCP Server (Planned)
+
+Direct database access for meeting queries:
+
+```json
+{
+  "mcpServers": {
+    "transcript": {
+      "command": "node",
+      "args": ["path/to/transcript-mcp-server/dist/index.js"],
+      "env": {
+        "DATABASE_URL": "postgresql://...",
+        "OPENAI_API_KEY": "sk-..."
+      }
+    }
+  }
+}
+```
+
+**Planned Capabilities:**
+- "What did we discuss in yesterday's meeting?"
+- "Find all meetings about project X"
+- "What action items came out of client calls this week?"
+- Semantic search across all transcripts
+
+## Configuration
+
+MCP configuration is stored in `.mcp.json` at the project root. To set up:
+
+1. Copy `.mcp.json.example` to `.mcp.json`
+2. Add your API keys and database credentials
+3. Ensure `.mcp.json` is in `.gitignore` (contains secrets!)
+
+## Security Note
+
+The `.mcp.json` file contains sensitive credentials. Make sure to:
+
+- Never commit this file to git
+- Use environment variables for production deployments
+- Rotate API keys if they've been exposed
+
+---
+
+# File Locations
+
+| Purpose | Location |
+|---------|----------|
+| **Recordings** | `~/Documents/MeetingRecorder/Recordings/` |
+| **Transcripts** | `~/Documents/MeetingRecorder/Transcripts/` |
+| **Watcher Logs** | `~/Documents/MeetingRecorder/logs/watcher.log` |
+| **noScribe Logs** | `~/Library/Application Support/noscribe/log/` |
+| **Config** | `~/Documents/MeetingRecorder/config.yaml` |
+| **N8N Workflows** | `workflows/transcript-processor-mvp.json` |
+
+---
+
+# Troubleshooting
+
+## Transcription Issues
+
+**Watcher not transcribing new recordings:**
+```bash
+# Check if watcher is running
+launchctl list | grep transcribewatcher
+
+# View logs
+tail -100 ~/Documents/MeetingRecorder/logs/watcher.log
+
+# Restart watcher
+launchctl stop com.user.transcribewatcher
+launchctl start com.user.transcribewatcher
+```
+
+**Poor transcription quality:**
+- Use "precise" model instead of "fast"
+- Ensure good audio quality with minimal background noise
+- Check that speaker detection is enabled for multi-speaker recordings
+
+## N8N Workflow Issues
+
+**Webhook not receiving data:**
+```bash
+# Test webhook manually
+curl -X POST http://localhost:5678/webhook/transcript-mvp \
+  -H "Content-Type: application/json" \
+  -d '{"transcript_html": "<p>Test</p>", "started_at": "2025-01-01T00:00:00Z"}'
+```
+
+**Database connection failing:**
+- Verify PostgreSQL credentials in n8n
+- Check that pgvector extension is installed
+- Ensure database tables exist (run schema SQL above)
+
+**LLM analysis returning errors:**
+- Verify OpenRouter API key is valid
+- Check that model `google/gemini-2.5-flash` is available
+- Try reducing transcript length if hitting context limits
+
+---
+
+# License
+
+This project is licensed under **GPL-3.0** - see the [LICENSE](LICENSE) file for details.
+
+MeetingMemory is a fork of [noScribe](https://github.com/kaixxx/noScribe) by Kai Dröge. The automation additions (MeetingRecorder, N8N workflow, MCP integration) are developed by [Matthias Heim](https://github.com/MatthiasHeim).
+
+---
+
+# Acknowledgments
+
+- **[Kai Dröge](https://github.com/kaixxx)** - Original noScribe author
+- **[OpenAI Whisper](https://github.com/openai/whisper)** - Speech recognition
+- **[faster-whisper](https://github.com/guillaumekln/faster-whisper)** - Optimized Whisper implementation
+- **[pyannote.audio](https://github.com/pyannote/pyannote-audio)** - Speaker diarization
+- **[n8n](https://n8n.io)** - Workflow automation
+- **[Neon](https://neon.tech)** - Serverless PostgreSQL

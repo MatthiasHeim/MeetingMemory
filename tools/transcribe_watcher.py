@@ -18,7 +18,7 @@ import argparse
 import subprocess
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import yaml
@@ -367,7 +367,16 @@ class TranscribeWatcher:
             self._send_webhook(audio_file, transcript_file, processing_time)
 
     def _send_webhook(self, audio_file: Path, transcript_file: Path, processing_time: float):
-        """Send transcription result to n8n webhook."""
+        """Send transcription result to n8n webhook.
+
+        Sends payload matching n8n workflow expectations:
+        {
+            "transcript_path": "/path/to/transcript.html",
+            "transcript_html": "<html>...</html>",
+            "started_at": "2025-12-05T15:56:47Z",
+            "audio_duration_seconds": 2279
+        }
+        """
         webhook_url = self.config.get('webhook', {}).get('url', '')
 
         if not webhook_url:
@@ -375,38 +384,55 @@ class TranscribeWatcher:
             return
 
         try:
-            # Read transcript content
-            transcript_html = transcript_file.read_text(encoding='utf-8')
-            transcript_text = html_to_text(transcript_html)
+            # Read transcript HTML content
+            with open(transcript_file, 'r', encoding='utf-8') as f:
+                transcript_html = f.read()
 
             # Get audio duration (approximate from file size, assuming 16kHz mono 16-bit)
             audio_size = audio_file.stat().st_size
             # WAV header is ~44 bytes, 16kHz * 2 bytes = 32000 bytes/second
             duration_seconds = max(0, (audio_size - 44) / 32000)
 
+            # Parse start time from filename (format: YYYY-MM-DD_HH-MM-SS.wav)
+            # Example: 2025-12-05_15-56-47.wav
+            # Note: Filename timestamp is in LOCAL time, need to convert to UTC
+            filename_without_ext = audio_file.stem
+            try:
+                date_part, time_part = filename_without_ext.split('_')
+                year, month, day = date_part.split('-')
+                hour, minute, second = time_part.split('-')
+                # Parse as local time (no timezone = naive datetime interpreted as local)
+                local_dt = datetime(int(year), int(month), int(day),
+                                   int(hour), int(minute), int(second))
+                # Convert local time to UTC
+                # astimezone() treats naive datetime as local time and converts to UTC
+                utc_dt = local_dt.astimezone(timezone.utc)
+                started_at = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                self.logger.debug(f"Parsed timestamp: local={local_dt}, utc={started_at}")
+            except (ValueError, IndexError) as e:
+                # Fallback: use current time if filename doesn't match expected format
+                self.logger.warning(f"Could not parse timestamp from filename: {filename_without_ext} ({e})")
+                started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # Build payload matching n8n workflow expectations
             payload = {
-                "event": "transcription_complete",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "audio_file": str(audio_file),
-                "audio_filename": audio_file.name,
-                "transcript_file": str(transcript_file),
-                "transcript_filename": transcript_file.name,
+                "transcript_path": str(transcript_file),
                 "transcript_html": transcript_html,
-                "transcript_text": transcript_text,
-                "duration_seconds": round(duration_seconds),
-                "processing_time_seconds": round(processing_time)
+                "started_at": started_at,
+                "audio_duration_seconds": round(duration_seconds)
             }
 
             timeout = self.config.get('webhook', {}).get('timeout', 30)
             response = requests.post(webhook_url, json=payload, timeout=timeout)
             response.raise_for_status()
 
-            self.logger.info(f"Webhook sent successfully: {response.status_code}")
+            self.logger.info(f"✅ Webhook sent successfully to n8n: {response.status_code}")
+            self.logger.debug(f"Payload sent (HTML content: {len(transcript_html)} chars)")
 
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Webhook failed: {e}")
+            self.logger.error(f"❌ Webhook request failed: {e}")
         except Exception as e:
-            self.logger.error(f"Error preparing webhook: {e}")
+            self.logger.error(f"❌ Error preparing webhook: {e}")
 
 
 def main():
