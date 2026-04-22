@@ -3,7 +3,12 @@
 TranscribeWatcher - Automatic transcription service for MeetingRecorder
 
 Monitors a folder for new audio files and automatically transcribes them
-using noScribe, then sends results to an n8n webhook.
+using either noScribe (Whisper) or Gemini Flash, then sends results to n8n webhook.
+
+Processing modes:
+- "whisper": Traditional noScribe transcription → n8n analysis
+- "gemini": Direct Gemini 2.5 Flash transcription + analysis
+- "both": Run both pipelines in parallel for comparison
 
 Usage:
     python transcribe_watcher.py [--config PATH]
@@ -12,6 +17,7 @@ Usage:
 import os
 import sys
 import time
+import json
 import queue
 import logging
 import argparse
@@ -25,6 +31,30 @@ import yaml
 import requests
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load from project root .env file
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+except ImportError:
+    pass  # dotenv not installed, rely on system env vars
+
+# Add tools directory to path for sibling module imports
+_tools_dir = Path(__file__).parent
+if str(_tools_dir) not in sys.path:
+    sys.path.insert(0, str(_tools_dir))
+
+# Import Gemini processing modules (optional - gracefully handle if not available)
+try:
+    from audio_converter import convert_for_gemini, get_audio_duration
+    from gemini_processor import GeminiAudioProcessor, GeminiResult
+    GEMINI_AVAILABLE = True
+except ImportError as e:
+    GEMINI_AVAILABLE = False
+    _GEMINI_IMPORT_ERROR = str(e)
 
 
 # Default config path
@@ -173,6 +203,37 @@ class TranscribeWatcher:
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
 
+        # Processing mode: "whisper", "gemini", or "both"
+        self.processing_mode = config.get('processing', {}).get('mode', 'whisper')
+        self.logger.info(f"Processing mode: {self.processing_mode}")
+
+        # Validate Gemini availability if needed
+        if self.processing_mode in ('gemini', 'both') and not GEMINI_AVAILABLE:
+            self.logger.warning(
+                "Gemini processing requested but modules not available. "
+                "Falling back to whisper mode. Install: pip install google-genai"
+            )
+            self.processing_mode = 'whisper'
+
+        # Initialize Gemini processor if needed
+        self.gemini_processor = None
+        if self.processing_mode in ('gemini', 'both') and GEMINI_AVAILABLE:
+            gemini_config = config.get('gemini', {})
+            api_key = os.environ.get(gemini_config.get('api_key_env', 'GEMINI_API_KEY'))
+            if api_key:
+                self.gemini_processor = GeminiAudioProcessor(
+                    api_key=api_key,
+                    model=gemini_config.get('model', 'gemini-2.5-flash'),
+                    max_output_tokens=gemini_config.get('max_output_tokens', 65536),
+                    temperature=gemini_config.get('temperature', 0.1),
+                    timeout_seconds=gemini_config.get('timeout', 600)
+                )
+                self.logger.info(f"Gemini processor initialized with model: {gemini_config.get('model', 'gemini-2.5-flash')}")
+            else:
+                self.logger.error(f"GEMINI_API_KEY not found in environment. Gemini processing disabled.")
+                if self.processing_mode == 'gemini':
+                    self.processing_mode = 'whisper'
+
         # Initialize queue
         self.queue = TranscriptionQueue(logger)
 
@@ -211,20 +272,40 @@ class TranscribeWatcher:
         """Stop the watcher."""
         self.logger.info("Stopping watcher...")
         self.running = False
+
+        # Terminate any running Claude sessions
+        for proc in getattr(self, '_claude_pids', []):
+            if proc.poll() is None:
+                self.logger.info(f"Terminating Claude session PID={proc.pid}")
+                proc.terminate()
+
         self.observer.stop()
         self.observer.join()
         self.logger.info("Watcher stopped.")
 
     def _process_existing_files(self):
-        """Check for WAV files that don't have corresponding transcripts."""
+        """Check for WAV files that don't have corresponding outputs."""
         for wav_file in self.recordings_dir.glob("*.wav"):
-            transcript_file = self.transcripts_dir / f"{wav_file.stem}.html"
-            if not transcript_file.exists():
+            needs_processing = False
+
+            if self.processing_mode in ('whisper', 'both'):
+                # Check for Whisper HTML transcript
+                transcript_file = self.transcripts_dir / f"{wav_file.stem}.html"
+                if not transcript_file.exists():
+                    needs_processing = True
+
+            if self.processing_mode in ('gemini', 'both'):
+                # Check for Gemini JSON output
+                gemini_json = self.transcripts_dir / f"{wav_file.stem}.json"
+                if not gemini_json.exists():
+                    needs_processing = True
+
+            if needs_processing:
                 self.logger.info(f"Found unprocessed file: {wav_file.name}")
                 self.queue.add(wav_file)
 
     def _process_queue(self):
-        """Process the next file in the queue."""
+        """Process the next file in the queue based on processing mode."""
         audio_file = self.queue.get()
         if audio_file is None:
             return
@@ -233,23 +314,42 @@ class TranscribeWatcher:
         self.queue.processing = True
 
         try:
-            self._transcribe_file(audio_file)
+            if self.processing_mode == 'whisper':
+                self._process_with_whisper(audio_file)
+            elif self.processing_mode == 'gemini':
+                self._process_with_gemini(audio_file)
+            elif self.processing_mode == 'both':
+                # Run both pipelines
+                self.logger.info(f"Running both pipelines for: {audio_file.name}")
+                self._process_with_whisper(audio_file)
+                self._process_with_gemini(audio_file)
+            else:
+                self.logger.error(f"Unknown processing mode: {self.processing_mode}")
         except Exception as e:
-            self.logger.error(f"Error transcribing {audio_file.name}: {e}")
+            self.logger.error(f"Error processing {audio_file.name}: {e}")
         finally:
             self.queue.processing = False
             self.queue.current_file = None
 
     def _premix_audio(self, audio_file: Path) -> Path:
-        """Pre-mix multi-channel audio to mono, ensuring all channels are included.
+        """Pre-mix multi-channel audio to mono, dropping silent channels.
 
-        noScribe's ffmpeg uses -ac 1 which ignores channel 3 in 3-channel files.
-        This function properly mixes all channels with equal weight.
+        Background: the macOS capture pipeline sometimes writes a 3-channel WAV
+        where only one channel contains audio (observed with BlackHole routing:
+        audio lands in channel 2 (LFE); channels 0/1 are digital silence). A
+        naive equal-weight mix across all channels attenuates the signal by
+        ~10dB and pushes Swiss German ASR below its accuracy threshold.
+
+        Strategy: per-channel volumedetect → keep channels with mean_volume
+        above SILENCE_THRESHOLD_DB → mix only those channels.
         """
         import tempfile
 
-        # Check channel count (use full path for ffprobe in case PATH isn't set in launchd)
         ffprobe_path = '/opt/homebrew/bin/ffprobe'
+        ffmpeg_path = '/opt/homebrew/bin/ffmpeg'
+        SILENCE_THRESHOLD_DB = -60.0  # channels below this are treated as silent
+
+        # Check channel count
         probe_cmd = [ffprobe_path, '-v', 'error', '-select_streams', 'a:0',
                      '-show_entries', 'stream=channels', '-of', 'csv=p=0',
                      str(audio_file)]
@@ -259,30 +359,54 @@ class TranscribeWatcher:
             self.logger.debug(f"Detected {channels} channels in {audio_file.name}")
         except Exception as e:
             self.logger.warning(f"ffprobe failed: {e}, assuming 2 channels")
-            channels = 2  # Assume stereo if probe fails
+            channels = 2
 
-        if channels <= 2:
-            # Standard stereo or mono, no pre-processing needed
+        if channels <= 1:
             return audio_file
 
-        self.logger.info(f"Pre-mixing {channels}-channel audio to mono")
+        # Measure per-channel mean volume (probe first 60s for speed)
+        active_channels = []
+        for i in range(channels):
+            probe = subprocess.run(
+                [ffmpeg_path, '-i', str(audio_file), '-t', '60',
+                 '-af', f'pan=mono|c0=c{i},volumedetect', '-f', 'null', '-'],
+                capture_output=True, text=True,
+            )
+            import re
+            m = re.search(r'mean_volume:\s*(-?[0-9.]+)\s*dB', probe.stderr)
+            mean_db = float(m.group(1)) if m else float('-inf')
+            self.logger.debug(f"  channel {i}: mean_volume={mean_db} dB")
+            if mean_db > SILENCE_THRESHOLD_DB:
+                active_channels.append(i)
 
-        # Create temp file for mixed audio
+        if not active_channels:
+            self.logger.warning(f"No active channels detected in {audio_file.name}, "
+                                f"falling back to equal-weight mix of all {channels}")
+            active_channels = list(range(channels))
+
+        if channels == 2 and active_channels == [0, 1]:
+            # Standard stereo with audio on both channels — noScribe's -ac 1 handles this fine
+            return audio_file
+
+        self.logger.info(
+            f"Pre-mixing to mono: {channels} channels detected, "
+            f"using active channels {active_channels}"
+        )
+
         temp_dir = Path(tempfile.gettempdir())
         mixed_file = temp_dir / f"{audio_file.stem}_mixed.wav"
 
-        # Mix all channels equally: for 3 channels, each gets 1/3 weight
-        # pan filter: mono output, mix all input channels
-        weight = 1.0 / channels
-        mix_filter = f"pan=mono|c0={'+'.join([f'{weight}*c{i}' for i in range(channels)])}"
+        weight = 1.0 / len(active_channels)
+        mix_filter = (
+            f"pan=mono|c0=" + '+'.join([f'{weight}*c{i}' for i in active_channels])
+        )
 
-        ffmpeg_path = '/opt/homebrew/bin/ffmpeg'
         mix_cmd = [
             ffmpeg_path, '-y', '-i', str(audio_file),
             '-af', mix_filter,
-            '-ar', '48000',  # Keep original sample rate
+            '-ar', '48000',
             '-c:a', 'pcm_s16le',
-            str(mixed_file)
+            str(mixed_file),
         ]
 
         try:
@@ -297,8 +421,8 @@ class TranscribeWatcher:
             self.logger.warning(f"Pre-mix error, using original: {e}")
             return audio_file
 
-    def _transcribe_file(self, audio_file: Path):
-        """Transcribe a single audio file using noScribe."""
+    def _process_with_whisper(self, audio_file: Path):
+        """Transcribe a single audio file using noScribe (Whisper)."""
         transcript_file = self.transcripts_dir / f"{audio_file.stem}.html"
 
         self.logger.info(f"Starting transcription: {audio_file.name}")
@@ -365,6 +489,9 @@ class TranscribeWatcher:
         # Send webhook notification
         if self.config.get('webhook', {}).get('enabled', False):
             self._send_webhook(audio_file, transcript_file, processing_time)
+
+        # Trigger Claude for immediate processing
+        self._trigger_claude(transcript_file)
 
     def _send_webhook(self, audio_file: Path, transcript_file: Path, processing_time: float):
         """Send transcription result to n8n webhook.
@@ -433,6 +560,204 @@ class TranscribeWatcher:
             self.logger.error(f"❌ Webhook request failed: {e}")
         except Exception as e:
             self.logger.error(f"❌ Error preparing webhook: {e}")
+
+    def _process_with_gemini(self, audio_file: Path):
+        """Process audio file using Gemini 2.5 Flash for transcription + analysis."""
+        if not self.gemini_processor:
+            self.logger.error("Gemini processor not initialized, skipping Gemini processing")
+            return
+
+        self.logger.info(f"Starting Gemini processing: {audio_file.name}")
+        start_time = time.time()
+
+        try:
+            # Step 1: Convert WAV to MP3 (extracts mic channel)
+            self.logger.info("Converting WAV to MP3...")
+            mp3_path = convert_for_gemini(audio_file, output_dir=self.transcripts_dir)
+            self.logger.info(f"Converted to: {mp3_path.name} ({mp3_path.stat().st_size / 1024 / 1024:.1f} MB)")
+
+            # Step 2: Get audio duration
+            audio_duration = get_audio_duration(mp3_path)
+            self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
+
+            # Step 3: Process with Gemini
+            self.logger.info("Sending to Gemini API...")
+            result = self.gemini_processor.process_audio(mp3_path)
+
+            processing_time = time.time() - start_time
+            self.logger.info(f"Gemini processing complete in {processing_time:.1f}s")
+
+            if result.error:
+                self.logger.error(f"Gemini processing error: {result.error}")
+                return
+
+            # Log some stats
+            if result.input_tokens and result.output_tokens:
+                self.logger.info(f"Tokens - Input: {result.input_tokens}, Output: {result.output_tokens}")
+
+            # Step 4: Save JSON result alongside MP3
+            json_path = mp3_path.with_suffix('.json')
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(result.parsed_response, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Saved result to: {json_path.name}")
+
+            # Step 5: Send webhook if configured
+            if self.config.get('webhook_gemini', {}).get('enabled', False):
+                self._send_gemini_webhook(audio_file, mp3_path, result, audio_duration, processing_time)
+
+            # Trigger Claude for immediate processing
+            self._trigger_claude(json_path)
+
+        except Exception as e:
+            self.logger.error(f"Gemini processing failed: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+
+    def _send_gemini_webhook(self, audio_file: Path, mp3_path: Path,
+                             result: 'GeminiResult', audio_duration: float,
+                             processing_time: float):
+        """Send Gemini transcription result to n8n webhook.
+
+        Sends payload optimized for the conversations_gemini table:
+        {
+            "source_audio_path": "/path/to/original.wav",
+            "source_mp3_path": "/path/to/converted.mp3",
+            "started_at": "2025-01-01T00:00:00Z",
+            "duration_seconds": 1800,
+            "processing_time_seconds": 45.2,
+            "gemini_model": "gemini-2.5-flash",
+            "gemini_input_tokens": 57600,
+            "gemini_output_tokens": 8500,
+            "transcript_text": "Full transcript...",
+            "transcript_language": "de",
+            "title": "Meeting Title",
+            "summary": "Meeting summary...",
+            "key_points": ["point1", "point2"],
+            "tags": ["tag1", "tag2"],
+            "participants": {...},
+            "sentiment": "positive",
+            "meeting_type": "client_call",
+            "lailix_communication_score": 7,
+            "lailix_communication_feedback": "...",
+            "lailix_sales_score": 6,
+            "lailix_sales_feedback": "...",
+            "lailix_strategic_alignment": "...",
+            "lailix_improvement_areas": ["area1", "area2"],
+            "lailix_strengths": ["strength1", "strength2"]
+        }
+        """
+        webhook_url = self.config.get('webhook_gemini', {}).get('url', '')
+
+        if not webhook_url:
+            self.logger.debug("Gemini webhook URL not configured, skipping notification")
+            return
+
+        try:
+            # Parse start time from filename
+            filename_without_ext = audio_file.stem
+            try:
+                date_part, time_part = filename_without_ext.split('_')
+                year, month, day = date_part.split('-')
+                hour, minute, second = time_part.split('-')
+                local_dt = datetime(int(year), int(month), int(day),
+                                   int(hour), int(minute), int(second))
+                utc_dt = local_dt.astimezone(timezone.utc)
+                started_at = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, IndexError):
+                started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # Extract data from Gemini result
+            data = result.parsed_response or {}
+            lailix_feedback = data.get('lailix_feedback', {})
+
+            # Build payload for conversations_gemini table
+            payload = {
+                # Source info
+                "source_audio_path": str(audio_file),
+                "source_mp3_path": str(mp3_path),
+                "started_at": started_at,
+                "duration_seconds": round(audio_duration),
+
+                # Processing metadata
+                "processing_time_seconds": round(processing_time, 2),
+                "gemini_model": result.model,
+                "gemini_input_tokens": result.input_tokens,
+                "gemini_output_tokens": result.output_tokens,
+
+                # Transcript
+                "transcript_text": data.get('transcript', ''),
+                "transcript_language": data.get('language', ''),
+
+                # Standard metadata
+                "title": data.get('title', ''),
+                "summary": data.get('summary', ''),
+                "key_points": data.get('key_points', []),
+                "tags": data.get('tags', []),
+                "participants": data.get('participants', {}),
+                "sentiment": data.get('sentiment', ''),
+                "meeting_type": data.get('meeting_type', ''),
+
+                # Lailix-specific feedback
+                "lailix_communication_score": lailix_feedback.get('communication_score'),
+                "lailix_communication_feedback": lailix_feedback.get('communication_feedback', ''),
+                "lailix_sales_score": lailix_feedback.get('sales_score'),
+                "lailix_sales_feedback": lailix_feedback.get('sales_feedback', ''),
+                "lailix_strategic_alignment": lailix_feedback.get('strategic_alignment', ''),
+                "lailix_improvement_areas": lailix_feedback.get('improvement_areas', []),
+                "lailix_strengths": lailix_feedback.get('strengths', []),
+
+                # Raw response for debugging
+                "gemini_raw_response": data
+            }
+
+            timeout = self.config.get('webhook_gemini', {}).get('timeout', 60)
+            response = requests.post(webhook_url, json=payload, timeout=timeout)
+            response.raise_for_status()
+
+            self.logger.info(f"✅ Gemini webhook sent successfully: {response.status_code}")
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Gemini webhook request failed: {e}")
+        except Exception as e:
+            self.logger.error(f"❌ Error preparing Gemini webhook: {e}")
+
+    def _trigger_claude(self, transcript_path: Path):
+        """Fire-and-forget headless Claude session to process transcript."""
+        claude_config = self.config.get('claude_trigger', {})
+        if not claude_config.get('enabled', False):
+            self.logger.debug("Claude trigger disabled, skipping")
+            return
+
+        claude_path = claude_config.get('claude_path', '/Users/Matthias/.local/bin/claude')
+        brain_repo = claude_config.get('brain_repo', '/Users/Matthias/Desktop/Repos/Brain')
+        command = claude_config.get('command', 'meeting-actions')
+
+        prompt = f"Read .claude/commands/{command}.md and process transcript: {transcript_path}"
+
+        # Log file for this Claude session
+        log_dir = expand_path(self.config['paths']['logs'])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_file = log_dir / f"claude-{timestamp}.log"
+
+        env = os.environ.copy()
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin"
+
+        try:
+            with open(log_file, 'w') as lf:
+                proc = subprocess.Popen(
+                    [claude_path, "-p", prompt, "--dangerously-skip-permissions"],
+                    cwd=brain_repo,
+                    env=env,
+                    stdout=lf,
+                    stderr=lf,
+                )
+            self.logger.info(f"Claude trigger fired: PID={proc.pid}, log={log_file.name}")
+            if not hasattr(self, '_claude_pids'):
+                self._claude_pids = []
+            self._claude_pids.append(proc)
+        except Exception as e:
+            self.logger.error(f"Failed to trigger Claude: {e}")
 
 
 def main():
