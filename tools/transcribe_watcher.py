@@ -56,6 +56,30 @@ except ImportError as e:
     GEMINI_AVAILABLE = False
     _GEMINI_IMPORT_ERROR = str(e)
 
+# Import neon_insert for programmatic InsightBase source creation +
+# enrichment. Graceful degrade: if the module or psycopg2 is missing, the
+# watcher still processes transcripts and triggers Claude (which has its
+# own insert fallback in /meeting-actions Step 1).
+try:
+    from neon_insert import (
+        insert_source as _insightbase_insert_source,
+        update_source_with_gemini as _insightbase_update_with_gemini,
+        update_source_calendar_match as _insightbase_update_calendar,
+    )
+    NEON_INSERT_AVAILABLE = True
+except ImportError as e:
+    NEON_INSERT_AVAILABLE = False
+    _NEON_INSERT_IMPORT_ERROR = str(e)
+
+# Import calendar_resolve for participant resolution. Optional — if the
+# import fails we skip calendar resolution and let Claude handle it.
+try:
+    import calendar_resolve as _calendar_resolve
+    CALENDAR_RESOLVE_AVAILABLE = True
+except ImportError as e:
+    CALENDAR_RESOLVE_AVAILABLE = False
+    _CALENDAR_RESOLVE_IMPORT_ERROR = str(e)
+
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
@@ -490,8 +514,12 @@ class TranscribeWatcher:
         if self.config.get('webhook', {}).get('enabled', False):
             self._send_webhook(audio_file, transcript_file, processing_time)
 
+        # Seed InsightBase with a sources row BEFORE triggering Claude.
+        # If this fails, we still trigger Claude (graceful degrade).
+        source_id = self._seed_insightbase_source(transcript_file)
+
         # Trigger Claude for immediate processing
-        self._trigger_claude(transcript_file)
+        self._trigger_claude(transcript_file, source_id=source_id)
 
     def _send_webhook(self, audio_file: Path, transcript_file: Path, processing_time: float):
         """Send transcription result to n8n webhook.
@@ -601,12 +629,33 @@ class TranscribeWatcher:
                 json.dump(result.parsed_response, f, indent=2, ensure_ascii=False)
             self.logger.info(f"Saved result to: {json_path.name}")
 
-            # Step 5: Send webhook if configured
+            # Step 5: Send webhook if configured (legacy path; disabled by default)
             if self.config.get('webhook_gemini', {}).get('enabled', False):
                 self._send_gemini_webhook(audio_file, mp3_path, result, audio_duration, processing_time)
 
-            # Trigger Claude for immediate processing
-            self._trigger_claude(json_path)
+            # Step 6a: Seed sources row in InsightBase.
+            source_id = self._seed_insightbase_source(json_path)
+
+            # Step 6b: Deterministic ingest — populate audio-derived fields and
+            # write meeting_metadata. We do this BEFORE Claude so /meeting-actions
+            # can skip its sources-UPDATE block. Each step is best-effort.
+            self._enrich_with_gemini(source_id, result, audio_duration)
+
+            # Step 6c: Resolve participants via Google Calendar.
+            cal_match = self._calendar_resolve(source_id, json_path)
+
+            # Step 6d: Telegram ping — fires as soon as the row is in the DB
+            # and ready for downstream LLM work. The Claude session below
+            # finishes minutes later and posts no second notification.
+            self._notify_telegram_meeting_captured(
+                source_id=source_id, result=result, cal_match=cal_match,
+                audio_duration=audio_duration,
+            )
+
+            # Step 7: Trigger Claude for the LLM-only steps (insights, email
+            # draft, ClientContext, CRM, wiki). It reads the seeded fields
+            # and skips its old Step 1b/Step 2-UPDATE/Step 8.
+            self._trigger_claude(json_path, source_id=source_id)
 
         except Exception as e:
             self.logger.error(f"Gemini processing failed: {e}")
@@ -721,8 +770,176 @@ class TranscribeWatcher:
         except Exception as e:
             self.logger.error(f"❌ Error preparing Gemini webhook: {e}")
 
-    def _trigger_claude(self, transcript_path: Path):
-        """Fire-and-forget headless Claude session to process transcript."""
+    def _seed_insightbase_source(self, transcript_path: Path) -> Optional[int]:
+        """Insert a minimal sources row in InsightBase and return its id.
+
+        Called BEFORE launching Claude so that a record of the meeting
+        persists even if /meeting-actions fails to run. /meeting-actions
+        Step 1 receives the id via --source-id and UPDATEs the row with
+        enriched metadata (summary, participant_details, calendar_event_id,
+        company) that requires Google Calendar resolution.
+
+        Returns the source_id on success, or None if the insert fails or
+        the neon_insert module isn't available. Failure here is NEVER
+        fatal — we always fall through to the Claude trigger.
+        """
+        if not NEON_INSERT_AVAILABLE:
+            self.logger.warning(
+                f"neon_insert unavailable ({_NEON_INSERT_IMPORT_ERROR}); "
+                f"skipping InsightBase seed. /meeting-actions will insert inline."
+            )
+            return None
+
+        # Derive started_at from filename (YYYY-MM-DD_HH-MM-SS) if possible.
+        started_at = None
+        try:
+            date_part, time_part = transcript_path.stem.split('_')
+            y, mo, d = date_part.split('-')
+            h, mi, s = time_part.split('-')
+            local_dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(s))
+            started_at = local_dt.astimezone(timezone.utc)
+        except (ValueError, IndexError):
+            self.logger.debug(f"Could not parse started_at from {transcript_path.stem}")
+
+        try:
+            source_id = _insightbase_insert_source(
+                transcript_path=str(transcript_path),
+                title=transcript_path.stem,  # /meeting-actions will overwrite with real title
+                started_at=started_at,
+                origin='noscribe',
+                sensitivity_level='internal',
+            )
+            self.logger.info(
+                f"Seeded InsightBase source id={source_id} for {transcript_path.name}"
+            )
+            return source_id
+        except Exception as e:
+            # Graceful degrade — never block the pipeline on DB issues.
+            self.logger.warning(
+                f"InsightBase seed failed for {transcript_path.name}: {e}. "
+                f"/meeting-actions will insert inline as a fallback."
+            )
+            return None
+
+    def _enrich_with_gemini(self, source_id: Optional[int], result,
+                              audio_duration: float) -> None:
+        """Populate sources audio-derived fields + INSERT meeting_metadata.
+
+        Best-effort. Failures here do not block calendar resolution, Telegram,
+        or the Claude trigger.
+        """
+        if source_id is None:
+            self.logger.debug("No source_id; skipping Gemini enrichment")
+            return
+        if not NEON_INSERT_AVAILABLE:
+            self.logger.warning(
+                f"neon_insert unavailable; skipping Gemini enrichment "
+                f"({_NEON_INSERT_IMPORT_ERROR})"
+            )
+            return
+        try:
+            _insightbase_update_with_gemini(
+                source_id=source_id,
+                gemini_result=result.parsed_response,
+                duration_seconds=audio_duration,
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"Gemini enrichment failed for source_id={source_id}: {e}"
+            )
+
+    def _calendar_resolve(self, source_id: Optional[int],
+                           transcript_path: Path) -> Optional[dict]:
+        """Resolve participants via Google Calendar; UPDATE sources.
+
+        Returns the resolution dict on success (with calendar_event_id,
+        company, participant_details, participant_resolution_log), or None
+        if the lookup didn't run / failed.
+        """
+        if source_id is None:
+            return None
+        if not CALENDAR_RESOLVE_AVAILABLE:
+            self.logger.warning(
+                f"calendar_resolve unavailable; Claude will resolve "
+                f"({_CALENDAR_RESOLVE_IMPORT_ERROR})"
+            )
+            return None
+        try:
+            cal = _calendar_resolve.resolve(transcript_path)
+        except Exception as e:
+            self.logger.warning(f"calendar_resolve failed: {e}")
+            return None
+        if not NEON_INSERT_AVAILABLE:
+            return cal
+        try:
+            _insightbase_update_calendar(
+                source_id=source_id,
+                participant_details=cal.get("participant_details") or [],
+                participant_resolution_log=cal.get("participant_resolution_log") or {},
+                calendar_event_id=cal.get("calendar_event_id"),
+                company=cal.get("company"),
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"Calendar UPDATE failed for source_id={source_id}: {e}"
+            )
+        return cal
+
+    def _notify_telegram_meeting_captured(self, source_id: Optional[int],
+                                            result, cal_match: Optional[dict],
+                                            audio_duration: float) -> None:
+        """Send a one-line Telegram ping that the meeting is in InsightBase.
+
+        Fires BEFORE the Claude session — user knows the row exists and the
+        transcript is ready to be pulled into a session if needed. Best-effort.
+        """
+        notify_path = os.path.expanduser(
+            "~/.claude/scripts/telegram_notify.py"
+        )
+        if not os.path.exists(notify_path):
+            self.logger.debug("telegram_notify.py not found; skipping ping")
+            return
+
+        title = (cal_match or {}).get("calendar_event_id") and (
+            (cal_match or {}).get("participant_resolution_log", {})
+            .get("calendar_search", {}).get("chosen_event_title")
+        ) or "Untitled meeting"
+        company = (cal_match or {}).get("company") or "—"
+        duration_min = int(audio_duration // 60) if audio_duration else 0
+        sentiment = result.overall_sentiment if result else "neutral"
+        intensity = result.sentiment_intensity if result else "moderate"
+        chunked = bool(result and result.chunked)
+        n_emotions = (
+            sum(len(e.get("arc", []) or []) for e in (result.speaker_emotions or []))
+            if result else 0
+        )
+        msg = (
+            f"Meeting captured (#{source_id})\n"
+            f"{title}\n"
+            f"Client: {company} • {duration_min}min • "
+            f"sentiment {sentiment}/{intensity}\n"
+            f"{n_emotions} emotion arc events"
+            + (" • chunked" if chunked else "")
+            + "\nClaude /meeting-actions running…"
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.logger.info(f"Telegram ping sent for source_id={source_id}")
+        except Exception as e:
+            self.logger.warning(f"Telegram ping failed: {e}")
+
+    def _trigger_claude(self, transcript_path: Path, source_id: Optional[int] = None):
+        """Fire-and-forget headless Claude session to process transcript.
+
+        If source_id is provided, it is passed to /meeting-actions as a
+        --source-id flag so Step 1 UPDATEs that row instead of INSERTing
+        a fresh one. The watcher seeds the row (see
+        _seed_insightbase_source) so a record persists even if this
+        Claude session never runs.
+        """
         claude_config = self.config.get('claude_trigger', {})
         if not claude_config.get('enabled', False):
             self.logger.debug("Claude trigger disabled, skipping")
@@ -732,7 +949,11 @@ class TranscribeWatcher:
         brain_repo = claude_config.get('brain_repo', '/Users/Matthias/Desktop/Repos/Brain')
         command = claude_config.get('command', 'meeting-actions')
 
-        prompt = f"Read .claude/commands/{command}.md and process transcript: {transcript_path}"
+        source_id_arg = f" --source-id {source_id}" if source_id else ""
+        prompt = (
+            f"Read .claude/commands/{command}.md and process transcript: "
+            f"{transcript_path}{source_id_arg}"
+        )
 
         # Log file for this Claude session
         log_dir = expand_path(self.config['paths']['logs'])

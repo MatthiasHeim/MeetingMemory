@@ -16,3 +16,7 @@ requests>=2.31.0
 
 # Configuration
 pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# InsightBase (Neon Postgres) — used by neon_insert.py
+psycopg2-binary>=2.9.0

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Gemini Audio Processor - Transcription and analysis using Gemini 2.5 Flash.
+Gemini Audio Processor - Transcription and audio-only analysis.
 
-Processes audio files through Gemini API to get:
-1. Full verbatim transcription
-2. Meeting metadata (title, summary, key points, etc.)
-3. Lailix-specific business coaching feedback
+Processes audio files through Gemini API to get signals that only the audio
+reveals: verbatim transcript, diarization (speaking_pct), overall sentiment,
+per-speaker emotional arcs, pacing (wpm/hesitations/pauses), interruption
+events, and energy levels.
+
+Text-reasoning fields (title, summary, key points, tags, meeting type, action
+items, decisions, coaching feedback) used to live here too, but were moved out
+because they're better produced by Claude with full Brain context. The prior
+prompt's coaching scaffolding also competed for the model's attention with
+transcription itself.
 """
 
 import os
@@ -20,140 +26,141 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
-# Lailix Analysis Prompt - requests full transcription + analysis
-LAILIX_ANALYSIS_PROMPT = """You are transcribing and analyzing a meeting recording for Lailix, a Swiss AI consultancy.
+# Audio-only analysis prompt. Single-shot path uses this on raw audio. Chunked
+# path runs each chunk through this, then runs a separate text-only reduce-pass
+# (REDUCE_PASS_PROMPT) over the merged transcript.
+AUDIO_ANALYSIS_PROMPT = """You are transcribing and analyzing a meeting recording. Capture signals that only the audio reveals — these cannot be recovered later from transcript text alone.
 
-## CRITICAL: FULL TRANSCRIPTION REQUIRED
+## TRANSCRIPTION (REQUIRED)
 
-You MUST transcribe the ENTIRE audio recording word-for-word. Do not summarize or skip any parts.
-This is a COMPLETE transcription task - every word spoken must be captured.
+Transcribe the ENTIRE audio word-for-word. Do not summarize or skip any parts.
 
-Include speaker labels where identifiable:
-- Use "Matthias:" for the Lailix consultant (usually the main speaker/host)
-- Use "Client:", "Speaker 1:", "Speaker 2:", etc. for other participants
-- If you can identify speakers by name from context, use their names
-
-Include timestamps approximately every 2-3 minutes in the format [MM:SS] or [HH:MM:SS] for longer recordings.
+- Speaker labels: "Matthias:" for the host (Lailix consultant), otherwise speaker names if identifiable from context, else "Speaker 1:", "Speaker 2:", etc.
+- Timestamps every 2-3 minutes: `[MM:SS]` or `[HH:MM:SS]` for longer recordings.
+- Transcribe in original language(s); preserve mixed-language segments verbatim.
+- Mark unclear sections `[inaudible]` or `[unclear]`.
 
 ## OUTPUT FORMAT
 
-Return a single JSON object (no markdown code blocks, just raw JSON) with these exact fields:
+Return a single JSON object (raw — no markdown code fences) with these fields:
 
 {
-  "transcript": "The COMPLETE verbatim transcript of the entire meeting with speaker labels and timestamps",
-  "language": "Primary language detected (e.g., 'German', 'English', 'Swiss German', 'Mixed German/English')",
-  "title": "A concise, descriptive title for the meeting",
-  "summary": "2-3 sentence executive summary of the meeting (max 300 chars)",
-  "key_points": ["Key point 1", "Key point 2", "Key point 3", ...],
-  "tags": ["relevant", "tags", "for", "categorization"],
+  "transcript": "Complete verbatim transcript with speaker labels and timestamps",
+  "language": "Primary language (e.g., 'German', 'Swiss German', 'English', 'Mixed German/English')",
   "participants": [
-    {"name": "Matthias", "role": "host", "speaking_pct": 60},
-    {"name": "Client Name", "role": "participant", "speaking_pct": 40}
+    {"name": "Matthias", "role": "host", "speaking_pct": 60, "total_seconds": 1230},
+    {"name": "Stefan", "role": "participant", "speaking_pct": 40, "total_seconds": 820}
   ],
-  "sentiment": "positive|neutral|negative|mixed",
-  "meeting_type": "client_call|internal|sales|support|interview|workshop|presentation|homeschooling|other",
-  "action_items": ["Action item 1", "Action item 2", ...],
-  "decisions_made": ["Decision 1", "Decision 2", ...],
-  "lailix_feedback": {
-    "communication_score": 7,
-    "communication_feedback": "Detailed feedback on clarity, articulation, pace, and effectiveness of communication...",
-    "sales_score": 8,
-    "sales_feedback": "Detailed feedback on discovery questions, value articulation, objection handling...",
-    "strategic_alignment": "Analysis of how well this conversation aligns with Lailix positioning as an AI consultancy helping teams become AI Agent Ready...",
-    "improvement_areas": ["Specific area 1 to improve", "Specific area 2 to improve"],
-    "strengths": ["Strength 1 demonstrated", "Strength 2 demonstrated"],
-    "overall_assessment": "Brief overall assessment of Matthias's performance in this meeting"
+  "overall_sentiment": "positive | neutral | negative | mixed",
+  "sentiment_intensity": "mild | moderate | strong",
+  "speaker_emotions": [
+    {
+      "speaker": "Stefan",
+      "arc": [
+        {"time": "[14:23]", "tone": "skeptical", "energy": "medium", "trigger": "scope question raised", "quote": "Da bin ich noch nicht überzeugt..."},
+        {"time": "[18:01]", "tone": "agitated", "energy": "high", "trigger": "AI cost claim", "quote": "Das halte ich für unrealistisch."}
+      ]
+    }
+  ],
+  "speaker_pacing": {
+    "Matthias": {"wpm_avg": 145, "hesitation_count": 8, "longest_pause_sec": 3.2},
+    "Stefan": {"wpm_avg": 110, "hesitation_count": 22, "longest_pause_sec": 5.8}
+  },
+  "interruptions": [
+    {"time": "[12:45]", "interrupter": "Matthias", "interruptee": "Stefan", "context_quote": "...wenn wir das so machen — Aber wäre es nicht..."}
+  ],
+  "energy_levels": {
+    "Matthias": {"avg": "high", "arc": [{"time": "[00:00]", "level": "high"}, {"time": "[15:00]", "level": "medium"}]},
+    "Stefan": {"avg": "medium", "arc": [{"time": "[00:00]", "level": "medium"}, {"time": "[18:00]", "level": "high"}]}
   }
 }
 
-## LAILIX CONTEXT (for feedback evaluation)
+## TONE VOCABULARY
 
-Lailix is a Swiss AI consultancy with these characteristics:
-- Mission: Helping product teams become "AI Agent Ready"
-- Approach: Connecting the "Four Voices" - Customer, Prospect, Product, Team
-- Values: No slides, no hype, just real outcomes
-- Target clients: Product-led tech companies (50-300 employees)
-- Key offering: AI Agent Readiness Diagnostic
+Use specific tone labels from this set:
+- Positive: enthusiastic, warm, confident, engaged, curious, supportive, amused
+- Neutral: neutral, professional, measured, focused, attentive
+- Negative: skeptical, agitated, frustrated, hesitant, anxious, defensive, dismissive, tired
+- Complex: thoughtful, conflicted, evasive, polite-but-distant
 
-## LAILIX FEEDBACK CRITERIA
+## ENERGY LEVELS
 
-When evaluating Matthias's performance, consider:
+`high` (animated, fast, leaning in) | `medium` (steady, conversational) | `low` (slow, withdrawn, tired)
 
-1. **Discovery Quality** (communication_score component)
-   - Are we asking probing questions to uncover real pain points?
-   - Are we listening actively and building on responses?
-   - Are we avoiding assumptions and truly understanding the client's situation?
+## INTERRUPTIONS
 
-2. **Value Articulation** (sales_score component)
-   - Are we clearly explaining how Lailix helps?
-   - Are we connecting our capabilities to their specific needs?
-   - Are we demonstrating expertise without being arrogant?
+Only flag genuine interruptions (cutting someone off mid-thought), not collaborative cross-talk or short acknowledgments ("ja", "mhm", "right"). The `context_quote` should capture the boundary moment showing both speakers.
 
-3. **Consultative Approach** (both scores)
-   - Are we asking more than telling?
-   - Are we positioning ourselves as a trusted advisor?
-   - Are we providing genuine value in the conversation itself?
+## SPEAKER_EMOTIONS GUIDANCE
 
-4. **Strategic Fit** (strategic_alignment)
-   - Is this the right type of client for Lailix?
-   - Are they in our target segment (product-led, 50-300 employees)?
-   - Do they have problems we can genuinely solve?
+Capture meaningful shifts: energy changes, topic transitions, points of friction, moments of agreement or breakthrough. Aim for 3-8 arc events per active speaker per 15-minute segment. Apply the same observational standard to the host as to anyone else — Matthias's emotional arc matters too.
 
-5. **Communication Clarity** (communication_score)
-   - Is the communication clear and well-structured?
-   - Are complex concepts explained simply?
-   - Is the pace appropriate?
+## PACING MEASUREMENTS
 
-Score both communication and sales on a 1-10 scale:
-- 1-3: Significant improvement needed
-- 4-5: Below expectations
-- 6-7: Meets expectations
-- 8-9: Exceeds expectations
-- 10: Exceptional performance
+Derive from actual speech rate, not transcript text length. `hesitation_count` is filler words and audible self-corrections ("ähm", "äh", "I mean", "sorry"). `longest_pause_sec` is the longest mid-utterance silence by that speaker (excluding turn-taking gaps).
 
-## IMPORTANT NOTES
+## NOTES
 
-- The transcript field must contain the COMPLETE meeting, not a summary
-- If the audio is very long (>1 hour), still transcribe everything
-- Detect and preserve the original language(s) used
-- For mixed-language meetings, transcribe each segment in its original language
-- If audio quality is poor in sections, indicate [inaudible] or [unclear]
+- The transcript field must contain the COMPLETE recording, not a summary.
+- For mixed-language meetings, transcribe each segment in its original language.
+- If audio quality is poor in a section, indicate `[inaudible]` and continue.
+- Do NOT include title, summary, key_points, tags, meeting_type, action_items, decisions, or coaching feedback — these are produced downstream by an LLM with full repository context.
+"""
+
+
+# Reduce-pass prompt. Used for chunked recordings where each chunk produced its
+# own per-speaker analysis. This call sees the merged transcript + all chunk
+# analyses concatenated and produces a single coherent meeting-wide view.
+REDUCE_PASS_PROMPT = """You receive (a) the merged transcript of a meeting that was transcribed in chunks, and (b) the per-chunk audio analyses concatenated together. Produce a single coherent meeting-wide analysis.
+
+Return raw JSON (no fences) with exactly these fields:
+
+{
+  "overall_sentiment": "positive | neutral | negative | mixed",
+  "sentiment_intensity": "mild | moderate | strong",
+  "speaker_emotions": [
+    {"speaker": "<name>", "arc": [{"time": "[MM:SS]", "tone": "...", "energy": "...", "trigger": "...", "quote": "..."}]}
+  ],
+  "speaker_pacing": {"<speaker>": {"wpm_avg": <int>, "hesitation_count": <int>, "longest_pause_sec": <float>}},
+  "interruptions": [{"time": "[MM:SS]", "interrupter": "<name>", "interruptee": "<name>", "context_quote": "..."}],
+  "energy_levels": {"<speaker>": {"avg": "high|medium|low", "arc": [{"time": "[MM:SS]", "level": "..."}]}}
+}
+
+## RULES
+
+- Merge per-chunk arcs into one timeline per speaker. Drop near-duplicates introduced by chunk overlap (events within 30 seconds of each other with the same tone).
+- For pacing, average `wpm_avg` weighted by chunk duration; sum `hesitation_count`; take the max of `longest_pause_sec`.
+- For energy `avg`, use the dominant level across the chunks weighted by speaking time.
+- `overall_sentiment` and `sentiment_intensity` describe the whole meeting, not the dominant chunk. A meeting that goes positive → tense → resolved is `mixed` with `moderate` intensity.
+- Do NOT add fields beyond the schema above. Do NOT produce a transcript (it's already merged).
 """
 
 
 @dataclass
-class LailixFeedback:
-    """Lailix-specific coaching feedback."""
-    communication_score: int
-    communication_feedback: str
-    sales_score: int
-    sales_feedback: str
-    strategic_alignment: str
-    improvement_areas: list[str]
-    strengths: list[str]
-    overall_assessment: str = ""
-
-
-@dataclass
 class GeminiResult:
-    """Result from Gemini audio processing."""
+    """Result from Gemini audio processing — audio-derived signals only.
+
+    Text-reasoning fields (title, summary, action items, coaching, etc.) are
+    NOT here by design. They are produced downstream by Claude in the Brain
+    repo, which has access to ClientContext, SALES_COACHING.md, recent meeting
+    patterns, and the wiki — context Gemini does not have.
+    """
     # Transcript
     transcript: str
     language: str
 
-    # Metadata
-    title: str
-    summary: str
-    key_points: list[str]
-    tags: list[str]
-    participants: list[dict]
-    sentiment: str
-    meeting_type: str
-    action_items: list[str] = field(default_factory=list)
-    decisions_made: list[str] = field(default_factory=list)
+    # Diarization (audio-derived)
+    participants: list[dict] = field(default_factory=list)  # [{name, role, speaking_pct, total_seconds}]
 
-    # Lailix feedback
-    lailix_feedback: Optional[LailixFeedback] = None
+    # Whole-meeting affect (post reduce-pass for chunked recordings)
+    overall_sentiment: str = "neutral"      # positive | neutral | negative | mixed
+    sentiment_intensity: str = "moderate"   # mild | moderate | strong
+
+    # Per-speaker signals (irreplaceable from text)
+    speaker_emotions: list[dict] = field(default_factory=list)   # [{speaker, arc:[{time,tone,energy,trigger,quote}]}]
+    speaker_pacing: dict = field(default_factory=dict)           # {speaker: {wpm_avg, hesitation_count, longest_pause_sec}}
+    interruptions: list[dict] = field(default_factory=list)      # [{time, interrupter, interruptee, context_quote}]
+    energy_levels: dict = field(default_factory=dict)            # {speaker: {avg, arc:[{time,level}]}}
 
     # Processing metadata
     input_tokens: int = 0
@@ -161,6 +168,9 @@ class GeminiResult:
     audio_duration_seconds: float = 0.0
     processing_time_seconds: float = 0.0
     model: str = "gemini-2.5-flash"
+    chunked: bool = False
+    chunk_count: int = 1
+    reduce_pass_used: bool = False
 
     # Raw response for debugging
     raw_response: Optional[dict] = None
@@ -170,32 +180,28 @@ class GeminiResult:
 
     @property
     def parsed_response(self) -> dict:
-        """Reconstruct the dict form that legacy consumers expect."""
-        d = {
+        """Dict form for JSON serialization on disk and DB writes."""
+        return {
             "transcript": self.transcript,
             "language": self.language,
-            "title": self.title,
-            "summary": self.summary,
-            "key_points": self.key_points,
-            "tags": self.tags,
             "participants": self.participants,
-            "sentiment": self.sentiment,
-            "meeting_type": self.meeting_type,
-            "action_items": self.action_items,
-            "decisions_made": self.decisions_made,
+            "overall_sentiment": self.overall_sentiment,
+            "sentiment_intensity": self.sentiment_intensity,
+            "speaker_emotions": self.speaker_emotions,
+            "speaker_pacing": self.speaker_pacing,
+            "interruptions": self.interruptions,
+            "energy_levels": self.energy_levels,
+            "_meta": {
+                "model": self.model,
+                "chunked": self.chunked,
+                "chunk_count": self.chunk_count,
+                "reduce_pass_used": self.reduce_pass_used,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "processing_time_seconds": self.processing_time_seconds,
+                "audio_duration_seconds": self.audio_duration_seconds,
+            },
         }
-        if self.lailix_feedback:
-            d["lailix_feedback"] = {
-                "communication_score": self.lailix_feedback.communication_score,
-                "communication_feedback": self.lailix_feedback.communication_feedback,
-                "sales_score": self.lailix_feedback.sales_score,
-                "sales_feedback": self.lailix_feedback.sales_feedback,
-                "strategic_alignment": self.lailix_feedback.strategic_alignment,
-                "improvement_areas": self.lailix_feedback.improvement_areas,
-                "strengths": self.lailix_feedback.strengths,
-                "overall_assessment": self.lailix_feedback.overall_assessment,
-            }
-        return d
 
 
 class GeminiAudioProcessor:
@@ -315,23 +321,23 @@ class GeminiAudioProcessor:
 
         Args:
             audio_path: Path to the audio file (MP3, WAV, etc.)
-            custom_prompt: Optional custom prompt (default: LAILIX_ANALYSIS_PROMPT)
+            custom_prompt: Optional custom prompt (default: AUDIO_ANALYSIS_PROMPT)
 
         Returns:
-            GeminiResult with transcript, metadata, and Lailix feedback
+            GeminiResult with transcript and audio-derived signals.
         """
         audio_path = Path(audio_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
         # If audio is long, chunk-and-merge. Each chunk goes through the
-        # single-shot path below via recursion, then we stitch.
+        # single-shot path below via recursion, then we stitch + reduce-pass.
         total_duration = self._get_duration(audio_path)
         if total_duration > self.CHUNK_THRESHOLD_SEC:
             return self._process_chunked(audio_path, custom_prompt, total_duration)
 
         start_time = time.time()
-        prompt = custom_prompt or LAILIX_ANALYSIS_PROMPT
+        prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
 
         file_size = audio_path.stat().st_size
         file_size_mb = file_size / 1024 / 1024
@@ -408,6 +414,7 @@ class GeminiAudioProcessor:
 
         # Parse response
         result = self._parse_response(response, processing_time, response_text)
+        result.audio_duration_seconds = total_duration
 
         # Clean up uploaded file if we used Files API
         if uploaded_file is not None:
@@ -419,22 +426,26 @@ class GeminiAudioProcessor:
 
         return result
 
-    def _generate_with_retry(self, prompt: str, audio_content: Any,
+    def _generate_with_retry(self, prompt: str, audio_content: Optional[Any] = None,
                               max_attempts: int = 3) -> tuple:
         """Stream generate_content with retry on transient disconnects.
 
         Gemini's server disconnects with RemoteProtocolError on ~30% of
         long-audio requests. Streaming + retry makes the pipeline reliable.
 
+        Pass `audio_content=None` for a text-only call (used by the reduce-pass
+        merge over chunked transcripts).
+
         Returns: (text, response) where response has usage_metadata and text.
         """
+        contents = [prompt] if audio_content is None else [prompt, audio_content]
         last_error = None
         for attempt in range(1, max_attempts + 1):
             chunks = []
             try:
                 stream = self.client.models.generate_content_stream(
                     model=self.model,
-                    contents=[prompt, audio_content],
+                    contents=contents,
                     config=self.types.GenerateContentConfig(
                         temperature=self.temperature,
                         max_output_tokens=self.max_output_tokens,
@@ -461,14 +472,49 @@ class GeminiAudioProcessor:
                     time.sleep(wait)
         raise RuntimeError(f"All {max_attempts} attempts failed: {last_error}")
 
+    def _shift_event_times(self, events: list[dict], offset_sec: float,
+                           time_key: str = "time") -> list[dict]:
+        """Shift `[MM:SS]` timestamps inside a list of dict events by offset.
+
+        Used to convert per-chunk timestamps in `speaker_emotions[].arc[]`,
+        `interruptions`, and `energy_levels[].arc[]` to global meeting time.
+        """
+        shifted = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            new_ev = dict(ev)
+            t = new_ev.get(time_key)
+            if isinstance(t, str) and t.startswith('['):
+                new_ev[time_key] = self._shift_timestamps(t, offset_sec)
+            shifted.append(new_ev)
+        return shifted
+
+    def _shift_chunk_times(self, chunk_result: 'GeminiResult', offset_sec: float) -> None:
+        """In-place shift of all timestamps in a chunk result to global time."""
+        # speaker_emotions: [{speaker, arc:[{time,...}]}]
+        for entry in chunk_result.speaker_emotions:
+            if isinstance(entry, dict) and 'arc' in entry:
+                entry['arc'] = self._shift_event_times(entry['arc'], offset_sec)
+        # interruptions: [{time, ...}]
+        chunk_result.interruptions = self._shift_event_times(
+            chunk_result.interruptions, offset_sec
+        )
+        # energy_levels: {speaker: {avg, arc:[{time, level}]}}
+        for spk, data in chunk_result.energy_levels.items():
+            if isinstance(data, dict) and 'arc' in data:
+                data['arc'] = self._shift_event_times(data['arc'], offset_sec)
+
     def _process_chunked(self, audio_path: Path, custom_prompt: Optional[str],
                           total_duration: float) -> GeminiResult:
-        """Chunk long audio, transcribe each chunk, merge results.
+        """Chunk long audio, transcribe each chunk, merge with reduce-pass.
 
-        Analysis (title/summary/action_items/feedback) comes from the first
-        chunk only — reliable enough for routing/logging, and the Claude
-        meeting-actions skill redoes its own deeper analysis from the full
-        merged transcript anyway.
+        Per-chunk analyses (sentiment, speaker_emotions, pacing, etc.) are NOT
+        kept naively — that's what the prior implementation did and it was
+        wrong on long meetings (chunk 1 wins). Instead, after all chunks come
+        back, a single text-only Gemini call (REDUCE_PASS_PROMPT) sees the
+        merged transcript + concatenated per-chunk analyses and produces one
+        coherent meeting-wide view.
         """
         start_time = time.time()
         chunks = self._chunk_audio(audio_path)
@@ -477,8 +523,10 @@ class GeminiAudioProcessor:
         merged_transcript_parts = []
         input_tokens_total = 0
         output_tokens_total = 0
-        first_result = None
-        last_overlap_tail = None  # used to dedupe across chunk boundaries
+        chunk_results: list['GeminiResult'] = []
+        chunk_offsets: list[float] = []
+        chunk_language = "unknown"
+        chunk_participants: list[dict] = []
 
         for i, (chunk_path, offset) in enumerate(chunks):
             logger.info(f"  Chunk {i+1}/{len(chunks)} at offset {offset/60:.1f}min")
@@ -492,18 +540,23 @@ class GeminiAudioProcessor:
 
             input_tokens_total += chunk_result.input_tokens
             output_tokens_total += chunk_result.output_tokens
-            if first_result is None:
-                first_result = chunk_result
 
-            # Shift timestamps in chunk transcript by the chunk's start offset
-            shifted = self._shift_timestamps(chunk_result.transcript, offset)
-            merged_transcript_parts.append(shifted)
+            # Pick first non-empty language and participants list (these don't
+            # benefit from reduce-pass; they're stable across chunks).
+            if chunk_language == "unknown" and chunk_result.language not in (None, "", "unknown"):
+                chunk_language = chunk_result.language
+            if not chunk_participants and chunk_result.participants:
+                chunk_participants = chunk_result.participants
 
-        # Merge transcripts (naive concat — overlap region appears twice but
-        # timestamp ordering lets downstream consumers dedupe if needed)
+            # Shift all timestamps to global time
+            chunk_result.transcript = self._shift_timestamps(chunk_result.transcript, offset)
+            self._shift_chunk_times(chunk_result, offset)
+
+            merged_transcript_parts.append(chunk_result.transcript)
+            chunk_results.append(chunk_result)
+            chunk_offsets.append(offset)
+
         merged_transcript = '\n\n'.join(t for t in merged_transcript_parts if t.strip())
-        processing_time = time.time() - start_time
-        logger.info(f"Chunked processing complete in {processing_time:.1f}s")
 
         # Cleanup chunk files
         import shutil
@@ -513,138 +566,229 @@ class GeminiAudioProcessor:
             except Exception as e:
                 logger.warning(f"Cleanup failed: {e}")
 
-        # Build result: use first chunk's analysis for metadata
-        if first_result is None:
+        # All chunks failed — return a transcript-only error result
+        if not chunk_results:
+            processing_time = time.time() - start_time
             return GeminiResult(
                 transcript=merged_transcript,
                 language="unknown",
-                title="All chunks failed",
-                summary="All transcription chunks failed",
-                key_points=[], tags=["chunked_processing_error"],
-                participants=[], sentiment="neutral", meeting_type="other",
                 processing_time_seconds=processing_time,
+                model=self.model,
+                chunked=True,
+                chunk_count=len(chunks),
+                reduce_pass_used=False,
                 error="All chunks failed",
             )
 
+        # Reduce-pass: text-only call to merge per-chunk analyses
+        reduce_input = self._build_reduce_input(merged_transcript, chunk_results, chunk_offsets)
+        reduce_data = None
+        reduce_pass_ok = False
+        try:
+            logger.info(f"Running reduce-pass over {len(chunk_results)} chunk analyses...")
+            reduce_text, reduce_response = self._generate_with_retry(
+                prompt=REDUCE_PASS_PROMPT + "\n\n" + reduce_input,
+                audio_content=None,
+                max_attempts=2,
+            )
+            reduce_data = self._strip_and_parse_json(reduce_text)
+            if reduce_response and reduce_response.usage_metadata:
+                input_tokens_total += reduce_response.usage_metadata.prompt_token_count or 0
+                output_tokens_total += reduce_response.usage_metadata.candidates_token_count or 0
+            reduce_pass_ok = True
+        except Exception as e:
+            logger.warning(f"Reduce-pass failed ({e}); falling back to chunk-1 analysis")
+
+        processing_time = time.time() - start_time
+        logger.info(f"Chunked processing complete in {processing_time:.1f}s")
+
+        # Build merged result. Prefer reduce-pass output; fall back to chunk-1
+        # for whichever fields the reduce-pass didn't deliver.
+        first = chunk_results[0]
+        if reduce_data is None:
+            reduce_data = {}
+
         return GeminiResult(
             transcript=merged_transcript,
-            language=first_result.language,
-            title=first_result.title,
-            summary=first_result.summary,
-            key_points=first_result.key_points,
-            tags=first_result.tags + ["chunked"],
-            participants=first_result.participants,
-            sentiment=first_result.sentiment,
-            meeting_type=first_result.meeting_type,
-            action_items=first_result.action_items,
-            decisions_made=first_result.decisions_made,
-            lailix_feedback=first_result.lailix_feedback,
+            language=chunk_language or first.language or "unknown",
+            participants=chunk_participants or first.participants,
+            overall_sentiment=self._validate_sentiment(reduce_data.get("overall_sentiment", first.overall_sentiment)),
+            sentiment_intensity=self._validate_intensity(reduce_data.get("sentiment_intensity", first.sentiment_intensity)),
+            speaker_emotions=reduce_data.get("speaker_emotions") or self._merge_speaker_emotions(chunk_results),
+            speaker_pacing=reduce_data.get("speaker_pacing") or self._merge_speaker_pacing(chunk_results),
+            interruptions=reduce_data.get("interruptions") or self._merge_interruptions(chunk_results),
+            energy_levels=reduce_data.get("energy_levels") or self._merge_energy_levels(chunk_results),
             input_tokens=input_tokens_total,
             output_tokens=output_tokens_total,
             audio_duration_seconds=total_duration,
             processing_time_seconds=processing_time,
             model=self.model,
+            chunked=True,
+            chunk_count=len(chunks),
+            reduce_pass_used=reduce_pass_ok,
+            raw_response={"chunks": [c.parsed_response for c in chunk_results], "reduce": reduce_data},
         )
+
+    @staticmethod
+    def _strip_and_parse_json(text: str) -> dict:
+        """Strip markdown fences and parse JSON; raise on failure."""
+        s = text.strip()
+        if s.startswith("```json"):
+            s = s[7:]
+        elif s.startswith("```"):
+            s = s[3:]
+        if s.endswith("```"):
+            s = s[:-3]
+        return json.loads(s.strip())
+
+    @staticmethod
+    def _build_reduce_input(merged_transcript: str, chunk_results: list,
+                             chunk_offsets: list[float]) -> str:
+        """Render the input for the reduce-pass call.
+
+        Caps the merged transcript at ~120k chars to stay well under the
+        text-only context budget; the per-chunk analyses are usually small.
+        """
+        TRANSCRIPT_CAP = 120_000
+        clipped = merged_transcript[:TRANSCRIPT_CAP]
+        if len(merged_transcript) > TRANSCRIPT_CAP:
+            clipped += f"\n\n[...transcript truncated at {TRANSCRIPT_CAP} chars for reduce-pass...]"
+        chunk_blocks = []
+        for cr, off in zip(chunk_results, chunk_offsets):
+            block = {
+                "chunk_offset_sec": off,
+                "overall_sentiment": cr.overall_sentiment,
+                "sentiment_intensity": cr.sentiment_intensity,
+                "speaker_emotions": cr.speaker_emotions,
+                "speaker_pacing": cr.speaker_pacing,
+                "interruptions": cr.interruptions,
+                "energy_levels": cr.energy_levels,
+            }
+            chunk_blocks.append(block)
+        return (
+            "## MERGED TRANSCRIPT\n\n" + clipped +
+            "\n\n## PER-CHUNK ANALYSES\n\n" + json.dumps(chunk_blocks, ensure_ascii=False, indent=2)
+        )
+
+    @staticmethod
+    def _merge_speaker_emotions(chunk_results: list) -> list[dict]:
+        """Naive fallback: union arcs by speaker name (used if reduce-pass fails)."""
+        by_speaker: dict[str, list] = {}
+        for cr in chunk_results:
+            for entry in cr.speaker_emotions:
+                if not isinstance(entry, dict):
+                    continue
+                spk = entry.get("speaker")
+                if not spk:
+                    continue
+                by_speaker.setdefault(spk, []).extend(entry.get("arc", []) or [])
+        return [{"speaker": s, "arc": arc} for s, arc in by_speaker.items()]
+
+    @staticmethod
+    def _merge_speaker_pacing(chunk_results: list) -> dict:
+        """Average wpm, sum hesitations, max longest_pause across chunks."""
+        agg: dict[str, dict] = {}
+        for cr in chunk_results:
+            for spk, vals in (cr.speaker_pacing or {}).items():
+                if not isinstance(vals, dict):
+                    continue
+                a = agg.setdefault(spk, {"wpm_sum": 0.0, "n": 0, "hesitation_count": 0, "longest_pause_sec": 0.0})
+                a["wpm_sum"] += float(vals.get("wpm_avg") or 0)
+                a["n"] += 1
+                a["hesitation_count"] += int(vals.get("hesitation_count") or 0)
+                a["longest_pause_sec"] = max(a["longest_pause_sec"], float(vals.get("longest_pause_sec") or 0))
+        out = {}
+        for spk, a in agg.items():
+            out[spk] = {
+                "wpm_avg": int(a["wpm_sum"] / a["n"]) if a["n"] else 0,
+                "hesitation_count": a["hesitation_count"],
+                "longest_pause_sec": a["longest_pause_sec"],
+            }
+        return out
+
+    @staticmethod
+    def _merge_interruptions(chunk_results: list) -> list[dict]:
+        out = []
+        for cr in chunk_results:
+            for ev in (cr.interruptions or []):
+                if isinstance(ev, dict):
+                    out.append(ev)
+        return out
+
+    @staticmethod
+    def _merge_energy_levels(chunk_results: list) -> dict:
+        by_speaker: dict[str, dict] = {}
+        for cr in chunk_results:
+            for spk, data in (cr.energy_levels or {}).items():
+                if not isinstance(data, dict):
+                    continue
+                slot = by_speaker.setdefault(spk, {"avg_counts": {"high": 0, "medium": 0, "low": 0}, "arc": []})
+                avg = data.get("avg")
+                if avg in slot["avg_counts"]:
+                    slot["avg_counts"][avg] += 1
+                slot["arc"].extend(data.get("arc", []) or [])
+        out = {}
+        for spk, slot in by_speaker.items():
+            counts = slot["avg_counts"]
+            avg = max(counts.items(), key=lambda kv: kv[1])[0] if any(counts.values()) else "medium"
+            out[spk] = {"avg": avg, "arc": slot["arc"]}
+        return out
+
+    @staticmethod
+    def _validate_sentiment(s: Any) -> str:
+        return s if s in ("positive", "neutral", "negative", "mixed") else "neutral"
+
+    @staticmethod
+    def _validate_intensity(s: Any) -> str:
+        return s if s in ("mild", "moderate", "strong") else "moderate"
 
     def _parse_response(self, response: Any, processing_time: float,
                          text: Optional[str] = None) -> GeminiResult:
-        """Parse Gemini response into GeminiResult.
+        """Parse Gemini single-shot response into GeminiResult.
 
-        Args:
-            response: Gemini API response
-            processing_time: Time taken to process
-            text: Pre-collected text (from streaming). If None, uses response.text.
-
-        Returns:
-            GeminiResult with parsed data
+        Schema is the audio-only one (see AUDIO_ANALYSIS_PROMPT). Fields that
+        used to live here (title, summary, key_points, tags, meeting_type,
+        action_items, decisions_made, lailix_feedback) are no longer expected.
         """
-        # Get token usage
         usage = response.usage_metadata
         input_tokens = usage.prompt_token_count if usage else 0
         output_tokens = usage.candidates_token_count if usage else 0
 
-        # Parse JSON from response text
         if text is None:
             text = response.text
         logger.debug(f"Response length: {len(text)} chars")
 
-        # Clean potential markdown code blocks
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-
         try:
-            data = json.loads(text.strip())
+            data = self._strip_and_parse_json(text)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Gemini response as JSON: {e}")
             logger.debug(f"Raw response: {text[:500]}...")
-            # Return minimal result with raw text
             return GeminiResult(
                 transcript=text,
                 language="unknown",
-                title="Parse Error",
-                summary="Failed to parse Gemini response",
-                key_points=[],
-                tags=["parse_error"],
-                participants=[],
-                sentiment="neutral",
-                meeting_type="other",
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 processing_time_seconds=processing_time,
-                raw_response={"raw_text": text, "parse_error": str(e)}
+                model=self.model,
+                error=f"JSONDecodeError: {e}",
+                raw_response={"raw_text": text, "parse_error": str(e)},
             )
-
-        # Extract Lailix feedback
-        lailix_data = data.get("lailix_feedback", {})
-        lailix_feedback = None
-        if lailix_data:
-            lailix_feedback = LailixFeedback(
-                communication_score=lailix_data.get("communication_score", 0),
-                communication_feedback=lailix_data.get("communication_feedback", ""),
-                sales_score=lailix_data.get("sales_score", 0),
-                sales_feedback=lailix_data.get("sales_feedback", ""),
-                strategic_alignment=lailix_data.get("strategic_alignment", ""),
-                improvement_areas=lailix_data.get("improvement_areas", []),
-                strengths=lailix_data.get("strengths", []),
-                overall_assessment=lailix_data.get("overall_assessment", "")
-            )
-
-        # Validate enums
-        valid_sentiments = ["positive", "neutral", "negative", "mixed"]
-        sentiment = data.get("sentiment", "neutral")
-        if sentiment not in valid_sentiments:
-            sentiment = "neutral"
-
-        valid_types = [
-            "client_call", "internal", "sales", "support", "interview",
-            "workshop", "presentation", "homeschooling", "other"
-        ]
-        meeting_type = data.get("meeting_type", "other")
-        if meeting_type not in valid_types:
-            meeting_type = "other"
 
         return GeminiResult(
             transcript=data.get("transcript", ""),
             language=data.get("language", "unknown"),
-            title=data.get("title", "Untitled Meeting"),
-            summary=data.get("summary", ""),
-            key_points=data.get("key_points", []),
-            tags=data.get("tags", []),
             participants=data.get("participants", []),
-            sentiment=sentiment,
-            meeting_type=meeting_type,
-            action_items=data.get("action_items", []),
-            decisions_made=data.get("decisions_made", []),
-            lailix_feedback=lailix_feedback,
+            overall_sentiment=self._validate_sentiment(data.get("overall_sentiment", "neutral")),
+            sentiment_intensity=self._validate_intensity(data.get("sentiment_intensity", "moderate")),
+            speaker_emotions=data.get("speaker_emotions", []) or [],
+            speaker_pacing=data.get("speaker_pacing", {}) or {},
+            interruptions=data.get("interruptions", []) or [],
+            energy_levels=data.get("energy_levels", {}) or {},
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             processing_time_seconds=processing_time,
             model=self.model,
-            raw_response=data
+            raw_response=data,
         )
 
     def estimate_cost(self, audio_duration_seconds: float) -> dict:
@@ -729,26 +873,31 @@ if __name__ == "__main__":
     result = processor.process_audio(audio_file)
 
     print(f"\n{'='*60}")
-    print(f"Title: {result.title}")
     print(f"Language: {result.language}")
-    print(f"Meeting type: {result.meeting_type}")
-    print(f"Sentiment: {result.sentiment}")
-    print(f"\nSummary: {result.summary}")
-    print(f"\nKey points:")
-    for point in result.key_points:
-        print(f"  - {point}")
+    print(f"Overall sentiment: {result.overall_sentiment} ({result.sentiment_intensity})")
+    print(f"Chunked: {result.chunked} (count={result.chunk_count}, reduce_pass={result.reduce_pass_used})")
 
-    if result.lailix_feedback:
-        print(f"\n{'='*60}")
-        print("LAILIX FEEDBACK")
-        print(f"Communication Score: {result.lailix_feedback.communication_score}/10")
-        print(f"Sales Score: {result.lailix_feedback.sales_score}/10")
-        print(f"\nStrengths:")
-        for s in result.lailix_feedback.strengths:
-            print(f"  + {s}")
-        print(f"\nImprovement Areas:")
-        for i in result.lailix_feedback.improvement_areas:
-            print(f"  - {i}")
+    print(f"\nParticipants:")
+    for p in result.participants:
+        print(f"  - {p.get('name')} ({p.get('role')}): {p.get('speaking_pct')}% / {p.get('total_seconds')}s")
+
+    print(f"\nSpeaker emotion arcs:")
+    for entry in result.speaker_emotions:
+        spk = entry.get("speaker", "?")
+        arc = entry.get("arc", [])
+        print(f"  {spk}: {len(arc)} events")
+        for ev in arc[:3]:
+            print(f"    {ev.get('time')} {ev.get('tone')}/{ev.get('energy')} — {ev.get('trigger')}")
+        if len(arc) > 3:
+            print(f"    ... +{len(arc)-3} more")
+
+    print(f"\nPacing:")
+    for spk, vals in (result.speaker_pacing or {}).items():
+        print(f"  {spk}: {vals.get('wpm_avg')} wpm, {vals.get('hesitation_count')} hesitations, longest pause {vals.get('longest_pause_sec')}s")
+
+    print(f"\nInterruptions: {len(result.interruptions or [])}")
+    for ev in (result.interruptions or [])[:5]:
+        print(f"  {ev.get('time')}: {ev.get('interrupter')} → {ev.get('interruptee')}")
 
     print(f"\n{'='*60}")
     print(f"Processing time: {result.processing_time_seconds:.1f}s")
