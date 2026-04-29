@@ -80,6 +80,15 @@ except ImportError as e:
     CALENDAR_RESOLVE_AVAILABLE = False
     _CALENDAR_RESOLVE_IMPORT_ERROR = str(e)
 
+# Import speaker_reconcile to canonicalize Gemini-guessed speaker names
+# against the calendar attendee list before persisting the transcript.
+try:
+    from speaker_reconcile import reconcile as _reconcile_speakers
+    SPEAKER_RECONCILE_AVAILABLE = True
+except ImportError as e:
+    SPEAKER_RECONCILE_AVAILABLE = False
+    _SPEAKER_RECONCILE_IMPORT_ERROR = str(e)
+
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
@@ -623,8 +632,21 @@ class TranscribeWatcher:
             if result.input_tokens and result.output_tokens:
                 self.logger.info(f"Tokens - Input: {result.input_tokens}, Output: {result.output_tokens}")
 
-            # Step 4: Save JSON result alongside MP3
+            # Step 4: derive JSON output path for the rest of the pipeline.
             json_path = mp3_path.with_suffix('.json')
+
+            # Step 4a: Resolve calendar attendees BEFORE persisting anything,
+            # so we can canonicalize Gemini-guessed speaker names against the
+            # actual attendee list. Filename encodes the timestamp, so this
+            # works even though the JSON doesn't exist yet.
+            cal_match = self._resolve_calendar(json_path)
+
+            # Step 4b: Speaker reconciliation. Mutates `result` in place so
+            # downstream JSON write, DB seed, and `update_source_with_gemini`
+            # all see canonical names from the calendar.
+            self._reconcile_speakers_inplace(result, cal_match)
+
+            # Step 4c: Save JSON result alongside MP3 (now canonical).
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(result.parsed_response, f, indent=2, ensure_ascii=False)
             self.logger.info(f"Saved result to: {json_path.name}")
@@ -641,8 +663,8 @@ class TranscribeWatcher:
             # can skip its sources-UPDATE block. Each step is best-effort.
             self._enrich_with_gemini(source_id, result, audio_duration)
 
-            # Step 6c: Resolve participants via Google Calendar.
-            cal_match = self._calendar_resolve(source_id, json_path)
+            # Step 6c: Persist the calendar resolution we computed in Step 4a.
+            self._persist_calendar(source_id, cal_match)
 
             # Step 6d: Telegram ping — fires as soon as the row is in the DB
             # and ready for downstream LLM work. The Claude session below
@@ -848,16 +870,14 @@ class TranscribeWatcher:
                 f"Gemini enrichment failed for source_id={source_id}: {e}"
             )
 
-    def _calendar_resolve(self, source_id: Optional[int],
-                           transcript_path: Path) -> Optional[dict]:
-        """Resolve participants via Google Calendar; UPDATE sources.
+    def _resolve_calendar(self, transcript_path: Path) -> Optional[dict]:
+        """Look up the calendar event matching the transcript timestamp.
 
-        Returns the resolution dict on success (with calendar_event_id,
-        company, participant_details, participant_resolution_log), or None
-        if the lookup didn't run / failed.
+        Returns the resolution dict (calendar_event_id, company,
+        participant_details, participant_resolution_log) or None if the
+        lookup didn't run / failed. No DB writes here — `_persist_calendar`
+        does that AFTER the source row exists.
         """
-        if source_id is None:
-            return None
         if not CALENDAR_RESOLVE_AVAILABLE:
             self.logger.warning(
                 f"calendar_resolve unavailable; Claude will resolve "
@@ -865,25 +885,68 @@ class TranscribeWatcher:
             )
             return None
         try:
-            cal = _calendar_resolve.resolve(transcript_path)
+            return _calendar_resolve.resolve(transcript_path)
         except Exception as e:
             self.logger.warning(f"calendar_resolve failed: {e}")
             return None
+
+    def _reconcile_speakers_inplace(self, result, cal_match: Optional[dict]) -> None:
+        """Canonicalize Gemini-guessed speaker names against calendar attendees.
+
+        Mutates the GeminiResult fields (transcript, participants,
+        speaker_emotions, speaker_pacing, interruptions, energy_levels) so the
+        JSON write, the source content_text, the meeting_metadata row, and
+        Claude all see the same canonical names. Stashes a forensic log on
+        cal_match so it gets persisted via `participant_resolution_log`.
+        """
+        if not SPEAKER_RECONCILE_AVAILABLE:
+            self.logger.warning(
+                f"speaker_reconcile unavailable; speaker names not canonicalized "
+                f"({_SPEAKER_RECONCILE_IMPORT_ERROR})"
+            )
+            return
+        if not cal_match:
+            return
+        try:
+            d = result.parsed_response
+            recon_log = _reconcile_speakers(d, cal_match)
+            # Push reconciled values back into the dataclass.
+            result.transcript = d.get("transcript", result.transcript)
+            result.participants = d.get("participants", result.participants)
+            result.speaker_emotions = d.get("speaker_emotions", result.speaker_emotions)
+            result.speaker_pacing = d.get("speaker_pacing", result.speaker_pacing)
+            result.interruptions = d.get("interruptions", result.interruptions)
+            result.energy_levels = d.get("energy_levels", result.energy_levels)
+            # Attach to participant_resolution_log so it lands in the DB.
+            prl = cal_match.setdefault("participant_resolution_log", {})
+            prl["speaker_reconciliation"] = recon_log
+            if recon_log.get("rewrote_speakers"):
+                self.logger.info(
+                    f"Speaker reconciliation rewrote "
+                    f"{recon_log['rewrote_speakers']} name(s) using calendar"
+                )
+        except Exception as e:
+            self.logger.warning(f"Speaker reconciliation failed: {e}")
+
+    def _persist_calendar(self, source_id: Optional[int],
+                            cal_match: Optional[dict]) -> None:
+        """Write the already-resolved calendar match to the sources row."""
+        if source_id is None or not cal_match:
+            return
         if not NEON_INSERT_AVAILABLE:
-            return cal
+            return
         try:
             _insightbase_update_calendar(
                 source_id=source_id,
-                participant_details=cal.get("participant_details") or [],
-                participant_resolution_log=cal.get("participant_resolution_log") or {},
-                calendar_event_id=cal.get("calendar_event_id"),
-                company=cal.get("company"),
+                participant_details=cal_match.get("participant_details") or [],
+                participant_resolution_log=cal_match.get("participant_resolution_log") or {},
+                calendar_event_id=cal_match.get("calendar_event_id"),
+                company=cal_match.get("company"),
             )
         except Exception as e:
             self.logger.warning(
                 f"Calendar UPDATE failed for source_id={source_id}: {e}"
             )
-        return cal
 
     def _notify_telegram_meeting_captured(self, source_id: Optional[int],
                                             result, cal_match: Optional[dict],

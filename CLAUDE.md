@@ -114,17 +114,11 @@ Located in `environments/`:
 
 ## Git Remotes
 
-This fork setup:
 ```
-origin   → https://github.com/MatthiasHeim/noScribe (this fork)
-upstream → https://github.com/kaixxx/noScribe (original)
+origin → https://github.com/MatthiasHeim/MeetingMemory
 ```
 
-To sync with upstream:
-```bash
-git fetch upstream
-git merge upstream/main
-```
+This repo started as a fork of [kaixxx/noScribe](https://github.com/kaixxx/noScribe) but has since rebranded as MeetingMemory and dropped the local-transcription pipeline in favour of Gemini audio. The upstream remote was removed because divergence is no longer meaningful.
 
 # Tool Usage Protocol
 - **N8N Operations**: You are FORBIDDEN from calling `n8n_*` tools directly.
