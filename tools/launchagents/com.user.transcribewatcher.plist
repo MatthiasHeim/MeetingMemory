@@ -7,8 +7,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/Matthias/noScribe/venv/bin/python</string>
-        <string>/Users/Matthias/noScribe/tools/transcribe_watcher.py</string>
+        <string>/Users/Matthias/Desktop/Repos/MeetingMemory/venv/bin/python</string>
+        <string>/Users/Matthias/Desktop/Repos/MeetingMemory/tools/transcribe_watcher.py</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -24,7 +24,13 @@
     <string>/Users/Matthias/Documents/MeetingRecorder/logs/watcher_stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/Matthias/noScribe</string>
+    <string>/Users/Matthias/Desktop/Repos/MeetingMemory</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin</string>
+    </dict>
 
     <key>ThrottleInterval</key>
     <integer>10</integer>
