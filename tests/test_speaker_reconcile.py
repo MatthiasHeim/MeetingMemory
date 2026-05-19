@@ -215,8 +215,12 @@ def test_mid_sentence_fragments_filtered_from_candidates():
         assert not any(c.isdigit() for c in n)
 
 
-def test_speaker_n_labels_ignored_as_candidates():
-    """Generic 'Speaker 2' style labels do not produce a rename decision."""
+def test_speaker_n_labels_collapse_in_1to1_calendar():
+    """Generic 'Speaker 2' style labels ARE candidates and, in a 1:1
+    calendar meeting, collapse to the sole canonical attendee. (Before the
+    singleton_collapse fix these labels were silently dropped — see the
+    Antonella mislabel bug where 'Speaker 1' / 'Speaker 2' / 'Vivienne'
+    persisted across chunks.)"""
     cal = _cal([
         {"name": "Matthias Heim", "role": "self"},
         {"name": "Ladina Walicki-Kasper", "role": "participant"},
@@ -224,4 +228,176 @@ def test_speaker_n_labels_ignored_as_candidates():
     g = _gem(transcript="Speaker 2: hi.\nMatthias: hi.")
     log = reconcile(g, cal)
     names = {d["gemini_name"] for d in log["decisions"]}
-    assert "Speaker 2" not in names
+    assert "Speaker 2" in names
+    # Only one non-self gemini label → strict singleton fires.
+    assert any(d["rule"] == "singleton" and d["canonical_name"] == "Ladina Walicki-Kasper"
+               for d in log["decisions"])
+    assert "Ladina Walicki-Kasper: hi." in g["transcript"]
+
+
+# ── singleton_collapse (Fix 2) ────────────────────────────────────────
+
+
+def test_singleton_collapse_rewrites_multiple_drifted_labels():
+    """Antonella case: 1:1 calendar (one external attendee) and Gemini
+    chunk-drift surfaces THREE different labels for the same physical
+    speaker ('Speaker 1', 'Speaker 2', 'Vivienne'). Strict singleton can't
+    fire (multiple non-self labels), but singleton_collapse must rewrite
+    ALL three to the sole calendar attendee."""
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Antonella Borromeo", "company": "BlueCare",
+         "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "[00:00] Speaker 1: Hallo Matthias.\n"
+            "Matthias: Schön dich zu sehen.\n"
+            "[14:30] Vivienne: Wir haben Standorte.\n"
+            "Matthias: Aha.\n"
+            "[31:12] Speaker 2: Und dann noch.\n"
+        ),
+        participants=[
+            {"name": "Matthias", "role": "host", "speaking_pct": 40},
+            {"name": "Speaker 1", "role": "participant", "speaking_pct": 60},
+        ],
+        speaker_emotions=[
+            {"speaker": "Speaker 1", "arc": [{"time": "[00:30]", "tone": "warm"}]},
+            {"speaker": "Vivienne", "arc": [{"time": "[15:00]", "tone": "focused"}]},
+        ],
+        speaker_pacing={
+            "Vivienne": {"wpm_avg": 130, "hesitation_count": 5, "longest_pause_sec": 2.0},
+            "Speaker 2": {"wpm_avg": 120, "hesitation_count": 3, "longest_pause_sec": 1.5},
+        },
+        interruptions=[
+            {"time": "[14:31]", "interrupter": "Matthias", "interruptee": "Vivienne"},
+        ],
+        energy_levels={"Speaker 1": {"avg": "medium", "arc": []}},
+    )
+
+    log = reconcile(g, cal)
+
+    # All three drifted labels collapsed to Antonella.
+    collapse_decisions = [d for d in log["decisions"]
+                          if d["rule"] == "singleton_collapse"]
+    collapsed_names = {d["gemini_name"] for d in collapse_decisions}
+    assert collapsed_names == {"Speaker 1", "Vivienne", "Speaker 2"}
+    for d in collapse_decisions:
+        assert d["canonical_name"] == "Antonella Borromeo"
+    assert log["collapsed_labels"] == 3
+    assert log["rewrote_speakers"] == 3
+
+    # Transcript labels rewritten everywhere.
+    assert "Speaker 1" not in g["transcript"]
+    assert "Speaker 2" not in g["transcript"]
+    assert "Vivienne" not in g["transcript"]
+    assert "Antonella Borromeo:" in g["transcript"]
+    # Matthias preserved.
+    assert "Matthias: Schön dich zu sehen." in g["transcript"]
+
+    # Structured fields rewritten too.
+    assert any(p["name"] == "Antonella Borromeo" for p in g["participants"])
+    assert all(p["name"] != "Speaker 1" for p in g["participants"])
+    assert all(e["speaker"] == "Antonella Borromeo"
+               for e in g["speaker_emotions"])
+    assert "Antonella Borromeo" in g["speaker_pacing"]
+    assert "Vivienne" not in g["speaker_pacing"]
+    assert "Speaker 2" not in g["speaker_pacing"]
+    assert g["interruptions"][0]["interruptee"] == "Antonella Borromeo"
+    assert "Antonella Borromeo" in g["energy_levels"]
+
+
+def test_singleton_collapse_skipped_for_multi_attendee_drift():
+    """When calendar has 2+ external attendees, chunk drift must NOT
+    collapse — we can't know which physical speaker each label maps to."""
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Stefan Müller", "role": "participant"},
+        {"name": "Anna Weber", "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "[00:00] Speaker 1: Hi.\n"
+            "Matthias: Hallo.\n"
+            "[10:00] Someone Else: Etwas.\n"
+        ),
+        participants=[
+            {"name": "Matthias"},
+            {"name": "Speaker 1"},
+            {"name": "Someone Else"},
+        ],
+    )
+    log = reconcile(g, cal)
+    # No collapse: too many canonicals to disambiguate.
+    assert log.get("collapsed_labels", 0) == 0
+    assert log["rewrote_speakers"] == 0
+    rules = {d["gemini_name"]: d["rule"] for d in log["decisions"]}
+    assert rules["Speaker 1"] == "none"
+    assert rules["Someone Else"] == "none"
+    # Original labels preserved in transcript.
+    assert "Speaker 1:" in g["transcript"]
+    assert "Someone Else:" in g["transcript"]
+
+
+def test_singleton_collapse_does_not_overwrite_confident_match():
+    """Ad-hoc joiner case: calendar lists ONE external attendee, but Gemini
+    correctly identifies the canonical (confident match) AND also surfaces
+    a different label. The canonical match must not be overwritten, and
+    the extra label must be preserved (could be an ad-hoc joiner). The
+    collapse rule only fires when the canonical wasn't already matched."""
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Ladina Walicki-Kasper", "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "[00:00] Some Other Person: Hi.\n"
+            "Ladina Walicki-Kasper: Hallo.\n"
+            "Matthias: Hi all."
+        ),
+        participants=[
+            {"name": "Some Other Person"},
+            {"name": "Ladina Walicki-Kasper"},
+            {"name": "Matthias"},
+        ],
+    )
+    log = reconcile(g, cal)
+    assert log.get("collapsed_labels", 0) == 0
+    decisions = {d["gemini_name"]: d for d in log["decisions"]}
+    assert decisions["Ladina Walicki-Kasper"]["rule"] == "confident"
+    assert decisions["Some Other Person"]["rule"] == "none"
+    assert "Some Other Person:" in g["transcript"]
+
+
+def test_singleton_collapse_never_collapses_self_label():
+    """Self labels are excluded from the collapse pass."""
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Antonella Borromeo", "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "Matthias: Hi.\n"
+            "Matthias Heim: Continuing.\n"
+            "Speaker 1: Hallo.\n"
+            "Vivienne: Sicher."
+        ),
+        participants=[
+            {"name": "Matthias"}, {"name": "Speaker 1"}, {"name": "Vivienne"},
+        ],
+    )
+    log = reconcile(g, cal)
+    # Matthias / Matthias Heim resolve to 'self' and must NOT collapse.
+    for d in log["decisions"]:
+        if d["gemini_name"] in ("Matthias", "Matthias Heim"):
+            assert d["rule"] == "self"
+            assert d["canonical_name"] != "Antonella Borromeo"
+    # Drift labels DO collapse.
+    collapsed = {d["gemini_name"] for d in log["decisions"]
+                 if d["rule"] == "singleton_collapse"}
+    assert collapsed == {"Speaker 1", "Vivienne"}
+    # Both Matthias variants survived as Matthias (not rewritten to Antonella).
+    assert "Matthias:" in g["transcript"]
+    assert "Antonella Borromeo:" in g["transcript"]
+    # Self labels are intentionally NOT rewritten away from 'Matthias' —
+    # they're anchored, not collapsed.

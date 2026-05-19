@@ -617,9 +617,33 @@ class TranscribeWatcher:
             audio_duration = get_audio_duration(mp3_path)
             self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
 
-            # Step 3: Process with Gemini
+            # Step 2b: JSON output path used downstream (and as the source
+            # of truth for calendar timestamp parsing — filename-derived).
+            json_path = mp3_path.with_suffix('.json')
+
+            # Step 2c: Resolve calendar attendees BEFORE the Gemini call.
+            # Two reasons:
+            #   1. Pass attendees into Gemini so it doesn't guess names —
+            #      this prevents the cross-chunk drift that produced bogus
+            #      "Vivienne" / "Speaker 1" / "Speaker 2" labels in long
+            #      meetings (each chunk re-guessed in isolation).
+            #   2. The result also feeds speaker_reconcile as a safety net
+            #      for any remaining generic "Speaker A/B" labels.
+            # Filename encodes the timestamp, so resolve() works even though
+            # the JSON doesn't exist yet.
+            cal_match = self._resolve_calendar(json_path)
+            known_attendees = (cal_match or {}).get("participant_details") or []
+            if known_attendees:
+                self.logger.info(
+                    f"Calendar attendees ({len(known_attendees)}): "
+                    f"{', '.join(a.get('name', '?') for a in known_attendees)}"
+                )
+
+            # Step 3: Process with Gemini (with attendees prompt-injected)
             self.logger.info("Sending to Gemini API...")
-            result = self.gemini_processor.process_audio(mp3_path)
+            result = self.gemini_processor.process_audio(
+                mp3_path, known_attendees=known_attendees or None,
+            )
 
             processing_time = time.time() - start_time
             self.logger.info(f"Gemini processing complete in {processing_time:.1f}s")
@@ -632,16 +656,9 @@ class TranscribeWatcher:
             if result.input_tokens and result.output_tokens:
                 self.logger.info(f"Tokens - Input: {result.input_tokens}, Output: {result.output_tokens}")
 
-            # Step 4: derive JSON output path for the rest of the pipeline.
-            json_path = mp3_path.with_suffix('.json')
-
-            # Step 4a: Resolve calendar attendees BEFORE persisting anything,
-            # so we can canonicalize Gemini-guessed speaker names against the
-            # actual attendee list. Filename encodes the timestamp, so this
-            # works even though the JSON doesn't exist yet.
-            cal_match = self._resolve_calendar(json_path)
-
-            # Step 4b: Speaker reconciliation. Mutates `result` in place so
+            # Step 4b: Speaker reconciliation safety net. Even with attendees
+            # in the prompt, Gemini may still emit "Speaker A/B" for unclear
+            # voices — map those to canonicals. Mutates `result` in place so
             # downstream JSON write, DB seed, and `update_source_with_gemini`
             # all see canonical names from the calendar.
             self._reconcile_speakers_inplace(result, cal_match)

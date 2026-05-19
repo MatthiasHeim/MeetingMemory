@@ -24,6 +24,14 @@ Decision rules per Gemini-guessed name (highest precedence first):
     → fuzzy, rewrite.
   - Otherwise → keep Gemini guess (logged as no-match for review).
 
+Second pass — singleton_collapse: after the per-name loop, if calendar
+has exactly ONE non-self attendee but multiple non-self gemini labels
+remained unmatched (chunk drift produced 2-3 different labels for one
+physical speaker, e.g. "Speaker 1" / "Speaker 2" / "Vivienne" all for
+Antonella), collapse ALL unmatched non-self labels to that sole canonical.
+Rationale: in a 1:1, every non-host voice must be that one attendee —
+chunk drift cannot create real additional speakers.
+
 When the calendar lookup returned no external attendees (solo event, no
 match), reconciliation is skipped entirely — only Matthias is anchored,
 and there's no canonical to compare guesses against.
@@ -153,7 +161,12 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
             "skipped_no_calendar": bool,
         }
     """
-    log = {"decisions": [], "rewrote_speakers": 0, "skipped_no_calendar": False}
+    log = {
+        "decisions": [],
+        "rewrote_speakers": 0,
+        "collapsed_labels": 0,
+        "skipped_no_calendar": False,
+    }
 
     cal_attendees = (calendar_resolution or {}).get("participant_details") or []
     canonicals = _canonical_attendees(cal_attendees)
@@ -164,7 +177,9 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
 
     # Collect Gemini-guessed speaker names from participants[] and from the
     # transcript labels themselves (Gemini sometimes labels speakers without
-    # listing them in participants).
+    # listing them in participants). Generic "Speaker N" / "Speaker A" labels
+    # ARE collected — when calendar shows a 1:1 they collapse to the sole
+    # attendee in the second pass below.
     gemini_names: list[str] = []
     for p in gemini_dict.get("participants") or []:
         if isinstance(p, dict) and p.get("name"):
@@ -172,6 +187,7 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
             if n and n not in gemini_names:
                 gemini_names.append(n)
     transcript = gemini_dict.get("transcript") or ""
+    _generic_speaker_re = re.compile(r"^speaker\s+[A-Za-z0-9]+$", re.IGNORECASE)
     for m in re.finditer(
         r"(?:^|(?<=[\s\]]))([A-ZÄÖÜ][^\n:]{0,40}?)(?=:)",
         transcript, flags=re.MULTILINE,
@@ -179,14 +195,13 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         n = m.group(1).strip()
         if not n or n in gemini_names:
             continue
-        if n.lower().startswith("speaker "):
-            continue
-        if not _looks_like_speaker_name(n):
-            continue  # mid-paragraph captures (timestamps, sentence fragments)
-        gemini_names.append(n)
+        # Generic "Speaker N"/"Speaker A" labels are valid candidates (for
+        # the collapse pass); skip mid-paragraph captures with non-name shape.
+        if _generic_speaker_re.match(n) or _looks_like_speaker_name(n):
+            gemini_names.append(n)
 
-    # Compute singleton: only valid when calendar has exactly one non-self
-    # attendee AND Gemini surfaced exactly one non-self speaker.
+    # Compute strict singleton: calendar has exactly one non-self attendee
+    # AND Gemini surfaced exactly one non-self speaker label.
     non_self_canonicals = [c for c in canonicals if c["role"] != "self"]
     non_self_gemini = [n for n in gemini_names if not _is_self_label(n)]
     singleton_external = (
@@ -210,6 +225,46 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         log["decisions"].append(decision)
         if canonical and canonical["full"] != g:
             rename[g] = canonical["full"]
+
+    # Second pass — singleton_collapse. In a 1:1 calendar meeting where
+    # strict singleton couldn't fire (multiple drifted gemini labels) AND
+    # the sole canonical wasn't already confidently/fuzzy matched, every
+    # unmatched non-self label must be the sole canonical. Rewrite each
+    # 'none'-ruled decision in place. Self labels are excluded. The
+    # "no prior confident/fuzzy match for the canonical" guard preserves
+    # the ad-hoc-joiner case: when Ladina is correctly identified and a
+    # second person also appears, the second person is NOT collapsed.
+    if len(non_self_canonicals) == 1 and singleton_external is None:
+        sole = non_self_canonicals[0]
+        canonical_already_matched = any(
+            d.get("rule") in ("confident", "fuzzy")
+            and d.get("canonical_name") == sole["full"]
+            for d in log["decisions"]
+        )
+        if not canonical_already_matched:
+            unmatched_non_self = [
+                d for d in log["decisions"]
+                if d["rule"] == "none" and not _is_self_label(d["gemini_name"])
+            ]
+            collapse_count = 0
+            for d in unmatched_non_self:
+                if sole["full"] == d["gemini_name"]:
+                    continue  # already canonical
+                rename[d["gemini_name"]] = sole["full"]
+                d["canonical_name"] = sole["full"]
+                d["rule"] = "singleton_collapse"
+                d["evidence"] = (
+                    f"1:1 calendar with {len(unmatched_non_self)} drifted "
+                    f"labels — collapsed to sole attendee"
+                )
+                collapse_count += 1
+            if collapse_count:
+                log["collapsed_labels"] = collapse_count
+                logger.info(
+                    "speaker_reconcile: singleton_collapse rewrote %d "
+                    "drifted label(s) to %r",
+                    collapse_count, sole["full"],
+                )
 
     if not rename:
         return log
