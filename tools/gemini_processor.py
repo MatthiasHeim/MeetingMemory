@@ -49,31 +49,33 @@ Return a single JSON object (raw — no markdown code fences) with these fields:
   "language": "Primary language (e.g., 'German', 'Swiss German', 'English', 'Mixed German/English')",
   "participants": [
     {"name": "Matthias", "role": "host", "speaking_pct": 60, "total_seconds": 1230},
-    {"name": "Stefan", "role": "participant", "speaking_pct": 40, "total_seconds": 820}
+    {"name": "Speaker B", "role": "participant", "speaking_pct": 40, "total_seconds": 820}
   ],
   "overall_sentiment": "positive | neutral | negative | mixed",
   "sentiment_intensity": "mild | moderate | strong",
   "speaker_emotions": [
     {
-      "speaker": "Stefan",
+      "speaker": "Speaker B",
       "arc": [
-        {"time": "[14:23]", "tone": "skeptical", "energy": "medium", "trigger": "scope question raised", "quote": "Da bin ich noch nicht überzeugt..."},
-        {"time": "[18:01]", "tone": "agitated", "energy": "high", "trigger": "AI cost claim", "quote": "Das halte ich für unrealistisch."}
+        {"time": "[14:23]", "tone": "skeptical", "energy": "medium", "trigger": "scope question raised", "quote": "<verbatim quote in original language>"},
+        {"time": "[18:01]", "tone": "agitated", "energy": "high", "trigger": "pricing pushback", "quote": "<verbatim quote in original language>"}
       ]
     }
   ],
   "speaker_pacing": {
     "Matthias": {"wpm_avg": 145, "hesitation_count": 8, "longest_pause_sec": 3.2},
-    "Stefan": {"wpm_avg": 110, "hesitation_count": 22, "longest_pause_sec": 5.8}
+    "Speaker B": {"wpm_avg": 110, "hesitation_count": 22, "longest_pause_sec": 5.8}
   },
   "interruptions": [
-    {"time": "[12:45]", "interrupter": "Matthias", "interruptee": "Stefan", "context_quote": "...wenn wir das so machen — Aber wäre es nicht..."}
+    {"time": "[12:45]", "interrupter": "Matthias", "interruptee": "Speaker B", "context_quote": "<boundary moment showing both speakers>"}
   ],
   "energy_levels": {
     "Matthias": {"avg": "high", "arc": [{"time": "[00:00]", "level": "high"}, {"time": "[15:00]", "level": "medium"}]},
-    "Stefan": {"avg": "medium", "arc": [{"time": "[00:00]", "level": "medium"}, {"time": "[18:00]", "level": "high"}]}
+    "Speaker B": {"avg": "medium", "arc": [{"time": "[00:00]", "level": "medium"}, {"time": "[18:00]", "level": "high"}]}
   }
 }
+
+The names "Speaker B"/"Speaker C" above are PLACEHOLDERS for the schema. Replace them with the actual speaker's name when known (from the KNOWN ATTENDEES block below, if present), or with "Speaker B", "Speaker C", etc. if you cannot identify the speaker. Never carry "Speaker B" through as a literal name when a real name is available.
 
 ## TONE VOCABULARY
 
