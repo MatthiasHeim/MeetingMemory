@@ -32,6 +32,14 @@ import requests
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 
+# Marker used by the stale-code check below. Captured at module-import time
+# so we can warn when tools/*.py changes on disk without a process restart —
+# the operational failure mode behind the Stefan-mislabel incident where the
+# fixes were on disk but the long-running watcher was still serving the
+# pre-fix bytecode in memory.
+_PROCESS_START_MONOTONIC = time.time()
+_PROCESS_START_WALL = time.time()
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -92,6 +100,73 @@ except ImportError as e:
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
+
+
+def _git_sha() -> Optional[str]:
+    """Return the short git SHA of this repo, or None if unavailable."""
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip() or None
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def _tool_file_mtimes() -> dict[str, float]:
+    """Return mtime (seconds since epoch) for each .py in tools/."""
+    out: dict[str, float] = {}
+    for p in Path(__file__).resolve().parent.glob("*.py"):
+        try:
+            out[p.name] = p.stat().st_mtime
+        except OSError:
+            continue
+    return out
+
+
+def _log_code_version(logger: logging.Logger) -> None:
+    """Emit a one-shot banner with git SHA + tool-file mtimes.
+
+    Anchors every log file to a specific code revision. If the long-running
+    daemon is ever stale-deployed (fixes on disk, old bytecode in memory),
+    the operator can grep for this banner to see which revision is actually
+    running — that ambiguity is what hid the Stefan-mislabel root cause for
+    days.
+    """
+    sha = _git_sha() or "unknown"
+    mtimes = _tool_file_mtimes()
+    newest = max(mtimes.values()) if mtimes else 0
+    newest_iso = datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M:%S") if newest else "n/a"
+    logger.info(f"Code version: git={sha}, newest tools/*.py mtime={newest_iso}")
+
+
+def _warn_if_code_is_stale(logger: logging.Logger) -> None:
+    """Warn if any tools/*.py has been modified after this process started.
+
+    Fires once per detected file (suppressed by a module-level set so the log
+    doesn't get spammed). The next clean restart picks up the new code; until
+    then, the message gives the operator a single clear signal that a new
+    commit has landed and the watcher needs to be cycled.
+    """
+    stale: list[str] = []
+    for name, mtime in _tool_file_mtimes().items():
+        if mtime > _PROCESS_START_WALL and name not in _STALE_FILES_REPORTED:
+            stale.append(name)
+            _STALE_FILES_REPORTED.add(name)
+    if stale:
+        sha = _git_sha() or "unknown"
+        logger.warning(
+            f"Stale watcher: tools/*.py modified after process start — "
+            f"{', '.join(stale)}. Restart the watcher to load new code "
+            f"(current loaded SHA approx: {sha} but disk may be ahead)."
+        )
+
+
+_STALE_FILES_REPORTED: set[str] = set()
 
 
 def expand_path(path: str) -> Path:
@@ -280,6 +355,7 @@ class TranscribeWatcher:
     def start(self):
         """Start watching for new files."""
         self.logger.info(f"Starting TranscribeWatcher...")
+        _log_code_version(self.logger)
         self.logger.info(f"Watching: {self.recordings_dir}")
         self.logger.info(f"Transcripts: {self.transcripts_dir}")
 
@@ -605,6 +681,7 @@ class TranscribeWatcher:
             return
 
         self.logger.info(f"Starting Gemini processing: {audio_file.name}")
+        _warn_if_code_is_stale(self.logger)
         start_time = time.time()
 
         try:
@@ -617,9 +694,33 @@ class TranscribeWatcher:
             audio_duration = get_audio_duration(mp3_path)
             self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
 
-            # Step 3: Process with Gemini
+            # Step 2b: JSON output path used downstream (and as the source
+            # of truth for calendar timestamp parsing — filename-derived).
+            json_path = mp3_path.with_suffix('.json')
+
+            # Step 2c: Resolve calendar attendees BEFORE the Gemini call.
+            # Two reasons:
+            #   1. Pass attendees into Gemini so it doesn't guess names —
+            #      this prevents the cross-chunk drift that produced bogus
+            #      "Vivienne" / "Speaker 1" / "Speaker 2" labels in long
+            #      meetings (each chunk re-guessed in isolation).
+            #   2. The result also feeds speaker_reconcile as a safety net
+            #      for any remaining generic "Speaker A/B" labels.
+            # Filename encodes the timestamp, so resolve() works even though
+            # the JSON doesn't exist yet.
+            cal_match = self._resolve_calendar(json_path)
+            known_attendees = (cal_match or {}).get("participant_details") or []
+            if known_attendees:
+                self.logger.info(
+                    f"Calendar attendees ({len(known_attendees)}): "
+                    f"{', '.join(a.get('name', '?') for a in known_attendees)}"
+                )
+
+            # Step 3: Process with Gemini (with attendees prompt-injected)
             self.logger.info("Sending to Gemini API...")
-            result = self.gemini_processor.process_audio(mp3_path)
+            result = self.gemini_processor.process_audio(
+                mp3_path, known_attendees=known_attendees or None,
+            )
 
             processing_time = time.time() - start_time
             self.logger.info(f"Gemini processing complete in {processing_time:.1f}s")
@@ -632,16 +733,9 @@ class TranscribeWatcher:
             if result.input_tokens and result.output_tokens:
                 self.logger.info(f"Tokens - Input: {result.input_tokens}, Output: {result.output_tokens}")
 
-            # Step 4: derive JSON output path for the rest of the pipeline.
-            json_path = mp3_path.with_suffix('.json')
-
-            # Step 4a: Resolve calendar attendees BEFORE persisting anything,
-            # so we can canonicalize Gemini-guessed speaker names against the
-            # actual attendee list. Filename encodes the timestamp, so this
-            # works even though the JSON doesn't exist yet.
-            cal_match = self._resolve_calendar(json_path)
-
-            # Step 4b: Speaker reconciliation. Mutates `result` in place so
+            # Step 4b: Speaker reconciliation safety net. Even with attendees
+            # in the prompt, Gemini may still emit "Speaker A/B" for unclear
+            # voices — map those to canonicals. Mutates `result` in place so
             # downstream JSON write, DB seed, and `update_source_with_gemini`
             # all see canonical names from the calendar.
             self._reconcile_speakers_inplace(result, cal_match)

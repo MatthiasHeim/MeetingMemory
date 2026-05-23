@@ -24,6 +24,14 @@ Decision rules per Gemini-guessed name (highest precedence first):
     → fuzzy, rewrite.
   - Otherwise → keep Gemini guess (logged as no-match for review).
 
+Second pass — singleton_collapse: after the per-name loop, if calendar
+has exactly ONE non-self attendee but multiple non-self gemini labels
+remained unmatched (chunk drift produced 2-3 different labels for one
+physical speaker, e.g. "Speaker 1" / "Speaker 2" / "Vivienne" all for
+Antonella), collapse ALL unmatched non-self labels to that sole canonical.
+Rationale: in a 1:1, every non-host voice must be that one attendee —
+chunk drift cannot create real additional speakers.
+
 When the calendar lookup returned no external attendees (solo event, no
 match), reconciliation is skipped entirely — only Matthias is anchored,
 and there's no canonical to compare guesses against.
@@ -136,6 +144,73 @@ def _looks_like_speaker_name(s: str) -> bool:
     return bool(_NAME_RE.match((s or "").strip()))
 
 
+def _merge_pacing_under_rename(pacing: dict, rename: dict[str, str]) -> dict:
+    """Apply rename to a `speaker_pacing` dict, merging colliding entries.
+
+    Mirrors gemini_processor._merge_speaker_pacing's aggregation: mean wpm
+    weighted by entry count, sum of hesitations, max of longest pauses.
+    """
+    agg: dict[str, dict] = {}
+    for spk, vals in pacing.items():
+        if not isinstance(vals, dict):
+            continue
+        canonical = rename.get(spk, spk)
+        slot = agg.setdefault(canonical, {"wpm_sum": 0.0, "n": 0,
+                                          "hesitation_count": 0,
+                                          "longest_pause_sec": 0.0})
+        try:
+            slot["wpm_sum"] += float(vals.get("wpm_avg") or 0)
+            slot["n"] += 1
+            slot["hesitation_count"] += int(vals.get("hesitation_count") or 0)
+            slot["longest_pause_sec"] = max(
+                slot["longest_pause_sec"],
+                float(vals.get("longest_pause_sec") or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+    out = {}
+    for canonical, slot in agg.items():
+        out[canonical] = {
+            "wpm_avg": int(slot["wpm_sum"] / slot["n"]) if slot["n"] else 0,
+            "hesitation_count": slot["hesitation_count"],
+            "longest_pause_sec": slot["longest_pause_sec"],
+        }
+    return out
+
+
+def _merge_energy_under_rename(energy: dict, rename: dict[str, str]) -> dict:
+    """Apply rename to an `energy_levels` dict, merging colliding entries.
+
+    `avg` becomes the mode of the colliding values (ties resolved by the
+    canonical order high>medium>low). `arc` events are concatenated so
+    timeline data from every drifted label survives.
+    """
+    agg: dict[str, dict] = {}
+    for spk, data in energy.items():
+        if not isinstance(data, dict):
+            continue
+        canonical = rename.get(spk, spk)
+        slot = agg.setdefault(canonical, {
+            "avg_counts": {"high": 0, "medium": 0, "low": 0},
+            "arc": [],
+        })
+        avg = data.get("avg")
+        if avg in slot["avg_counts"]:
+            slot["avg_counts"][avg] += 1
+        slot["arc"].extend(data.get("arc") or [])
+    out = {}
+    for canonical, slot in agg.items():
+        counts = slot["avg_counts"]
+        # Tie-break by canonical order so the result is deterministic.
+        if any(counts.values()):
+            avg = max(("high", "medium", "low"),
+                      key=lambda level: counts[level])
+        else:
+            avg = "medium"
+        out[canonical] = {"avg": avg, "arc": slot["arc"]}
+    return out
+
+
 def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
     """Rewrite Gemini speaker names in `gemini_dict` (mutates in place).
 
@@ -153,7 +228,12 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
             "skipped_no_calendar": bool,
         }
     """
-    log = {"decisions": [], "rewrote_speakers": 0, "skipped_no_calendar": False}
+    log = {
+        "decisions": [],
+        "rewrote_speakers": 0,
+        "collapsed_labels": 0,
+        "skipped_no_calendar": False,
+    }
 
     cal_attendees = (calendar_resolution or {}).get("participant_details") or []
     canonicals = _canonical_attendees(cal_attendees)
@@ -164,7 +244,9 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
 
     # Collect Gemini-guessed speaker names from participants[] and from the
     # transcript labels themselves (Gemini sometimes labels speakers without
-    # listing them in participants).
+    # listing them in participants). Generic "Speaker N" / "Speaker A" labels
+    # ARE collected — when calendar shows a 1:1 they collapse to the sole
+    # attendee in the second pass below.
     gemini_names: list[str] = []
     for p in gemini_dict.get("participants") or []:
         if isinstance(p, dict) and p.get("name"):
@@ -172,6 +254,7 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
             if n and n not in gemini_names:
                 gemini_names.append(n)
     transcript = gemini_dict.get("transcript") or ""
+    _generic_speaker_re = re.compile(r"^speaker\s+[A-Za-z0-9]+$", re.IGNORECASE)
     for m in re.finditer(
         r"(?:^|(?<=[\s\]]))([A-ZÄÖÜ][^\n:]{0,40}?)(?=:)",
         transcript, flags=re.MULTILINE,
@@ -179,14 +262,13 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         n = m.group(1).strip()
         if not n or n in gemini_names:
             continue
-        if n.lower().startswith("speaker "):
-            continue
-        if not _looks_like_speaker_name(n):
-            continue  # mid-paragraph captures (timestamps, sentence fragments)
-        gemini_names.append(n)
+        # Generic "Speaker N"/"Speaker A" labels are valid candidates (for
+        # the collapse pass); skip mid-paragraph captures with non-name shape.
+        if _generic_speaker_re.match(n) or _looks_like_speaker_name(n):
+            gemini_names.append(n)
 
-    # Compute singleton: only valid when calendar has exactly one non-self
-    # attendee AND Gemini surfaced exactly one non-self speaker.
+    # Compute strict singleton: calendar has exactly one non-self attendee
+    # AND Gemini surfaced exactly one non-self speaker label.
     non_self_canonicals = [c for c in canonicals if c["role"] != "self"]
     non_self_gemini = [n for n in gemini_names if not _is_self_label(n)]
     singleton_external = (
@@ -211,6 +293,46 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         if canonical and canonical["full"] != g:
             rename[g] = canonical["full"]
 
+    # Second pass — singleton_collapse. In a 1:1 calendar meeting where
+    # strict singleton couldn't fire (multiple drifted gemini labels) AND
+    # the sole canonical wasn't already confidently/fuzzy matched, every
+    # unmatched non-self label must be the sole canonical. Rewrite each
+    # 'none'-ruled decision in place. Self labels are excluded. The
+    # "no prior confident/fuzzy match for the canonical" guard preserves
+    # the ad-hoc-joiner case: when Ladina is correctly identified and a
+    # second person also appears, the second person is NOT collapsed.
+    if len(non_self_canonicals) == 1 and singleton_external is None:
+        sole = non_self_canonicals[0]
+        canonical_already_matched = any(
+            d.get("rule") in ("confident", "fuzzy")
+            and d.get("canonical_name") == sole["full"]
+            for d in log["decisions"]
+        )
+        if not canonical_already_matched:
+            unmatched_non_self = [
+                d for d in log["decisions"]
+                if d["rule"] == "none" and not _is_self_label(d["gemini_name"])
+            ]
+            collapse_count = 0
+            for d in unmatched_non_self:
+                if sole["full"] == d["gemini_name"]:
+                    continue  # already canonical
+                rename[d["gemini_name"]] = sole["full"]
+                d["canonical_name"] = sole["full"]
+                d["rule"] = "singleton_collapse"
+                d["evidence"] = (
+                    f"1:1 calendar with {len(unmatched_non_self)} drifted "
+                    f"labels — collapsed to sole attendee"
+                )
+                collapse_count += 1
+            if collapse_count:
+                log["collapsed_labels"] = collapse_count
+                logger.info(
+                    "speaker_reconcile: singleton_collapse rewrote %d "
+                    "drifted label(s) to %r",
+                    collapse_count, sole["full"],
+                )
+
     if not rename:
         return log
     log["rewrote_speakers"] = len(rename)
@@ -225,9 +347,33 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         if isinstance(p, dict) and p.get("name") in rename:
             p["name"] = rename[p["name"]]
 
-    for entry in gemini_dict.get("speaker_emotions") or []:
-        if isinstance(entry, dict) and entry.get("speaker") in rename:
-            entry["speaker"] = rename[entry["speaker"]]
+    # Renames can be many-to-one (singleton_collapse maps multiple drifted
+    # labels to one canonical), so every per-speaker collection must merge
+    # collisions instead of overwriting. Without this, the last colliding
+    # label silently wins and earlier labels' pacing / energy / arc data is
+    # dropped — exactly the chunk-drift recovery this module is supposed
+    # to make safe.
+
+    # speaker_emotions: list of {speaker, arc}. Rewrite, then dedup by
+    # concatenating arcs per canonical speaker.
+    emotions = gemini_dict.get("speaker_emotions") or []
+    if emotions:
+        merged_emotions: dict[str, list] = {}
+        ordered_speakers: list[str] = []
+        for entry in emotions:
+            if not isinstance(entry, dict):
+                continue
+            spk = entry.get("speaker")
+            if not spk:
+                continue
+            canonical = rename.get(spk, spk)
+            if canonical not in merged_emotions:
+                merged_emotions[canonical] = []
+                ordered_speakers.append(canonical)
+            merged_emotions[canonical].extend(entry.get("arc") or [])
+        gemini_dict["speaker_emotions"] = [
+            {"speaker": s, "arc": merged_emotions[s]} for s in ordered_speakers
+        ]
 
     for ev in gemini_dict.get("interruptions") or []:
         if isinstance(ev, dict):
@@ -235,10 +381,13 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
                 if ev.get(k) in rename:
                     ev[k] = rename[ev[k]]
 
-    for key in ("speaker_pacing", "energy_levels"):
-        d = gemini_dict.get(key) or {}
-        if isinstance(d, dict):
-            gemini_dict[key] = {rename.get(k, k): v for k, v in d.items()}
+    pacing = gemini_dict.get("speaker_pacing") or {}
+    if isinstance(pacing, dict) and pacing:
+        gemini_dict["speaker_pacing"] = _merge_pacing_under_rename(pacing, rename)
+
+    energy = gemini_dict.get("energy_levels") or {}
+    if isinstance(energy, dict) and energy:
+        gemini_dict["energy_levels"] = _merge_energy_under_rename(energy, rename)
 
     logger.info(
         "speaker_reconcile: rewrote %d speakers — %s",

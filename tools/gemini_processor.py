@@ -49,31 +49,33 @@ Return a single JSON object (raw — no markdown code fences) with these fields:
   "language": "Primary language (e.g., 'German', 'Swiss German', 'English', 'Mixed German/English')",
   "participants": [
     {"name": "Matthias", "role": "host", "speaking_pct": 60, "total_seconds": 1230},
-    {"name": "Stefan", "role": "participant", "speaking_pct": 40, "total_seconds": 820}
+    {"name": "Speaker B", "role": "participant", "speaking_pct": 40, "total_seconds": 820}
   ],
   "overall_sentiment": "positive | neutral | negative | mixed",
   "sentiment_intensity": "mild | moderate | strong",
   "speaker_emotions": [
     {
-      "speaker": "Stefan",
+      "speaker": "Speaker B",
       "arc": [
-        {"time": "[14:23]", "tone": "skeptical", "energy": "medium", "trigger": "scope question raised", "quote": "Da bin ich noch nicht überzeugt..."},
-        {"time": "[18:01]", "tone": "agitated", "energy": "high", "trigger": "AI cost claim", "quote": "Das halte ich für unrealistisch."}
+        {"time": "[14:23]", "tone": "skeptical", "energy": "medium", "trigger": "scope question raised", "quote": "<verbatim quote in original language>"},
+        {"time": "[18:01]", "tone": "agitated", "energy": "high", "trigger": "pricing pushback", "quote": "<verbatim quote in original language>"}
       ]
     }
   ],
   "speaker_pacing": {
     "Matthias": {"wpm_avg": 145, "hesitation_count": 8, "longest_pause_sec": 3.2},
-    "Stefan": {"wpm_avg": 110, "hesitation_count": 22, "longest_pause_sec": 5.8}
+    "Speaker B": {"wpm_avg": 110, "hesitation_count": 22, "longest_pause_sec": 5.8}
   },
   "interruptions": [
-    {"time": "[12:45]", "interrupter": "Matthias", "interruptee": "Stefan", "context_quote": "...wenn wir das so machen — Aber wäre es nicht..."}
+    {"time": "[12:45]", "interrupter": "Matthias", "interruptee": "Speaker B", "context_quote": "<boundary moment showing both speakers>"}
   ],
   "energy_levels": {
     "Matthias": {"avg": "high", "arc": [{"time": "[00:00]", "level": "high"}, {"time": "[15:00]", "level": "medium"}]},
-    "Stefan": {"avg": "medium", "arc": [{"time": "[00:00]", "level": "medium"}, {"time": "[18:00]", "level": "high"}]}
+    "Speaker B": {"avg": "medium", "arc": [{"time": "[00:00]", "level": "medium"}, {"time": "[18:00]", "level": "high"}]}
   }
 }
+
+The names "Speaker B"/"Speaker C" above are PLACEHOLDERS for the schema. Replace them with the actual speaker's name when known (from the KNOWN ATTENDEES block below, if present), or with "Speaker B", "Speaker C", etc. if you cannot identify the speaker. Never carry "Speaker B" through as a literal name when a real name is available.
 
 ## TONE VOCABULARY
 
@@ -134,6 +136,49 @@ Return raw JSON (no fences) with exactly these fields:
 - `overall_sentiment` and `sentiment_intensity` describe the whole meeting, not the dominant chunk. A meeting that goes positive → tense → resolved is `mixed` with `moderate` intensity.
 - Do NOT add fields beyond the schema above. Do NOT produce a transcript (it's already merged).
 """
+
+
+SELF_NAME = "Matthias Heim"
+
+
+def _build_attendees_prefix(known_attendees: Optional[list[dict]]) -> str:
+    """Render a "KNOWN ATTENDEES" block to prepend to the audio prompt.
+
+    Anchors Gemini to the real attendee list from Google Calendar so it
+    doesn't invent names per chunk (the cross-chunk-drift bug behind the
+    Antonella mislabel). Returns "" if no usable non-self attendees were
+    provided — in that case the prompt is byte-identical to the legacy one.
+    """
+    if not known_attendees:
+        return ""
+    non_self = [
+        p for p in known_attendees
+        if isinstance(p, dict)
+        and (p.get("name") or "").strip()
+        and (p.get("role") or "").lower() != "self"
+        and (p.get("name") or "").strip().lower() != SELF_NAME.lower()
+    ]
+    if not non_self:
+        return ""
+
+    lines = [f"- {SELF_NAME} (host, Lailix)"]
+    for p in non_self:
+        name = (p.get("name") or "").strip()
+        company = (p.get("company") or "").strip()
+        role = (p.get("role") or "").strip()
+        descriptor = company or role or "participant"
+        lines.append(f"- {name} ({descriptor})")
+
+    return (
+        "## KNOWN ATTENDEES (USE THESE EXACT NAMES)\n\n"
+        "This recording is from a meeting with these attendees "
+        "(from Google Calendar):\n"
+        + "\n".join(lines) + "\n\n"
+        "Use these EXACT names for speaker labels (first name only is fine, "
+        "e.g. \"Antonella:\"). Do NOT invent other names. If you genuinely "
+        "cannot tell which attendee is speaking, use \"Speaker A:\", "
+        "\"Speaker B:\" — but never invent a name not in the list above.\n\n"
+    )
 
 
 @dataclass
@@ -315,13 +360,20 @@ class GeminiAudioProcessor:
     def process_audio(
         self,
         audio_path: Path,
-        custom_prompt: Optional[str] = None
+        custom_prompt: Optional[str] = None,
+        known_attendees: Optional[list[dict]] = None,
     ) -> GeminiResult:
         """Process an audio file with Gemini, returning transcript and analysis.
 
         Args:
             audio_path: Path to the audio file (MP3, WAV, etc.)
             custom_prompt: Optional custom prompt (default: AUDIO_ANALYSIS_PROMPT)
+            known_attendees: Optional list of calendar attendee records
+                (`{name, role, company, ...}`). When provided AND containing
+                at least one non-self attendee, a "KNOWN ATTENDEES" block is
+                prepended to the audio prompt so Gemini uses real names
+                instead of guessing. Required for chunked audio (≥15min) to
+                prevent cross-chunk name drift.
 
         Returns:
             GeminiResult with transcript and audio-derived signals.
@@ -334,10 +386,14 @@ class GeminiAudioProcessor:
         # single-shot path below via recursion, then we stitch + reduce-pass.
         total_duration = self._get_duration(audio_path)
         if total_duration > self.CHUNK_THRESHOLD_SEC:
-            return self._process_chunked(audio_path, custom_prompt, total_duration)
+            return self._process_chunked(
+                audio_path, custom_prompt, total_duration,
+                known_attendees=known_attendees,
+            )
 
         start_time = time.time()
-        prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
+        base_prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
+        prompt = _build_attendees_prefix(known_attendees) + base_prompt
 
         file_size = audio_path.stat().st_size
         file_size_mb = file_size / 1024 / 1024
@@ -506,7 +562,9 @@ class GeminiAudioProcessor:
                 data['arc'] = self._shift_event_times(data['arc'], offset_sec)
 
     def _process_chunked(self, audio_path: Path, custom_prompt: Optional[str],
-                          total_duration: float) -> GeminiResult:
+                          total_duration: float,
+                          known_attendees: Optional[list[dict]] = None,
+                          ) -> GeminiResult:
         """Chunk long audio, transcribe each chunk, merge with reduce-pass.
 
         Per-chunk analyses (sentiment, speaker_emotions, pacing, etc.) are NOT
@@ -515,6 +573,10 @@ class GeminiAudioProcessor:
         back, a single text-only Gemini call (REDUCE_PASS_PROMPT) sees the
         merged transcript + concatenated per-chunk analyses and produces one
         coherent meeting-wide view.
+
+        `known_attendees` is forwarded to EVERY chunk's Gemini call so all
+        chunks anchor to the same calendar attendee list — that's the fix
+        for cross-chunk speaker-name drift.
         """
         start_time = time.time()
         chunks = self._chunk_audio(audio_path)
@@ -531,8 +593,12 @@ class GeminiAudioProcessor:
         for i, (chunk_path, offset) in enumerate(chunks):
             logger.info(f"  Chunk {i+1}/{len(chunks)} at offset {offset/60:.1f}min")
             try:
-                # Recurse with single-shot path (chunks are all ≤15min)
-                chunk_result = self.process_audio(chunk_path, custom_prompt)
+                # Recurse with single-shot path (chunks are all ≤15min).
+                # Forward known_attendees so every chunk sees the same list.
+                chunk_result = self.process_audio(
+                    chunk_path, custom_prompt,
+                    known_attendees=known_attendees,
+                )
             except Exception as e:
                 logger.error(f"  Chunk {i+1} failed: {e}, continuing with others")
                 merged_transcript_parts.append(f"\n\n[CHUNK {i+1} FAILED: {e}]\n\n")
@@ -824,19 +890,22 @@ class GeminiAudioProcessor:
 
 def process_audio_file(
     audio_path: Path,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    known_attendees: Optional[list[dict]] = None,
 ) -> GeminiResult:
     """Convenience function to process an audio file.
 
     Args:
         audio_path: Path to the audio file
         api_key: Optional API key (default: from environment)
+        known_attendees: Optional calendar attendee records — see
+            GeminiAudioProcessor.process_audio for semantics.
 
     Returns:
         GeminiResult with transcript and analysis
     """
     processor = GeminiAudioProcessor(api_key=api_key)
-    return processor.process_audio(audio_path)
+    return processor.process_audio(audio_path, known_attendees=known_attendees)
 
 
 if __name__ == "__main__":
