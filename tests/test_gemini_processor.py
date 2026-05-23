@@ -5,6 +5,7 @@ call is not exercised here; that's an integration concern."""
 from __future__ import annotations
 
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from gemini_processor import (  # noqa: E402
     AUDIO_ANALYSIS_PROMPT,
+    REDUCE_PASS_PROMPT,
     GeminiAudioProcessor,
     _build_attendees_prefix,
     process_audio_file,
@@ -126,3 +128,39 @@ def test_prompt_prepended_with_attendees():
     assert "TRANSCRIPTION (REQUIRED)" in composed
     # And the attendee appears verbatim.
     assert "Antonella Borromeo (BlueCare)" in composed
+
+
+# ── named-person priming guard ────────────────────────────────────────
+
+
+# Names that have biased Gemini in past incidents. Each broke a real meeting:
+# - "Stefan" (Stefan Sieber at BlueCare) — the example JSON in
+#   AUDIO_ANALYSIS_PROMPT used to hardcode Stefan + Swiss-German business
+#   quotes, which primed Gemini to default to that name on any Swiss
+#   business call (source_id 186, source_id 192). Fix: 346a7ad1.
+# - Add more here as new bias incidents surface, with a short evidence note.
+_FORBIDDEN_PRIMING_NAMES: tuple[str, ...] = (
+    "Stefan",
+    "Sieber",
+)
+
+
+def test_prompts_contain_no_real_person_names():
+    """AUDIO_ANALYSIS_PROMPT and REDUCE_PASS_PROMPT must not name any real
+    person other than Matthias (the host anchor).
+
+    Few-shot examples that hardcode real names paired with realistic quotes
+    biased Gemini's attribution — see commit 346a7ad1. This guard prevents
+    that class of leak from regressing whenever someone iterates the prompt
+    schema. Add to `_FORBIDDEN_PRIMING_NAMES` when new bias incidents surface.
+    """
+    for needle in _FORBIDDEN_PRIMING_NAMES:
+        pat = re.compile(rf"\b{re.escape(needle)}\b")
+        assert not pat.search(AUDIO_ANALYSIS_PROMPT), (
+            f"AUDIO_ANALYSIS_PROMPT mentions {needle!r} — past-incident "
+            f"bias source. Use 'Speaker B/C' placeholders instead."
+        )
+        assert not pat.search(REDUCE_PASS_PROMPT), (
+            f"REDUCE_PASS_PROMPT mentions {needle!r} — past-incident "
+            f"bias source. Use 'Speaker B/C' placeholders instead."
+        )
