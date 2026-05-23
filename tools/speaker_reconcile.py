@@ -144,6 +144,73 @@ def _looks_like_speaker_name(s: str) -> bool:
     return bool(_NAME_RE.match((s or "").strip()))
 
 
+def _merge_pacing_under_rename(pacing: dict, rename: dict[str, str]) -> dict:
+    """Apply rename to a `speaker_pacing` dict, merging colliding entries.
+
+    Mirrors gemini_processor._merge_speaker_pacing's aggregation: mean wpm
+    weighted by entry count, sum of hesitations, max of longest pauses.
+    """
+    agg: dict[str, dict] = {}
+    for spk, vals in pacing.items():
+        if not isinstance(vals, dict):
+            continue
+        canonical = rename.get(spk, spk)
+        slot = agg.setdefault(canonical, {"wpm_sum": 0.0, "n": 0,
+                                          "hesitation_count": 0,
+                                          "longest_pause_sec": 0.0})
+        try:
+            slot["wpm_sum"] += float(vals.get("wpm_avg") or 0)
+            slot["n"] += 1
+            slot["hesitation_count"] += int(vals.get("hesitation_count") or 0)
+            slot["longest_pause_sec"] = max(
+                slot["longest_pause_sec"],
+                float(vals.get("longest_pause_sec") or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+    out = {}
+    for canonical, slot in agg.items():
+        out[canonical] = {
+            "wpm_avg": int(slot["wpm_sum"] / slot["n"]) if slot["n"] else 0,
+            "hesitation_count": slot["hesitation_count"],
+            "longest_pause_sec": slot["longest_pause_sec"],
+        }
+    return out
+
+
+def _merge_energy_under_rename(energy: dict, rename: dict[str, str]) -> dict:
+    """Apply rename to an `energy_levels` dict, merging colliding entries.
+
+    `avg` becomes the mode of the colliding values (ties resolved by the
+    canonical order high>medium>low). `arc` events are concatenated so
+    timeline data from every drifted label survives.
+    """
+    agg: dict[str, dict] = {}
+    for spk, data in energy.items():
+        if not isinstance(data, dict):
+            continue
+        canonical = rename.get(spk, spk)
+        slot = agg.setdefault(canonical, {
+            "avg_counts": {"high": 0, "medium": 0, "low": 0},
+            "arc": [],
+        })
+        avg = data.get("avg")
+        if avg in slot["avg_counts"]:
+            slot["avg_counts"][avg] += 1
+        slot["arc"].extend(data.get("arc") or [])
+    out = {}
+    for canonical, slot in agg.items():
+        counts = slot["avg_counts"]
+        # Tie-break by canonical order so the result is deterministic.
+        if any(counts.values()):
+            avg = max(("high", "medium", "low"),
+                      key=lambda level: counts[level])
+        else:
+            avg = "medium"
+        out[canonical] = {"avg": avg, "arc": slot["arc"]}
+    return out
+
+
 def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
     """Rewrite Gemini speaker names in `gemini_dict` (mutates in place).
 
@@ -280,9 +347,33 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         if isinstance(p, dict) and p.get("name") in rename:
             p["name"] = rename[p["name"]]
 
-    for entry in gemini_dict.get("speaker_emotions") or []:
-        if isinstance(entry, dict) and entry.get("speaker") in rename:
-            entry["speaker"] = rename[entry["speaker"]]
+    # Renames can be many-to-one (singleton_collapse maps multiple drifted
+    # labels to one canonical), so every per-speaker collection must merge
+    # collisions instead of overwriting. Without this, the last colliding
+    # label silently wins and earlier labels' pacing / energy / arc data is
+    # dropped — exactly the chunk-drift recovery this module is supposed
+    # to make safe.
+
+    # speaker_emotions: list of {speaker, arc}. Rewrite, then dedup by
+    # concatenating arcs per canonical speaker.
+    emotions = gemini_dict.get("speaker_emotions") or []
+    if emotions:
+        merged_emotions: dict[str, list] = {}
+        ordered_speakers: list[str] = []
+        for entry in emotions:
+            if not isinstance(entry, dict):
+                continue
+            spk = entry.get("speaker")
+            if not spk:
+                continue
+            canonical = rename.get(spk, spk)
+            if canonical not in merged_emotions:
+                merged_emotions[canonical] = []
+                ordered_speakers.append(canonical)
+            merged_emotions[canonical].extend(entry.get("arc") or [])
+        gemini_dict["speaker_emotions"] = [
+            {"speaker": s, "arc": merged_emotions[s]} for s in ordered_speakers
+        ]
 
     for ev in gemini_dict.get("interruptions") or []:
         if isinstance(ev, dict):
@@ -290,10 +381,13 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
                 if ev.get(k) in rename:
                     ev[k] = rename[ev[k]]
 
-    for key in ("speaker_pacing", "energy_levels"):
-        d = gemini_dict.get(key) or {}
-        if isinstance(d, dict):
-            gemini_dict[key] = {rename.get(k, k): v for k, v in d.items()}
+    pacing = gemini_dict.get("speaker_pacing") or {}
+    if isinstance(pacing, dict) and pacing:
+        gemini_dict["speaker_pacing"] = _merge_pacing_under_rename(pacing, rename)
+
+    energy = gemini_dict.get("energy_levels") or {}
+    if isinstance(energy, dict) and energy:
+        gemini_dict["energy_levels"] = _merge_energy_under_rename(energy, rename)
 
     logger.info(
         "speaker_reconcile: rewrote %d speakers — %s",

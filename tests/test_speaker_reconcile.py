@@ -401,3 +401,84 @@ def test_singleton_collapse_never_collapses_self_label():
     assert "Antonella Borromeo:" in g["transcript"]
     # Self labels are intentionally NOT rewritten away from 'Matthias' —
     # they're anchored, not collapsed.
+
+
+def test_singleton_collapse_merges_pacing_and_energy_collisions():
+    """Regression for P1 review feedback: when multiple drifted labels
+    collapse to one canonical, speaker_pacing/energy_levels/speaker_emotions
+    must MERGE the colliding entries, not overwrite (last-wins). Before this
+    fix, the dict comprehension dropped data silently — pacing for chunks
+    1 and 2 of the same physical speaker would be lost.
+    """
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Antonella Borromeo", "company": "BlueCare",
+         "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "[00:00] Speaker 1: Erstes Chunk.\n"
+            "[16:00] Vivienne: Zweites Chunk.\n"
+            "[31:00] Speaker 2: Drittes Chunk.\n"
+        ),
+        participants=[
+            {"name": "Matthias", "role": "host"},
+            {"name": "Speaker 1", "role": "participant"},
+        ],
+        # Three drifted labels each carrying their own arc of emotions —
+        # all three arcs must survive the collapse.
+        speaker_emotions=[
+            {"speaker": "Speaker 1",
+             "arc": [{"time": "[00:30]", "tone": "warm"}]},
+            {"speaker": "Vivienne",
+             "arc": [{"time": "[16:30]", "tone": "focused"}]},
+            {"speaker": "Speaker 2",
+             "arc": [{"time": "[31:30]", "tone": "tired"}]},
+        ],
+        # Pacing across three chunks — each with different numbers. The
+        # merged result must aggregate, not silently keep only the last.
+        speaker_pacing={
+            "Speaker 1": {"wpm_avg": 100, "hesitation_count": 5,
+                          "longest_pause_sec": 2.0},
+            "Vivienne":  {"wpm_avg": 140, "hesitation_count": 7,
+                          "longest_pause_sec": 5.0},
+            "Speaker 2": {"wpm_avg": 120, "hesitation_count": 3,
+                          "longest_pause_sec": 3.0},
+        },
+        # Energy across three chunks — arcs must concat, avg must mode.
+        energy_levels={
+            "Speaker 1": {"avg": "medium",
+                          "arc": [{"time": "[00:30]", "level": "medium"}]},
+            "Vivienne":  {"avg": "high",
+                          "arc": [{"time": "[16:30]", "level": "high"}]},
+            "Speaker 2": {"avg": "medium",
+                          "arc": [{"time": "[31:30]", "level": "low"}]},
+        },
+    )
+
+    reconcile(g, cal)
+
+    # speaker_emotions: one entry per canonical speaker, arcs concatenated.
+    emotions_by_speaker = {e["speaker"]: e for e in g["speaker_emotions"]}
+    assert "Antonella Borromeo" in emotions_by_speaker
+    assert len(emotions_by_speaker["Antonella Borromeo"]["arc"]) == 3, (
+        "All three arc events must survive collapse; got "
+        f"{emotions_by_speaker['Antonella Borromeo']['arc']!r}"
+    )
+
+    # speaker_pacing: aggregated — mean wpm, sum hesitations, max pause.
+    pacing = g["speaker_pacing"]["Antonella Borromeo"]
+    assert pacing["wpm_avg"] == int((100 + 140 + 120) / 3), pacing
+    assert pacing["hesitation_count"] == 5 + 7 + 3, pacing
+    assert pacing["longest_pause_sec"] == 5.0, pacing
+
+    # energy_levels: arcs concatenated, avg is the mode (medium ×2 > high ×1).
+    energy = g["energy_levels"]["Antonella Borromeo"]
+    assert len(energy["arc"]) == 3
+    assert energy["avg"] == "medium"
+
+    # No drifted labels survive.
+    for stale in ("Speaker 1", "Vivienne", "Speaker 2"):
+        assert stale not in g["speaker_pacing"]
+        assert stale not in g["energy_levels"]
+        assert not any(e["speaker"] == stale for e in g["speaker_emotions"])
