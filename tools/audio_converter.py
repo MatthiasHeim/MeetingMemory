@@ -204,19 +204,30 @@ def convert_to_mp3(
     # Build ffmpeg command
     cmd = [FFMPEG_PATH, '-y', '-i', str(input_path)]
 
+    # Compose the audio filter chain. EBU R128 loudness normalization is
+    # appended unconditionally because mic gain in MeetingRecorder captures
+    # varies by ~14 dB between sessions, and low-gain takes push Swiss German
+    # ASR below threshold. Target -16 LUFS matches the reference clip used
+    # for voice fingerprinting (voice_refs/matthias.mp3).
+    audio_filters: list[str] = []
     if active_channels and len(active_channels) == 1:
-        # Single active channel — extract directly
-        cmd.extend(['-af', f'pan=mono|c0=c{active_channels[0]}'])
+        audio_filters.append(f'pan=mono|c0=c{active_channels[0]}')
     elif active_channels and len(active_channels) > 1:
-        # Multiple active channels — equal-weight mix
         weight = 1.0 / len(active_channels)
-        mix_filter = 'pan=mono|c0=' + '+'.join(
-            f'{weight}*c{i}' for i in active_channels
+        audio_filters.append(
+            'pan=mono|c0=' + '+'.join(f'{weight}*c{i}' for i in active_channels)
         )
-        cmd.extend(['-af', mix_filter])
-    else:
-        # Mono or standard stereo
-        cmd.extend(['-ac', '1'])
+    elif num_channels > 1:
+        # No active-channel detection ran (stereo path) — do the mono
+        # downmix inside the filter chain so loudnorm sees mono input.
+        weight = 1.0 / num_channels
+        audio_filters.append(
+            'pan=mono|c0=' + '+'.join(f'{weight}*c{i}' for i in range(num_channels))
+        )
+    # else: mono input — no channel filter needed
+
+    audio_filters.append('loudnorm=I=-16:LRA=11:TP=-1.5')
+    cmd.extend(['-af', ','.join(audio_filters)])
 
     # High-quality MP3 encoding
     cmd.extend([
