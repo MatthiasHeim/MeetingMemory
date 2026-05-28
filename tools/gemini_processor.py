@@ -37,7 +37,7 @@ Transcribe the ENTIRE audio word-for-word. Do not summarize or skip any parts.
 
 - Speaker labels: "Matthias:" for the host (Lailix consultant), otherwise speaker names if identifiable from context, else "Speaker 1:", "Speaker 2:", etc.
 - Timestamps every 2-3 minutes: `[MM:SS]` or `[HH:MM:SS]` for longer recordings.
-- Transcribe in original language(s); preserve mixed-language segments verbatim.
+- Transcribe in the original spoken language AND dialect, exactly as spoken. If a speaker talks Swiss German (Schweizerdeutsch / Mundart), write the Swiss German words verbatim — do NOT translate or normalize them into standard High German (Hochdeutsch). For example, keep "Nei, also ich ha eigentlich Ferie" — never rewrite it as "Nein, also ich habe eigentlich Ferien". Preserve mixed-language (e.g. Swiss German + English) segments verbatim.
 - Mark unclear sections `[inaudible]` or `[unclear]`.
 
 ## OUTPUT FORMAT
