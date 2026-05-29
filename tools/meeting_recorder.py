@@ -204,10 +204,18 @@ class AudioRecorder:
 
         produced = None
         if mic_ok and sys_ok:
+            # Merge mic (1ch) + system (2ch) into a 3-channel WAV with a FIXED
+            # physical channel order: ch0=mic(host), ch1=sysL, ch2=sysR.
+            # NOTE: bare `amerge` of a mono+stereo pair reorders by channel
+            # label (mono FC sorts last → mic ends up on ch2), which silently
+            # swaps host/remote downstream. amerge deterministically yields
+            # [sysL, sysR, mic]; the pan then puts them back as [mic, sysL, sysR].
+            # Verified with synthetic tones (440=mic, 200=sysL, 800=sysR).
             r = subprocess.run(
                 [self._FFMPEG, "-y",
                  "-i", str(self._mic_wav), "-i", str(self._sys_wav),
-                 "-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
+                 "-filter_complex",
+                 "[0:a][1:a]amerge=inputs=2,pan=3.0|c0=c2|c1=c0|c2=c1[a]",
                  "-map", "[a]", "-c:a", "pcm_s16le", str(merged_tmp)],
                 capture_output=True, text=True,
             )
