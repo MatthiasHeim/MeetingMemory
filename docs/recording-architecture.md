@@ -166,6 +166,28 @@ business-critical capture. Weigh by appetite:
 
 ---
 
+## 7b. Option C build status (2026-05-29)
+
+Built a Swift Core Audio process-tap recorder (`tools/audio_tap_recorder.swift`). Progress:
+
+- ✅ **Tap + aggregate + IO proc + WAV writing all work** (compiles clean, runs, writes 48 kHz).
+- ✅ **TCC permission SOLVED.** An unsigned/unbundled CLI never triggers the macOS
+  `kTCCServiceAudioCapture` prompt — macOS silently feeds it −91 dB. Wrapping the binary in a
+  **signed .app bundle** with `NSAudioCaptureUsageDescription` registered and granted the
+  permission (TCC now lists `com.lailix.meetingmemory.audiotap` = allowed). So system-audio
+  capture is unblocked, contingent on shipping inside a signed bundle.
+- ⚠️ **Remaining bug:** putting the mic (sub-device) AND the tap in one aggregate yields a
+  **multi-stream** input — mic on stream 0 (1 ch), system tap on stream 1 (2 ch). The IO proc
+  currently reads only the first buffer, so it captures **mic only** (aggregate reports "1 ch").
+  To finish: handle the multi-buffer `AudioBufferList`, query per-stream formats, write
+  mic + sysL + sysR interleaved. Then validate with the −60 dB acceptance test.
+
+**Deployment shape (once the multi-stream fix lands):** the recorder must run inside a signed
+.app bundle (the MeetingRecorder menu-bar app itself, packaged via py2app + codesign, shelling
+out to / embedding this helper) so it keeps the audio-capture permission across launches. A
+self-signed (ad-hoc) bundle works for one machine; an Apple Developer ID signature avoids
+re-grant friction on updates.
+
 ## 8. Interim software mitigations (already landed / validated)
 
 While the recording fix is the main lever, two software changes already help on mono audio:
