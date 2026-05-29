@@ -11,6 +11,8 @@ Usage:
 
 import os
 import sys
+import time
+import shutil
 import threading
 import subprocess
 from pathlib import Path
@@ -76,76 +78,169 @@ def get_audio_device_index(device_name: str) -> Optional[int]:
 class AudioRecorder:
     """Handles audio recording in a background thread."""
 
+    # Hybrid capture: the microphone is recorded in-process via sounddevice
+    # (this Python process holds the macOS Microphone permission), while system
+    # audio is captured by the signed Core Audio tap bundle (which holds the
+    # System-Audio-Recording permission). The two are merged at stop into one
+    # 3-channel WAV: ch0=mic (host), ch1/ch2=system (remote participants).
+    #
+    # Why hybrid: a single tap+mic aggregate would need BOTH TCC grants on the
+    # tap bundle, but a background/ad-hoc bundle can't surface the microphone
+    # prompt. Splitting capture across the two processes that already hold each
+    # permission sidesteps that entirely, and IS the Phase-5 per-channel layout.
+    _PROC_PATTERN = "AudioTapRecorder.app/Contents/MacOS/audio_tap_recorder"
+    _FFMPEG = "/opt/homebrew/bin/ffmpeg"
+
     def __init__(self, config: dict):
         self.config = config
-        self.sample_rate = config['audio'].get('sample_rate', 16000)
-        self.channels = config['audio'].get('channels', 1)
-        self.device = get_audio_device_index(config['audio'].get('device', 'default'))
+        audio_cfg = config.get('audio', {})
+        # Mic: default input device (the microphone), mono, 48 kHz. NOT the old
+        # Aggregate Device (whose BlackHole channels were always silent).
+        self.sample_rate = int(audio_cfg.get('mic_sample_rate', 48000))
+        self.mic_device = None  # None => system default input = the mic
+        # Signed system-audio tap bundle (system-only mode).
+        self.tap_bundle = expand_path(audio_cfg.get(
+            'tap_bundle', '~/Documents/MeetingRecorder/bin/AudioTapRecorder.app'))
+        # Intermediates live OUTSIDE the watched Recordings dir so the watcher
+        # never picks up a half-written or duplicate file.
+        self.tmp_dir = expand_path('~/Documents/MeetingRecorder/.tmp')
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
         self.recording = False
         self.audio_data = []
         self.stream: Optional[sd.InputStream] = None
         self.output_file: Optional[Path] = None
+        self._sys_wav: Optional[Path] = None
+        self._mic_wav: Optional[Path] = None
+        self._sys_active = False
+
+    def _sys_proc_running(self) -> bool:
+        return subprocess.run(
+            ["pgrep", "-f", self._PROC_PATTERN], capture_output=True
+        ).returncode == 0
 
     def start(self, output_file: Path):
-        """Start recording audio to the specified file."""
+        """Start mic (sounddevice) + system-audio tap capture simultaneously."""
         if self.recording:
             return False
 
         self.output_file = output_file
         self.audio_data = []
-        self.recording = True
+        stem = output_file.stem
+        self._sys_wav = self.tmp_dir / f"{stem}.sys.wav"
+        self._mic_wav = self.tmp_dir / f"{stem}.mic.wav"
+        for p in (self._sys_wav, self._mic_wav):
+            if p.exists():
+                p.unlink()
 
+        # 1) System-audio tap first (it has launch latency). Best-effort: if it
+        #    fails we still record the mic, never losing the meeting.
+        self._sys_active = False
+        if self.tap_bundle.exists():
+            try:
+                subprocess.run(
+                    ["open", str(self.tap_bundle), "--args",
+                     str(self._sys_wav), "--system-only"],
+                    check=True,
+                )
+                self._sys_active = True
+            except Exception as e:
+                print(f"System-audio tap launch failed: {e}", file=sys.stderr)
+        else:
+            print(f"Tap bundle not found ({self.tap_bundle}); mic-only.", file=sys.stderr)
+
+        # 2) Microphone via sounddevice (this process holds the mic permission).
+        self.recording = True
         try:
             self.stream = sd.InputStream(
-                device=self.device,
-                channels=self.channels,
+                device=self.mic_device,
+                channels=1,
                 samplerate=self.sample_rate,
                 dtype=np.int16,
-                callback=self._audio_callback
+                callback=self._audio_callback,
             )
             self.stream.start()
             return True
         except Exception as e:
             self.recording = False
-            raise RuntimeError(f"Failed to start recording: {e}")
+            if self._sys_active:
+                subprocess.run(["pkill", "-INT", "-f", self._PROC_PATTERN])
+            raise RuntimeError(f"Failed to start mic recording: {e}")
 
     def stop(self) -> Optional[Path]:
-        """Stop recording and save to file."""
+        """Stop both captures, merge into one 3-channel WAV (mic + system)."""
         if not self.recording:
             return None
-
         self.recording = False
 
+        # Stop mic, write mic.wav.
         if self.stream:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+        mic_ok = False
+        if self.audio_data:
+            arr = np.concatenate(self.audio_data, axis=0)
+            sf.write(str(self._mic_wav), arr, self.sample_rate, subtype='PCM_16')
+            mic_ok = self._mic_wav.exists() and self._mic_wav.stat().st_size > 1000
 
-        if self.audio_data and self.output_file:
-            # Concatenate all audio chunks
-            audio_array = np.concatenate(self.audio_data, axis=0)
+        # Stop system tap via SIGINT (graceful teardown => valid WAV + tap freed).
+        if self._sys_active:
+            subprocess.run(["pkill", "-INT", "-f", self._PROC_PATTERN])
+            for _ in range(60):  # up to ~6s for clean teardown
+                if not self._sys_proc_running():
+                    break
+                time.sleep(0.1)
+            time.sleep(0.3)
+        sys_ok = (self._sys_wav.exists() and self._sys_wav.stat().st_size > 1000)
 
-            # Ensure output directory exists
-            self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        # Merge into a temp file, then atomically move into the watched dir so
+        # the watcher never sees a partial file. Fallbacks guarantee we keep
+        # whatever audio we captured.
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        merged_tmp = self.tmp_dir / f"{self.output_file.stem}.final.wav"
+        if merged_tmp.exists():
+            merged_tmp.unlink()
 
-            # Save as WAV
-            sf.write(
-                str(self.output_file),
-                audio_array,
-                self.sample_rate,
-                subtype='PCM_16'
+        produced = None
+        if mic_ok and sys_ok:
+            r = subprocess.run(
+                [self._FFMPEG, "-y",
+                 "-i", str(self._mic_wav), "-i", str(self._sys_wav),
+                 "-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
+                 "-map", "[a]", "-c:a", "pcm_s16le", str(merged_tmp)],
+                capture_output=True, text=True,
             )
+            if r.returncode == 0 and merged_tmp.exists():
+                produced = merged_tmp
+            else:
+                print(f"Merge failed ({r.stderr[:200]}); falling back to mic.", file=sys.stderr)
+        if produced is None:
+            # Fallback order: mic (host voice is most important) > system > none.
+            src = self._mic_wav if mic_ok else (self._sys_wav if sys_ok else None)
+            if src is not None:
+                shutil.copy(str(src), str(merged_tmp))
+                produced = merged_tmp
 
-            return self.output_file
+        result = None
+        if produced is not None:
+            os.replace(str(produced), str(self.output_file))  # atomic move into Recordings/
+            result = self.output_file
 
-        return None
+        # Cleanup intermediates.
+        for p in (self._mic_wav, self._sys_wav):
+            try:
+                if p and p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+
+        return result
 
     def _audio_callback(self, indata, frames, time, status):
-        """Callback for audio input stream."""
+        """Callback for the microphone input stream."""
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
-
         if self.recording:
             self.audio_data.append(indata.copy())
 

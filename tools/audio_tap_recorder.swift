@@ -43,6 +43,7 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
+import AVFoundation
 
 func chk(_ s: OSStatus, _ what: String) {
     if s != noErr {
@@ -55,7 +56,36 @@ func logln(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: 
 let args = CommandLine.arguments
 guard args.count >= 2 else { print("usage: audio_tap_recorder <out.wav> [seconds]"); exit(1) }
 let outURL = URL(fileURLWithPath: args[1])
-let duration: Double? = args.count >= 3 ? Double(args[2]) : nil
+let extraArgs = Array(args.dropFirst(2))
+// --system-only: tap-only aggregate (system audio, 2ch). Needs ONLY
+// kTCCServiceAudioCapture (no mic, no microphone permission). Used by the hybrid
+// pipeline where the mic is captured separately by the Python recorder.
+let systemOnly = extraArgs.contains("--system-only")
+let duration: Double? = extraArgs.compactMap { Double($0) }.first
+
+// ── Microphone permission ─────────────────────────────────────────────────────
+// The mic sub-device needs kTCCServiceMicrophone. Request it explicitly via
+// AVFoundation so the app registers in System Settings > Privacy > Microphone
+// and (if undetermined) shows the prompt. The system-audio tap uses a separate
+// permission (kTCCServiceAudioCapture) granted on first tap read.
+func ensureMicPermission(timeout: Double = 60) {
+    let status = AVCaptureDevice.authorizationStatus(for: .audio)
+    logln("mic authorization status (pre): \(status.rawValue)")
+    if status == .authorized { return }
+    var done = false
+    AVCaptureDevice.requestAccess(for: .audio) { granted in
+        logln("mic access granted: \(granted)")
+        done = true
+    }
+    // Spin the MAIN run loop while waiting — the permission prompt + its
+    // completion handler are delivered on the main run loop, so blocking it
+    // (e.g. on a semaphore) deadlocks the prompt and it never appears.
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while !done && Date() < deadline {
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+    }
+}
+if !systemOnly { ensureMicPermission() }
 
 // ── Default input (microphone) UID ────────────────────────────────────────────
 func defaultInputUID() -> String? {
@@ -89,8 +119,8 @@ let tapUID = desc.uuid.uuidString
 logln("tap id=\(tapID) uid=\(tapUID)")
 
 // ── 2) Aggregate: mic sub-device (clock master) + system tap, single clock ─────
-let micUID = defaultInputUID()
-logln("default mic uid=\(micUID ?? "<none>")")
+let micUID = systemOnly ? nil : defaultInputUID()
+logln("system-only=\(systemOnly) default mic uid=\(micUID ?? "<none>")")
 var subdevices: [[String: Any]] = []
 if let m = micUID { subdevices.append(["uid": m, "drift": 1]) }   // drift-compensate mic against tap clock
 let aggUID = "com.meetingmemory.recagg." + UUID().uuidString
@@ -209,19 +239,21 @@ let block: AudioDeviceIOBlock = { (_, inInputData, _, _, _) in
 }
 chk(AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggID, nil, block), "CreateIOProcIDWithBlock")
 
-// ── 6) Run until duration elapses or SIGINT ────────────────────────────────────
-var running = true
-let sig = DispatchSource.makeSignalSource(signal: SIGINT)
-sig.setEventHandler { running = false }
+// ── 6) Run the MAIN RUN LOOP until SIGINT (or duration) ────────────────────────
+// CoreAudio device IO + aggregate/tap delivery is reliable when the main run
+// loop is actually running; a bare `Thread.sleep`/poll loop intermittently
+// starves the IO proc (observed: 0 frames). Stop by stopping the run loop from
+// the SIGINT handler (clean teardown => valid WAV header) or a duration timer.
+let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+sig.setEventHandler { CFRunLoopStop(CFRunLoopGetMain()) }
 sig.resume()
 signal(SIGINT, SIG_IGN)
 chk(AudioDeviceStart(aggID, ioProcID), "AudioDeviceStart")
 logln("recording\(duration.map { " \($0)s" } ?? " until SIGINT")...")
 if let d = duration {
-    Thread.sleep(forTimeInterval: d)
-} else {
-    while running { Thread.sleep(forTimeInterval: 0.2) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + d) { CFRunLoopStop(CFRunLoopGetMain()) }
 }
+CFRunLoopRun()
 
 // ── 7) Teardown ────────────────────────────────────────────────────────────────
 AudioDeviceStop(aggID, ioProcID)
