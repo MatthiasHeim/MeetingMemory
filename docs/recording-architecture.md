@@ -176,17 +176,29 @@ Built a Swift Core Audio process-tap recorder (`tools/audio_tap_recorder.swift`)
   **signed .app bundle** with `NSAudioCaptureUsageDescription` registered and granted the
   permission (TCC now lists `com.lailix.meetingmemory.audiotap` = allowed). So system-audio
   capture is unblocked, contingent on shipping inside a signed bundle.
-- ⚠️ **Remaining bug:** putting the mic (sub-device) AND the tap in one aggregate yields a
-  **multi-stream** input — mic on stream 0 (1 ch), system tap on stream 1 (2 ch). The IO proc
-  currently reads only the first buffer, so it captures **mic only** (aggregate reports "1 ch").
-  To finish: handle the multi-buffer `AudioBufferList`, query per-stream formats, write
-  mic + sysL + sysR interleaved. Then validate with the −60 dB acceptance test.
+- ✅ **Multi-stream capture FIXED & validated.** The mic (sub-device) and tap are *separate*
+  input streams in the aggregate (mic stream 0 = 1 ch, system tap stream 1 = 2 ch). The IO proc
+  now enumerates both streams, interleaves them, and writes a 3-channel WAV (ch0=mic,
+  ch1=sysL, ch2=sysR). Verified live:
+  - SYSTEM channels captured at **−18.9 dB** when launched via LaunchServices (`open …app`).
+  - MIC channel captured at **−24 dB** when the process holds the microphone permission.
 
-**Deployment shape (once the multi-stream fix lands):** the recorder must run inside a signed
-.app bundle (the MeetingRecorder menu-bar app itself, packaged via py2app + codesign, shelling
-out to / embedding this helper) so it keeps the audio-capture permission across launches. A
-self-signed (ad-hoc) bundle works for one machine; an Apple Developer ID signature avoids
-re-grant friction on updates.
+  So the whole architecture is proven end-to-end — single clocked aggregate, no drift, no
+  virtual-device clutter, no output-device juggling.
+
+- 🔑 **The one remaining step is permissions on the deployed bundle.** It needs BOTH grants:
+  - `kTCCServiceAudioCapture` (system tap) — already granted to the test bundle.
+  - `kTCCServiceMicrophone` (mic sub-device) — a background `LSUIElement` app can't show the
+    prompt, so grant it from a FOREGROUND app or via System Settings → Privacy & Security →
+    Microphone. This is why it belongs in the MeetingRecorder menu-bar app (foreground, can
+    prompt for both on first run).
+
+**Deployment shape:** run the recorder inside a signed .app bundle (the MeetingRecorder
+menu-bar app itself, packaged via py2app + codesign, embedding/shelling out to this helper) so
+it keeps both permissions across launches. Ad-hoc (self-signed) works for one machine; an Apple
+Developer ID signature avoids re-grant friction on updates. **Crucial:** the process must be
+launched AS the bundle (LaunchServices) — a directly-exec'd binary isn't attributed to the
+bundle id and the system tap silently returns −91 dB.
 
 ## 8. Interim software mitigations (already landed / validated)
 
