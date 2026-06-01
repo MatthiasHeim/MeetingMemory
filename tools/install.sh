@@ -48,6 +48,10 @@ echo "Creating directory structure..."
 mkdir -p "$MEETING_RECORDER_DIR/Recordings"
 mkdir -p "$MEETING_RECORDER_DIR/Transcripts"
 mkdir -p "$MEETING_RECORDER_DIR/logs"
+# launchd StandardOut/ErrPath live here (NOT under ~/Documents, which is
+# TCC-protected — per-user launchd cannot open files there post-macOS-update,
+# and the job then fails with EX_CONFIG/78 and crash-loops).
+mkdir -p "$HOME/Library/Logs/MeetingRecorder"
 
 # Copy config if it doesn't exist
 if [ ! -f "$MEETING_RECORDER_DIR/config.yaml" ]; then

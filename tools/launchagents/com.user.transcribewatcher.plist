@@ -14,17 +14,41 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Crash-only restart: do NOT respawn on a clean/manual exit (a bare
+         KeepAlive=true respawned even after `bootout`, fighting any stop).
+         Combined with ThrottleInterval below this prevents a tight respawn
+         loop from piling load onto launchd/sandboxd. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
+    <!-- ROOT CAUSE of the exit-78 crash loop. These MUST live outside the
+         TCC-protected ~/Documents. After the macOS update on 2026-05-30, the
+         per-user launchd lost permission to OPEN std-io files inside
+         ~/Documents/MeetingRecorder/logs/, so every spawn failed std-io setup
+         and launchd recorded EX_CONFIG (78) -> KeepAlive respawn -> crash loop.
+         (The app's own logs via Python still write to ~/Documents fine, because
+         that access is in-session; only launchd's redirection broke.)
+         ~/Library/Logs is the conventional, non-TCC location for agent logs. -->
     <key>StandardOutPath</key>
-    <string>/Users/Matthias/Documents/MeetingRecorder/logs/watcher_stdout.log</string>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/watcher_stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/Matthias/Documents/MeetingRecorder/logs/watcher_stderr.log</string>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/watcher_stderr.log</string>
 
     <key>WorkingDirectory</key>
     <string>/Users/Matthias/Desktop/Repos/MeetingMemory</string>
+
+    <!-- Deliberately a background daemon (NO LimitLoadToSessionType=Aqua).
+         The interpreter lives under the TCC-protected ~/Desktop; in an Aqua
+         (GUI-session) agent, Python's startup open() of the venv triggers a
+         blocking TCC consent prompt and the process hangs forever in
+         getpath_readlines. A non-Aqua daemon is granted that access silently
+         and runs fine (verified 2026-05-30). FSEvents + ~/Documents data access
+         work fine from a daemon; only launchd's std-io redirect needed moving
+         out of ~/Documents (see StandardOutPath above). -->
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -32,7 +56,10 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin</string>
     </dict>
 
+    <!-- Minimum seconds between (re)launches. Was 10s, which let a fast-failing
+         watcher respawn ~6x/min. The watcher is headless and cannot itself
+         crash WindowServer, but a tight loop still loads launchd/sandboxd. -->
     <key>ThrottleInterval</key>
-    <integer>10</integer>
+    <integer>30</integer>
 </dict>
 </plist>

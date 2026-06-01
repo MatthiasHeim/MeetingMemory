@@ -7,8 +7,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/Matthias/noScribe/venv/bin/python</string>
-        <string>/Users/Matthias/noScribe/tools/meeting_recorder.py</string>
+        <string>/Users/Matthias/Desktop/Repos/MeetingMemory/venv/bin/python</string>
+        <string>/Users/Matthias/Desktop/Repos/MeetingMemory/tools/meeting_recorder.py</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -20,16 +20,41 @@
         <false/>
     </dict>
 
+    <!-- CRITICAL SAFETY VALVE. This is a rumps/AppKit menu-bar app and the only
+         WindowServer (HIToolbox/BindCGSToRunLoop) client here. When WindowServer
+         transiently degrades, the app loses its event port and exits non-zero;
+         crash-only KeepAlive then relaunches it. With the previous default ~10s
+         throttle, each relaunch was a fresh GUI-client registration hammering an
+         already-struggling WindowServer — ~95 relaunches drove WindowServer past
+         its 124s userspace-watchdog window and panicked the kernel (2026-05-30).
+         300s (>> the 124s watchdog) makes a respawn storm physically impossible
+         while still auto-recovering a genuine one-off crash within 5 minutes. A
+         clean exit (user picks Quit -> exit 0) is not respawned. -->
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+
+    <!-- ROOT CAUSE of the exit-78 crash loop (see ThrottleInterval note above
+         for the panic chain). std-io MUST live outside TCC-protected ~/Documents:
+         after the 2026-05-30 macOS update the per-user launchd could no longer
+         OPEN files in ~/Documents/MeetingRecorder/logs/, so every spawn failed
+         std-io setup -> EX_CONFIG (78) -> KeepAlive respawn. For this GUI app the
+         respawns hammered WindowServer and panicked the kernel. -->
     <key>StandardOutPath</key>
-    <string>/Users/Matthias/Documents/MeetingRecorder/logs/recorder_stdout.log</string>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/recorder_stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/Matthias/Documents/MeetingRecorder/logs/recorder_stderr.log</string>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/recorder_stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/Matthias/noScribe</string>
+    <string>/Users/Matthias/Desktop/Repos/MeetingMemory</string>
 
     <key>ProcessType</key>
     <string>Interactive</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>LSUIElement</key>
+    <true/>
 </dict>
 </plist>
