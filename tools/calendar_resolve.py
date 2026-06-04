@@ -105,6 +105,23 @@ def _company_from_email(email: str, client_names: list[str]) -> Optional[str]:
     return None
 
 
+def _humanize_email_local(local: str) -> str:
+    """Best-effort display name from an email local-part, used only when a
+    calendar attendee has no displayName.
+
+    External attendees (e.g. itesys) often arrive with just an email, so the
+    raw local-part ("sascha.lioi") would otherwise leak verbatim into
+    participant names, transcripts, insights, and the wiki. Convert the common
+    firstname.lastname / first_last pattern into "Sascha Lioi". Leaves
+    non-name-shaped locals (info, noreply, locals with digits, single tokens)
+    unchanged so we never invent a name where the local-part isn't one.
+    """
+    parts = [p for p in re.split(r"[._\-]+", local) if p]
+    if len(parts) >= 2 and all(p.isalpha() for p in parts):
+        return " ".join(p.capitalize() for p in parts)
+    return local
+
+
 # ── Calendar query ────────────────────────────────────────────────────
 
 def _gws_calendar_events(time_min: datetime, time_max: datetime) -> list[dict]:
@@ -263,7 +280,11 @@ def resolve(transcript_path: str | Path) -> dict:
     else:
         for att in attendees:
             email = (att.get("email") or "").lower()
-            display = att.get("displayName") or email.split("@", 1)[0] if email else None
+            display = att.get("displayName")
+            if not display and email:
+                # No displayName (common for external attendees) → derive a
+                # human name from the email local-part instead of leaking it.
+                display = _humanize_email_local(email.split("@", 1)[0])
             if not display:
                 continue
             is_self = email == SELF_EMAIL or att.get("self") is True
