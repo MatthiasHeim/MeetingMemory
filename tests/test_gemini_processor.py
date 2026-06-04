@@ -164,3 +164,86 @@ def test_prompts_contain_no_real_person_names():
             f"REDUCE_PASS_PROMPT mentions {needle!r} — past-incident "
             f"bias source. Use 'Speaker B/C' placeholders instead."
         )
+
+
+# ── single-call vs chunked dispatch + fallback ────────────────────────
+#
+# The pipeline transcribes meetings ≤ CHUNK_THRESHOLD_SEC (60 min) in a single
+# call to avoid cross-chunk speaker drift/swap, chunks longer ones, and falls
+# back to chunked if a single call fails (so a long-audio disconnect never
+# loses the whole meeting). These tests pin that dispatch without a live API.
+
+
+def _bare_processor() -> GeminiAudioProcessor:
+    """A processor instance without __init__ — no GEMINI_API_KEY / genai needed.
+    Class-level CHUNK_* constants are still present."""
+    return GeminiAudioProcessor.__new__(GeminiAudioProcessor)
+
+
+def test_threshold_is_one_hour():
+    """Regression: the single-call window is 60 min (raised from 15)."""
+    assert GeminiAudioProcessor.CHUNK_THRESHOLD_SEC == 60 * 60
+
+
+def test_audio_over_threshold_goes_straight_to_chunked(monkeypatch, tmp_path):
+    p = _bare_processor()
+    f = tmp_path / "long.mp3"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(p, "_get_duration", lambda path: 90 * 60)  # 90 min
+    seen: list[str] = []
+    monkeypatch.setattr(p, "_process_chunked", lambda *a, **k: seen.append("chunked") or "R")
+    monkeypatch.setattr(p, "_process_single_shot", lambda *a, **k: seen.append("single") or "R")
+    assert p.process_audio(f) == "R"
+    assert seen == ["chunked"]
+
+
+def test_audio_under_threshold_uses_single_shot(monkeypatch, tmp_path):
+    p = _bare_processor()
+    f = tmp_path / "mid.mp3"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(p, "_get_duration", lambda path: 45 * 60)  # 45 min
+    seen: list[str] = []
+    monkeypatch.setattr(p, "_process_chunked", lambda *a, **k: seen.append("chunked") or "R")
+    monkeypatch.setattr(p, "_process_single_shot", lambda *a, **k: seen.append("single") or "R")
+    assert p.process_audio(f) == "R"
+    assert seen == ["single"]
+
+
+def test_single_shot_failure_falls_back_to_chunked(monkeypatch, tmp_path):
+    """A 45-min recording (> CHUNK_DURATION_SEC) whose single call fails must
+    fall back to chunked rather than lose the whole meeting."""
+    p = _bare_processor()
+    f = tmp_path / "mid.mp3"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(p, "_get_duration", lambda path: 45 * 60)
+    seen: list[str] = []
+
+    def boom(*a, **k):
+        seen.append("single")
+        raise RuntimeError("Server disconnected without sending a response.")
+
+    monkeypatch.setattr(p, "_process_single_shot", boom)
+    monkeypatch.setattr(p, "_process_chunked", lambda *a, **k: seen.append("chunked") or "R")
+    assert p.process_audio(f) == "R"
+    assert seen == ["single", "chunked"]
+
+
+def test_short_single_shot_failure_propagates(monkeypatch, tmp_path):
+    """A sub-15-min recording can't meaningfully chunk; a single-shot failure
+    must propagate, not silently no-op through the chunked path."""
+    import pytest
+
+    p = _bare_processor()
+    f = tmp_path / "short.mp3"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(p, "_get_duration", lambda path: 8 * 60)  # < CHUNK_DURATION_SEC
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    chunked_called: list[int] = []
+    monkeypatch.setattr(p, "_process_single_shot", boom)
+    monkeypatch.setattr(p, "_process_chunked", lambda *a, **k: chunked_called.append(1))
+    with pytest.raises(RuntimeError):
+        p.process_audio(f)
+    assert chunked_called == []

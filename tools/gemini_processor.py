@@ -297,9 +297,18 @@ class GeminiAudioProcessor:
             )
 
     # Audio duration (seconds) above which chunked processing is used.
-    # Flash models hallucinate on long single-shot audio; Pro is slow+flaky.
-    # 15 min is a sweet spot — stays well under model thinking-loop thresholds.
-    CHUNK_THRESHOLD_SEC = 15 * 60
+    # History: 15 min was the old sweet spot for gemini-2.5-flash, which
+    # hallucinated (repeat-loops) on long single-shot audio. The pipeline now
+    # runs gemini-3-flash-preview, which transcribes a full 60-min meeting in
+    # one call cleanly — no repeat-loop, and crucially NO cross-chunk speaker
+    # drift/swap (verified 2026-06-04 on a real 60-min Swiss-German 1:1; see
+    # docs/transcription-single-call-investigation.md). So the threshold is
+    # raised to 60 min: meetings up to an hour go single-call and skip the
+    # chunk-boundary speaker bugs entirely. Recordings beyond 60 min still
+    # chunk (output-token + request-reliability headroom), and process_audio
+    # falls back to chunked if a single-call attempt fails, so a long
+    # single-call disconnect never loses the whole meeting.
+    CHUNK_THRESHOLD_SEC = 60 * 60
     CHUNK_DURATION_SEC = 15 * 60
     CHUNK_OVERLAP_SEC = 30
 
@@ -372,8 +381,8 @@ class GeminiAudioProcessor:
                 (`{name, role, company, ...}`). When provided AND containing
                 at least one non-self attendee, a "KNOWN ATTENDEES" block is
                 prepended to the audio prompt so Gemini uses real names
-                instead of guessing. Required for chunked audio (≥15min) to
-                prevent cross-chunk name drift.
+                instead of guessing. Still forwarded to chunked audio (>60min)
+                to prevent cross-chunk name drift.
 
         Returns:
             GeminiResult with transcript and audio-derived signals.
@@ -382,15 +391,48 @@ class GeminiAudioProcessor:
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        # If audio is long, chunk-and-merge. Each chunk goes through the
-        # single-shot path below via recursion, then we stitch + reduce-pass.
         total_duration = self._get_duration(audio_path)
+
+        # Long audio: chunk-and-merge (each chunk is a single-shot call,
+        # stitched + reduce-pass).
         if total_duration > self.CHUNK_THRESHOLD_SEC:
             return self._process_chunked(
                 audio_path, custom_prompt, total_duration,
                 known_attendees=known_attendees,
             )
 
+        # Short-enough audio: one single-shot call (no chunk boundaries → no
+        # cross-chunk speaker drift/swap). If that fails on a recording long
+        # enough to chunk, fall back to chunked rather than lose the whole
+        # meeting to one disconnect.
+        try:
+            return self._process_single_shot(
+                audio_path, custom_prompt, total_duration,
+                known_attendees=known_attendees,
+            )
+        except Exception as e:
+            if total_duration > self.CHUNK_DURATION_SEC:
+                logger.warning(
+                    f"Single-shot failed ({e}); falling back to chunked processing."
+                )
+                return self._process_chunked(
+                    audio_path, custom_prompt, total_duration,
+                    known_attendees=known_attendees,
+                )
+            raise
+
+    def _process_single_shot(
+        self,
+        audio_path: Path,
+        custom_prompt: Optional[str],
+        total_duration: float,
+        known_attendees: Optional[list[dict]] = None,
+    ) -> GeminiResult:
+        """Transcribe an audio file in a single Gemini call (no chunking).
+
+        Raises on upload/generation failure; the caller decides whether to
+        fall back to chunked processing.
+        """
         start_time = time.time()
         base_prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
         prompt = _build_attendees_prefix(known_attendees) + base_prompt
