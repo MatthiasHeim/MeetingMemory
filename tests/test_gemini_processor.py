@@ -228,6 +228,85 @@ def test_single_shot_failure_falls_back_to_chunked(monkeypatch, tmp_path):
     assert seen == ["single", "chunked"]
 
 
+def test_single_chunk_fallback_gets_full_channel_map(monkeypatch, tmp_path):
+    """Regression (review W1): when a 15-60 min single-shot call fails and
+    falls back to chunked, _chunk_audio returns ONE chunk covering the whole
+    file. The channel map slice must then cover the full duration — not
+    silently truncate at CHUNK_DURATION_SEC (15 min) while the prompt block
+    claims ground truth."""
+    from gemini_processor import GeminiResult
+
+    p = _bare_processor()
+    p.model = "test-model"  # _process_chunked reads it for the result
+    f = tmp_path / "mid.mp3"
+    f.write_bytes(b"x")
+    duration = 50 * 60  # 50 min: single chunk in _process_chunked
+    monkeypatch.setattr(p, "_get_duration", lambda path: duration)
+    monkeypatch.setattr(p, "_chunk_audio", lambda path: [(path, 0.0)])
+    # Reduce-pass must not hit the API.
+    monkeypatch.setattr(p, "_generate_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no api")))
+
+    captured: list = []
+
+    def fake_single_shot(audio_path, custom_prompt, total_duration,
+                         known_attendees=None, channel_segments=None):
+        captured.append(channel_segments)
+        return GeminiResult(transcript="[00:00] Matthias: hi", language="en")
+
+    monkeypatch.setattr(p, "_process_single_shot", fake_single_shot)
+
+    segments = [(0.0, 1200.0, 'host'), (1200.0, 2900.0, 'remote')]
+    p._process_chunked(f, None, duration, channel_segments=segments)
+
+    assert len(captured) == 1
+    chunk_segments = captured[0]
+    assert chunk_segments is not None
+    # The remote span past 15:00 must survive the slice in full.
+    assert max(t1 for _, t1, _ in chunk_segments) == 2900.0
+
+
+def test_chunk_loop_does_not_recurse_into_process_audio(monkeypatch, tmp_path):
+    """Regression (review S6): the chunk loop must call _process_single_shot
+    directly. Routing through process_audio meant a single-chunk fallback
+    (chunk == original 15-60 min file) re-entered the single-shot→chunked
+    fallback on failure — unbounded mutual recursion with API calls."""
+    from gemini_processor import GeminiResult
+
+    p = _bare_processor()
+    p.model = "test-model"
+    f = tmp_path / "mid.mp3"
+    f.write_bytes(b"x")
+    duration = 50 * 60
+    monkeypatch.setattr(p, "_get_duration", lambda path: duration)
+    monkeypatch.setattr(p, "_chunk_audio", lambda path: [(path, 0.0)])
+    monkeypatch.setattr(p, "_generate_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no api")))
+
+    calls = {"single_shot": 0, "process_audio": 0}
+
+    def failing_single_shot(*a, **k):
+        calls["single_shot"] += 1
+        raise RuntimeError("deterministic failure")
+
+    orig_process_audio = p.process_audio
+
+    def counting_process_audio(*a, **k):
+        calls["process_audio"] += 1
+        assert calls["process_audio"] < 5, "runaway recursion"
+        return orig_process_audio(*a, **k)
+
+    monkeypatch.setattr(p, "_process_single_shot", failing_single_shot)
+    monkeypatch.setattr(p, "process_audio", counting_process_audio)
+
+    result = p._process_chunked(f, None, duration)
+    # Chunk failed exactly once; no re-entry into process_audio; the
+    # all-chunks-failed error result comes back instead of a RecursionError.
+    assert calls["single_shot"] == 1
+    assert calls["process_audio"] == 0
+    assert result.error == "All chunks failed"
+
+
 def test_short_single_shot_failure_propagates(monkeypatch, tmp_path):
     """A sub-15-min recording can't meaningfully chunk; a single-shot failure
     must propagate, not silently no-op through the chunked path."""
