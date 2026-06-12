@@ -116,6 +116,18 @@ except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
     _SPEAKER_VERIFY_IMPORT_ERROR = str(e)
 
+# Import speaker_hints for counterpart inference when the calendar lookup
+# returned no external attendees (e.g. BlueCare meetings live on their
+# Teams/M365 calendar, not Matthias's Google Calendar). High-precision
+# transcript signals (real-name speaker labels, direct address) validated
+# against the Brain ClientContext directories.
+try:
+    from speaker_hints import detect_counterpart as _detect_counterpart
+    SPEAKER_HINTS_AVAILABLE = True
+except ImportError as e:
+    SPEAKER_HINTS_AVAILABLE = False
+    _SPEAKER_HINTS_IMPORT_ERROR = str(e)
+
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
@@ -764,6 +776,11 @@ class TranscribeWatcher:
             # voices — map those to canonicals. Mutates `result` in place so
             # downstream JSON write, DB seed, and `update_source_with_gemini`
             # all see canonical names from the calendar.
+            # Step 4a2: Counterpart hint when calendar gave no externals.
+            # Mutates cal_match (or creates one) so the reconcile below has
+            # a canonical name to rewrite "Speaker B" to.
+            cal_match = self._infer_counterpart_if_unknown(result, cal_match)
+
             self._reconcile_speakers_inplace(result, cal_match)
 
             # Step 4b2: Channel-based attribution verification. Runs AFTER
@@ -1054,6 +1071,73 @@ class TranscribeWatcher:
         except Exception as e:
             self.logger.warning(f"Speaker reconciliation failed: {e}")
 
+    def _infer_counterpart_if_unknown(self, result, cal_match: Optional[dict]):
+        """Infer the counterpart from the transcript when calendar gave none.
+
+        Only runs when the calendar resolution produced no external
+        attendee (the ~37%-of-meetings case). On a confident hint, injects
+        the person into cal_match.participant_details so the downstream
+        speaker_reconcile rewrites the generic labels, and records the
+        decision in participant_resolution_log. Best-effort: returns
+        cal_match unchanged on any failure or abstention.
+        """
+        try:
+            externals = [
+                p for p in (cal_match or {}).get("participant_details") or []
+                if isinstance(p, dict) and (p.get("role") or "").lower() != "self"
+            ]
+            if externals:
+                return cal_match
+            if not SPEAKER_HINTS_AVAILABLE:
+                self.logger.debug(
+                    f"speaker_hints unavailable ({_SPEAKER_HINTS_IMPORT_ERROR})"
+                )
+                return cal_match
+            hint = _detect_counterpart(result.parsed_response)
+            if not hint:
+                self.logger.info(
+                    "No calendar attendees and no confident transcript "
+                    "hint — counterpart stays unresolved (Brain Step 1c "
+                    "may still infer it)"
+                )
+                return cal_match
+            self.logger.info(
+                f"Counterpart inferred from transcript: {hint['name']} "
+                f"({hint['company']}) via {hint['method']} — {hint['evidence']}"
+            )
+            if cal_match is None:
+                cal_match = {
+                    "participant_details": [{
+                        "name": "Matthias Heim",
+                        "email": "matthias@lailix.com",
+                        "company": "Lailix", "role": "self",
+                    }],
+                    "participant_resolution_log": {},
+                    "calendar_event_id": None,
+                    "company": None,
+                }
+            cal_match.setdefault("participant_details", []).append({
+                "name": hint["name"],
+                "email": hint.get("email"),
+                "company": hint.get("company"),
+                "role": "participant",
+                "confidence": hint.get("confidence", "high"),
+                "resolution_method": hint["method"],
+            })
+            if not cal_match.get("company") and hint.get("company"):
+                cal_match["company"] = hint["company"]
+            prl = cal_match.setdefault("participant_resolution_log", {})
+            prl.setdefault("resolutions", []).append({
+                "name": hint["name"],
+                "method": hint["method"],
+                "confidence": hint.get("confidence", "high"),
+                "evidence": hint.get("evidence", ""),
+            })
+            return cal_match
+        except Exception as e:
+            self.logger.warning(f"Counterpart inference failed: {e}")
+            return cal_match
+
     def _compute_channel_vad_safe(self, audio_file: Path):
         """Compute channel VAD from the original WAV. Never raises.
 
@@ -1215,7 +1299,7 @@ class TranscribeWatcher:
             return
 
         claude_path = claude_config.get('claude_path', '/Users/Matthias/.local/bin/claude')
-        brain_repo = claude_config.get('brain_repo', '/Users/Matthias/Desktop/Repos/Brain')
+        brain_repo = claude_config.get('brain_repo', '/Users/Matthias/Repos/Brain')
         command = claude_config.get('command', 'meeting-actions')
 
         source_id_arg = f" --source-id {source_id}" if source_id else ""
