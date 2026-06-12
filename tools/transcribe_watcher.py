@@ -97,6 +97,25 @@ except ImportError as e:
     SPEAKER_RECONCILE_AVAILABLE = False
     _SPEAKER_RECONCILE_IMPORT_ERROR = str(e)
 
+# Import channel_vad + speaker_verify for channel-based speaker attribution:
+# the 3-channel hybrid WAV carries the host mic on its own channel, which is
+# physical ground truth for who speaks when. channel_vad feeds (a) a prompt
+# map into the Gemini call and (b) the post-transcription verification pass
+# that flips confidently-misattributed turns.
+try:
+    from channel_vad import compute_channel_vad as _compute_channel_vad
+    CHANNEL_VAD_AVAILABLE = True
+except ImportError as e:
+    CHANNEL_VAD_AVAILABLE = False
+    _CHANNEL_VAD_IMPORT_ERROR = str(e)
+
+try:
+    from speaker_verify import verify as _verify_speakers
+    SPEAKER_VERIFY_AVAILABLE = True
+except ImportError as e:
+    SPEAKER_VERIFY_AVAILABLE = False
+    _SPEAKER_VERIFY_IMPORT_ERROR = str(e)
+
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
@@ -716,10 +735,17 @@ class TranscribeWatcher:
                     f"{', '.join(a.get('name', '?') for a in known_attendees)}"
                 )
 
-            # Step 3: Process with Gemini (with attendees prompt-injected)
+            # Step 2d: Channel VAD from the ORIGINAL 3-channel WAV (the MP3
+            # is already mixed mono). Gives Gemini a ground-truth host/remote
+            # speaking map and feeds the post-transcription verification.
+            # None for mono/stereo recordings — both consumers skip cleanly.
+            channel_vad = self._compute_channel_vad_safe(audio_file)
+
+            # Step 3: Process with Gemini (attendees + channel map injected)
             self.logger.info("Sending to Gemini API...")
             result = self.gemini_processor.process_audio(
                 mp3_path, known_attendees=known_attendees or None,
+                channel_segments=channel_vad.segments if channel_vad else None,
             )
 
             processing_time = time.time() - start_time
@@ -739,6 +765,12 @@ class TranscribeWatcher:
             # downstream JSON write, DB seed, and `update_source_with_gemini`
             # all see canonical names from the calendar.
             self._reconcile_speakers_inplace(result, cal_match)
+
+            # Step 4b2: Channel-based attribution verification. Runs AFTER
+            # reconcile so flips target canonical names. Flips turns whose
+            # transcript label confidently contradicts the mic-channel
+            # ground truth (see speaker_verify module docstring).
+            self._verify_speakers_inplace(result, channel_vad, cal_match)
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
             with open(json_path, 'w', encoding='utf-8') as f:
@@ -1021,6 +1053,86 @@ class TranscribeWatcher:
                 )
         except Exception as e:
             self.logger.warning(f"Speaker reconciliation failed: {e}")
+
+    def _compute_channel_vad_safe(self, audio_file: Path):
+        """Compute channel VAD from the original WAV. Never raises.
+
+        Returns a ChannelVAD or None (module unavailable, non-hybrid
+        recording, decode failure) — callers treat None as "no channel
+        ground truth available" and proceed voice-only as before.
+        """
+        if not CHANNEL_VAD_AVAILABLE:
+            self.logger.warning(
+                f"channel_vad unavailable; voice-only attribution "
+                f"({_CHANNEL_VAD_IMPORT_ERROR})"
+            )
+            return None
+        try:
+            vad = _compute_channel_vad(audio_file)
+        except Exception as e:
+            self.logger.warning(f"channel_vad failed for {audio_file.name}: {e}")
+            return None
+        if vad is not None:
+            self.logger.info(
+                f"Channel VAD: {len(vad.segments)} segments over "
+                f"{vad.duration_sec / 60:.1f} min"
+            )
+        return vad
+
+    def _verify_speakers_inplace(self, result, channel_vad,
+                                 cal_match: Optional[dict]) -> None:
+        """Flip confidently-misattributed turns using channel ground truth.
+
+        Mutates the GeminiResult (transcript, participants) so the JSON
+        write, DB enrichment, and Claude all see verified attribution.
+        Attaches the forensic log to participant_resolution_log (next to
+        speaker_reconciliation) when a calendar match exists.
+        """
+        if channel_vad is None:
+            return
+        if not SPEAKER_VERIFY_AVAILABLE:
+            self.logger.warning(
+                f"speaker_verify unavailable; attribution not verified "
+                f"({_SPEAKER_VERIFY_IMPORT_ERROR})"
+            )
+            return
+        # Namesake guard: verification anchors every "Matthias ..." label to
+        # the host. If the calendar shows a REMOTE participant also named
+        # Matthias, that anchor is wrong for half the labels — skip entirely.
+        for att in (cal_match or {}).get("participant_details") or []:
+            name = (att.get("name") or "").strip().lower() if isinstance(att, dict) else ""
+            if (name.split() and name.split()[0] == "matthias"
+                    and (att.get("role") or "").lower() != "self"):
+                self.logger.warning(
+                    f"Speaker verification skipped: remote attendee "
+                    f"{att.get('name')!r} shares the host's first name"
+                )
+                return
+        try:
+            d = result.parsed_response
+            verify_log = _verify_speakers(d, channel_vad)
+            result.transcript = d.get("transcript") or result.transcript
+            result.participants = d.get("participants") or result.participants
+            # Persist the decision log in the on-disk JSON in all cases...
+            result.speaker_verification_log = verify_log
+            # ...and in the DB's participant_resolution_log when a calendar
+            # match exists to carry it.
+            if cal_match is not None:
+                prl = cal_match.setdefault("participant_resolution_log", {})
+                prl["speaker_verification"] = verify_log
+            n_flips = len(verify_log.get("flips") or [])
+            if n_flips:
+                self.logger.info(
+                    f"Speaker verification flipped {n_flips} turn(s) "
+                    f"using channel ground truth"
+                )
+            else:
+                self.logger.info(
+                    f"Speaker verification: no flips "
+                    f"({verify_log.get('turns_checked', 0)} turns checked)"
+                )
+        except Exception as e:
+            self.logger.warning(f"Speaker verification failed: {e}")
 
     def _persist_calendar(self, source_id: Optional[int],
                             cal_match: Optional[dict]) -> None:

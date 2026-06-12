@@ -36,7 +36,7 @@ AUDIO_ANALYSIS_PROMPT = """You are transcribing and analyzing a meeting recordin
 Transcribe the ENTIRE audio word-for-word. Do not summarize or skip any parts.
 
 - Speaker labels: "Matthias:" for the host (Lailix consultant), otherwise speaker names if identifiable from context, else "Speaker 1:", "Speaker 2:", etc.
-- Timestamps every 2-3 minutes: `[MM:SS]` or `[HH:MM:SS]` for longer recordings.
+- Timestamps at EVERY speaker change: start each speaker turn with `[MM:SS]` (or `[HH:MM:SS]` for recordings over an hour), e.g. `[14:23] Matthias: ...`. Every change of speaker MUST carry its own timestamp — downstream attribution verification depends on it.
 - Transcribe in the original spoken language AND dialect, exactly as spoken. If a speaker talks Swiss German (Schweizerdeutsch / Mundart), write the Swiss German words verbatim — do NOT translate or normalize them into standard High German (Hochdeutsch). For example, keep "Nei, also ich ha eigentlich Ferie" — never rewrite it as "Nein, also ich habe eigentlich Ferien". Preserve mixed-language (e.g. Swiss German + English) segments verbatim.
 - Mark unclear sections `[inaudible]` or `[unclear]`.
 
@@ -181,6 +181,47 @@ def _build_attendees_prefix(known_attendees: Optional[list[dict]]) -> str:
     )
 
 
+def _build_channel_map_prefix(channel_segments: Optional[list]) -> str:
+    """Render an "AUDIO CHANNEL MAP" block to prepend to the audio prompt.
+
+    `channel_segments` is the [(t0, t1, 'host'|'remote'|'both')] list from
+    `channel_vad.compute_channel_vad` — physical-layer ground truth from the
+    hybrid recording's separate mic channel. Returns "" when no segments are
+    provided (mono recordings, VAD unavailable) — in that case the prompt is
+    byte-identical to the no-map one.
+    """
+    if not channel_segments:
+        return ""
+    # Channel attribution is best-effort: ANY failure here must degrade to
+    # the no-map prompt, never block transcription.
+    try:
+        from channel_vad import render_map_text
+        map_text = render_map_text(channel_segments)
+    except Exception as e:
+        logger.warning(f"channel map rendering failed ({e}); no-map prompt")
+        return ""
+    if not map_text:
+        return ""
+    return (
+        "## AUDIO CHANNEL MAP (GROUND TRUTH)\n\n"
+        f"The host's ({SELF_NAME.split()[0]}'s) microphone was recorded on a "
+        "separate physical audio channel from the remote participants' audio. "
+        "The speaking map below was computed directly from those channel "
+        "signals, so it is GROUND TRUTH for who is speaking when:\n\n"
+        "- `host` spans: ONLY the host is speaking. Words spoken here are "
+        f"{SELF_NAME.split()[0]}'s.\n"
+        f"- `remote` spans: the host is NOT speaking. Never attribute words "
+        f"in these spans to {SELF_NAME.split()[0]}.\n"
+        "- `both` spans: overlapping speech (e.g. backchannel like \"ja\", "
+        "\"mhm\", or genuine crosstalk) — attribute by voice as usual.\n\n"
+        "Span boundaries are accurate to about ±1 second; very short "
+        "interjections near a boundary may belong to the adjacent span.\n\n"
+        + map_text + "\n\n"
+        "If your voice-based speaker judgement conflicts with a `host` or "
+        "`remote` span, the map wins — re-attribute the words accordingly.\n\n"
+    )
+
+
 @dataclass
 class GeminiResult:
     """Result from Gemini audio processing — audio-derived signals only.
@@ -223,10 +264,16 @@ class GeminiResult:
     # Error (if processing failed)
     error: Optional[str] = None
 
+    # Forensic log of the channel-based attribution verification pass
+    # (speaker_verify). Set by the watcher AFTER verification so the flip
+    # decisions persist in the on-disk JSON even when no calendar match
+    # exists to carry them into participant_resolution_log.
+    speaker_verification_log: Optional[dict] = None
+
     @property
     def parsed_response(self) -> dict:
         """Dict form for JSON serialization on disk and DB writes."""
-        return {
+        out = {
             "transcript": self.transcript,
             "language": self.language,
             "participants": self.participants,
@@ -247,6 +294,9 @@ class GeminiResult:
                 "audio_duration_seconds": self.audio_duration_seconds,
             },
         }
+        if self.speaker_verification_log is not None:
+            out["speaker_verification"] = self.speaker_verification_log
+        return out
 
 
 class GeminiAudioProcessor:
@@ -371,6 +421,7 @@ class GeminiAudioProcessor:
         audio_path: Path,
         custom_prompt: Optional[str] = None,
         known_attendees: Optional[list[dict]] = None,
+        channel_segments: Optional[list] = None,
     ) -> GeminiResult:
         """Process an audio file with Gemini, returning transcript and analysis.
 
@@ -383,6 +434,12 @@ class GeminiAudioProcessor:
                 prepended to the audio prompt so Gemini uses real names
                 instead of guessing. Still forwarded to chunked audio (>60min)
                 to prevent cross-chunk name drift.
+            channel_segments: Optional [(t0, t1, 'host'|'remote'|'both')]
+                channel-VAD segments (see channel_vad.compute_channel_vad).
+                When provided, an "AUDIO CHANNEL MAP (GROUND TRUTH)" block is
+                prepended so Gemini anchors host/remote attribution to the
+                physical mic channel instead of voice similarity. Timestamps
+                are meeting-global; the chunked path slices them per chunk.
 
         Returns:
             GeminiResult with transcript and audio-derived signals.
@@ -399,6 +456,7 @@ class GeminiAudioProcessor:
             return self._process_chunked(
                 audio_path, custom_prompt, total_duration,
                 known_attendees=known_attendees,
+                channel_segments=channel_segments,
             )
 
         # Short-enough audio: one single-shot call (no chunk boundaries → no
@@ -409,6 +467,7 @@ class GeminiAudioProcessor:
             return self._process_single_shot(
                 audio_path, custom_prompt, total_duration,
                 known_attendees=known_attendees,
+                channel_segments=channel_segments,
             )
         except Exception as e:
             if total_duration > self.CHUNK_DURATION_SEC:
@@ -418,6 +477,7 @@ class GeminiAudioProcessor:
                 return self._process_chunked(
                     audio_path, custom_prompt, total_duration,
                     known_attendees=known_attendees,
+                    channel_segments=channel_segments,
                 )
             raise
 
@@ -427,6 +487,7 @@ class GeminiAudioProcessor:
         custom_prompt: Optional[str],
         total_duration: float,
         known_attendees: Optional[list[dict]] = None,
+        channel_segments: Optional[list] = None,
     ) -> GeminiResult:
         """Transcribe an audio file in a single Gemini call (no chunking).
 
@@ -435,7 +496,11 @@ class GeminiAudioProcessor:
         """
         start_time = time.time()
         base_prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
-        prompt = _build_attendees_prefix(known_attendees) + base_prompt
+        prompt = (
+            _build_attendees_prefix(known_attendees)
+            + _build_channel_map_prefix(channel_segments)
+            + base_prompt
+        )
 
         file_size = audio_path.stat().st_size
         file_size_mb = file_size / 1024 / 1024
@@ -606,6 +671,7 @@ class GeminiAudioProcessor:
     def _process_chunked(self, audio_path: Path, custom_prompt: Optional[str],
                           total_duration: float,
                           known_attendees: Optional[list[dict]] = None,
+                          channel_segments: Optional[list] = None,
                           ) -> GeminiResult:
         """Chunk long audio, transcribe each chunk, merge with reduce-pass.
 
@@ -618,11 +684,20 @@ class GeminiAudioProcessor:
 
         `known_attendees` is forwarded to EVERY chunk's Gemini call so all
         chunks anchor to the same calendar attendee list — that's the fix
-        for cross-chunk speaker-name drift.
+        for cross-chunk speaker-name drift. `channel_segments` (meeting-global
+        times) is sliced per chunk and re-based to chunk-relative time so the
+        map matches each chunk's local [MM:SS] timestamps.
         """
         start_time = time.time()
         chunks = self._chunk_audio(audio_path)
         logger.info(f"Processing {len(chunks)} chunks of {audio_path.name}")
+
+        slice_fn = None
+        if channel_segments:
+            try:
+                from channel_vad import slice_segments as slice_fn
+            except ImportError:
+                logger.warning("channel_vad not importable; chunks get no map")
 
         merged_transcript_parts = []
         input_tokens_total = 0
@@ -634,12 +709,34 @@ class GeminiAudioProcessor:
 
         for i, (chunk_path, offset) in enumerate(chunks):
             logger.info(f"  Chunk {i+1}/{len(chunks)} at offset {offset/60:.1f}min")
+            chunk_segments = None
+            if slice_fn is not None:
+                # Single-chunk case: the "chunk" IS the whole file (single-
+                # shot fallback for a 15-60 min recording) — slice to the
+                # full duration, not CHUNK_DURATION_SEC, or the map would
+                # silently truncate at 15:00 while claiming ground truth.
+                chunk_end = (
+                    total_duration if len(chunks) == 1
+                    else offset + self.CHUNK_DURATION_SEC
+                )
+                try:
+                    chunk_segments = slice_fn(
+                        channel_segments, offset, chunk_end
+                    ) or None
+                except Exception as e:
+                    logger.warning(f"channel map slice failed ({e}); no map")
             try:
-                # Recurse with single-shot path (chunks are all ≤15min).
-                # Forward known_attendees so every chunk sees the same list.
-                chunk_result = self.process_audio(
+                # Call the single-shot path directly (chunks are ≤15min;
+                # the degenerate single chunk is the original file). NOT
+                # process_audio: for the single-chunk fallback that would
+                # recurse single-shot→chunked→single-shot indefinitely on
+                # a deterministic failure. Forward known_attendees so every
+                # chunk sees the same list.
+                chunk_result = self._process_single_shot(
                     chunk_path, custom_prompt,
+                    self._get_duration(chunk_path),
                     known_attendees=known_attendees,
+                    channel_segments=chunk_segments,
                 )
             except Exception as e:
                 logger.error(f"  Chunk {i+1} failed: {e}, continuing with others")
