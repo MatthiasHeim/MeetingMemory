@@ -44,9 +44,12 @@ logger = logging.getLogger(__name__)
 GWS_WRAPPER = os.path.expanduser("~/.claude/scripts/gws-account.sh")
 
 # Path to the auto-generated client index. Used to map email domains and
-# attendee names to known clients.
-CLIENT_INDEX = os.path.expanduser(
-    "~/Desktop/Repos/Brain/Areas/knowledge-mgmt/indexes/_INDEX_CLIENTS.md"
+# attendee names to known clients. The Brain repo moved from ~/Desktop/Repos
+# to ~/Repos (the old path silently broke company matching — only an empty
+# stub .claude dir remains there).
+CLIENT_INDEX = os.path.join(
+    os.environ.get("BRAIN_REPO", os.path.expanduser("~/Repos/Brain")),
+    "Areas/knowledge-mgmt/indexes/_INDEX_CLIENTS.md",
 )
 
 # How wide to search for matching calendar events around the recording start.
