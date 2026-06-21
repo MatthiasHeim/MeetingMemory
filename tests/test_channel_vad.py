@@ -23,6 +23,12 @@ from channel_vad import (  # noqa: E402
     render_map_text,
     slice_segments,
 )
+from audio_converter import (  # noqa: E402
+    TOPOLOGY_MULTI_SOURCE_GENUINE,
+    TOPOLOGY_SINGLE_SOURCE,
+    classify_source_topology,
+)
+from speaker_verify import verify  # noqa: E402
 
 needs_ffmpeg = pytest.mark.skipif(
     not os.path.exists(FFMPEG_PATH), reason="ffmpeg not installed"
@@ -141,8 +147,72 @@ def test_stereo_wav_returns_none(tmp_path):
 
 
 @needs_ffmpeg
+def test_silent_system_three_channel_returns_none(tmp_path):
+    """Regression: 3ch in-room capture with only ch0 active is single-source,
+    so it must not produce a host ground-truth map."""
+    wav = _write_wav(
+        tmp_path / "room_mic_only.wav",
+        channels=[[(0, 5)], [], []],
+        duration_sec=6,
+    )
+    assert compute_channel_vad(wav) is None
+
+
+@needs_ffmpeg
+def test_silent_system_three_channel_does_not_flip_to_matthias(tmp_path):
+    wav = _write_wav(
+        tmp_path / "room_mic_only.wav",
+        channels=[[(0, 10)], [], []],
+        duration_sec=12,
+    )
+    vad = compute_channel_vad(wav)
+    assert vad is None
+    gemini = {
+        "transcript": (
+            "[00:00] Speaker B: Das ist ein langer Beitrag aus dem Raum.\n"
+            "[00:10] Speaker C: Ende.\n"
+        ),
+        "participants": [{"name": "Speaker B"}, {"name": "Matthias"}],
+    }
+    log = verify(gemini, vad)
+    assert log["skipped_no_vad"] is True
+    assert "Speaker B: Das ist ein langer Beitrag" in gemini["transcript"]
+    assert "Matthias: Das ist ein langer Beitrag" not in gemini["transcript"]
+
+
+@needs_ffmpeg
 def test_missing_file_returns_none(tmp_path):
     assert compute_channel_vad(tmp_path / "nope.wav") is None
+
+
+@needs_ffmpeg
+def test_topology_classifier_mono(tmp_path):
+    wav = _write_wav(tmp_path / "mono.wav", channels=[[(0, 5)]],
+                     duration_sec=6)
+    info = classify_source_topology(wav)
+    assert info.total_channels == 1
+    assert info.active_channels == [0]
+    assert info.topology == TOPOLOGY_SINGLE_SOURCE
+
+
+@needs_ffmpeg
+def test_topology_classifier_silent_system_3ch(tmp_path):
+    wav = _write_wav(tmp_path / "room.wav",
+                     channels=[[(0, 5)], [], []], duration_sec=6)
+    info = classify_source_topology(wav)
+    assert info.total_channels == 3
+    assert info.active_channels == [0]
+    assert info.topology == TOPOLOGY_SINGLE_SOURCE
+
+
+@needs_ffmpeg
+def test_topology_classifier_genuine_multichannel(tmp_path):
+    wav = _write_wav(tmp_path / "remote.wav",
+                     channels=[[(0, 5)], [(2, 6)], []], duration_sec=7)
+    info = classify_source_topology(wav)
+    assert info.total_channels == 3
+    assert set(info.active_channels) == {0, 1}
+    assert info.topology == TOPOLOGY_MULTI_SOURCE_GENUINE
 
 
 @needs_ffmpeg

@@ -351,6 +351,30 @@ def compute_channel_vad(wav_path: Path,
         )
         return None
 
+    # Defensive topology gate: channel count alone is not enough. In-room
+    # recordings can be 3-channel files with everyone on ch0 and ch1/ch2 at
+    # digital silence. Treat those as single-source, otherwise speaker_verify
+    # would later interpret all confident speech as the host.
+    try:
+        from audio_converter import (
+            TOPOLOGY_MULTI_SOURCE_GENUINE,
+            classify_source_topology,
+        )
+        topology = classify_source_topology(wav_path)
+        if topology.topology != TOPOLOGY_MULTI_SOURCE_GENUINE:
+            logger.info(
+                f"channel_vad: {wav_path.name} topology={topology.topology} "
+                f"active_channels={topology.active_channels} — no reliable "
+                "host/system channel separation, skipping"
+            )
+            return None
+    except Exception as e:
+        logger.warning(
+            f"channel_vad: topology probe failed for {wav_path.name}: {e}; "
+            "skipping channel attribution"
+        )
+        return None
+
     try:
         import numpy as np
         frames = _decode_bandpassed(wav_path, channels)

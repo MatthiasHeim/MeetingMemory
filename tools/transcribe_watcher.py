@@ -29,8 +29,16 @@ from typing import Optional
 
 import yaml
 import requests
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+    WATCHDOG_AVAILABLE = True
+except ImportError as e:
+    Observer = None
+    FileSystemEventHandler = object
+    FileCreatedEvent = object
+    WATCHDOG_AVAILABLE = False
+    _WATCHDOG_IMPORT_ERROR = str(e)
 
 # Marker used by the stale-code check below. Captured at module-import time
 # so we can warn when tools/*.py changes on disk without a process restart —
@@ -57,7 +65,14 @@ if str(_tools_dir) not in sys.path:
 
 # Import Gemini processing modules (optional - gracefully handle if not available)
 try:
-    from audio_converter import convert_for_gemini, get_audio_duration
+    from audio_converter import (
+        TOPOLOGY_MULTI_SOURCE_GENUINE,
+        TOPOLOGY_SINGLE_SOURCE,
+        classify_source_topology,
+        convert_for_gemini,
+        detect_active_channels,
+        get_audio_duration,
+    )
     from gemini_processor import GeminiAudioProcessor, GeminiResult
     GEMINI_AVAILABLE = True
 except ImportError as e:
@@ -115,6 +130,20 @@ try:
 except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
     _SPEAKER_VERIFY_IMPORT_ERROR = str(e)
+
+try:
+    from diarize import (
+        PYANNOTE_AVAILABLE,
+        PYANNOTE_IMPORT_ERROR,
+        fuse_host_cluster_with_channel_vad,
+        run_pyannote_diarization,
+    )
+    DIARIZATION_AVAILABLE = True
+except ImportError as e:
+    DIARIZATION_AVAILABLE = False
+    PYANNOTE_AVAILABLE = False
+    PYANNOTE_IMPORT_ERROR = str(e)
+    _DIARIZATION_IMPORT_ERROR = str(e)
 
 # Import speaker_hints for counterpart inference when the calendar lookup
 # returned no external attendees (e.g. BlueCare meetings live on their
@@ -377,6 +406,11 @@ class TranscribeWatcher:
         self.queue = TranscriptionQueue(logger)
 
         # Set up file watcher
+        if not WATCHDOG_AVAILABLE:
+            raise ImportError(
+                "watchdog package not installed; TranscribeWatcher cannot "
+                f"watch files ({_WATCHDOG_IMPORT_ERROR})"
+            )
         debounce = config.get('watcher', {}).get('debounce_seconds', 2)
         self.handler = AudioFileHandler(self.queue, debounce, logger)
         self.observer = Observer()
@@ -504,20 +538,18 @@ class TranscribeWatcher:
         if channels <= 1:
             return audio_file
 
-        # Measure per-channel mean volume (probe first 60s for speed)
-        active_channels = []
-        for i in range(channels):
-            probe = subprocess.run(
-                [ffmpeg_path, '-i', str(audio_file), '-t', '60',
-                 '-af', f'pan=mono|c0=c{i},volumedetect', '-f', 'null', '-'],
-                capture_output=True, text=True,
+        # Measure per-channel mean volume (probe first 60s for speed).
+        try:
+            active_channels = detect_active_channels(
+                audio_file, probe_seconds=60,
+                silence_db=SILENCE_THRESHOLD_DB,
             )
-            import re
-            m = re.search(r'mean_volume:\s*(-?[0-9.]+)\s*dB', probe.stderr)
-            mean_db = float(m.group(1)) if m else float('-inf')
-            self.logger.debug(f"  channel {i}: mean_volume={mean_db} dB")
-            if mean_db > SILENCE_THRESHOLD_DB:
-                active_channels.append(i)
+        except Exception as e:
+            self.logger.warning(
+                f"Active-channel detection failed ({e}); "
+                f"falling back to equal-weight mix of all {channels}"
+            )
+            active_channels = list(range(channels))
 
         if not active_channels:
             self.logger.warning(f"No active channels detected in {audio_file.name}, "
@@ -741,23 +773,72 @@ class TranscribeWatcher:
             # the JSON doesn't exist yet.
             cal_match = self._resolve_calendar(json_path)
             known_attendees = (cal_match or {}).get("participant_details") or []
+            known_attendees = self._merge_configured_diarization_roster(
+                audio_file, known_attendees
+            )
             if known_attendees:
                 self.logger.info(
                     f"Calendar attendees ({len(known_attendees)}): "
                     f"{', '.join(a.get('name', '?') for a in known_attendees)}"
                 )
 
-            # Step 2d: Channel VAD from the ORIGINAL 3-channel WAV (the MP3
-            # is already mixed mono). Gives Gemini a ground-truth host/remote
-            # speaking map and feeds the post-transcription verification.
-            # None for mono/stereo recordings — both consumers skip cleanly.
-            channel_vad = self._compute_channel_vad_safe(audio_file)
+            # Step 2d: Classify source topology from the ORIGINAL WAV. Channel
+            # count alone is unsafe: in-room recordings can be 3-channel files
+            # with only ch0 active. In that topology, channel_vad MUST stay
+            # None for both prompt injection and speaker verification.
+            topology = self._classify_source_topology_safe(audio_file)
+
+            channel_vad = None
+            if topology and topology.topology == TOPOLOGY_SINGLE_SOURCE:
+                self.logger.info(
+                    "Source topology is single_source "
+                    f"(active_channels={topology.active_channels}); "
+                    "disabling channel VAD and speaker verification"
+                )
+            else:
+                # Channel VAD from the ORIGINAL 3-channel WAV (the MP3 is
+                # already mixed mono). Gives Gemini a ground-truth host/remote
+                # speaking map and feeds post-transcription verification.
+                # None for mono/stereo/non-genuine recordings.
+                channel_vad = self._compute_channel_vad_safe(audio_file)
+
+            diarization_segments = None
+            diarization_cfg = self.config.get("diarization", {}) or {}
+            diarization_enabled = diarization_cfg.get("enabled", True)
+            channel_fusion = diarization_cfg.get("channel_fusion", False)
+            if diarization_enabled:
+                should_run_diarization = self._should_run_diarization_prior(
+                    topology, channel_fusion
+                )
+                if should_run_diarization:
+                    num_speakers = self._diarization_num_speakers(
+                        audio_file, known_attendees
+                    )
+                    diarization_segments = self._run_diarization_safe(
+                        mp3_path, num_speakers=num_speakers
+                    )
+                    if (
+                        diarization_segments
+                        and channel_fusion
+                        and topology
+                        and topology.topology == TOPOLOGY_MULTI_SOURCE_GENUINE
+                    ):
+                        diarization_segments = fuse_host_cluster_with_channel_vad(
+                            diarization_segments, channel_vad
+                        )
+                elif topology and topology.topology == TOPOLOGY_MULTI_SOURCE_GENUINE:
+                    self.logger.info(
+                        "Source topology is multi_source_genuine; "
+                        "diarization.channel_fusion is off, preserving "
+                        "legacy channel_vad + speaker_verify behavior"
+                    )
 
             # Step 3: Process with Gemini (attendees + channel map injected)
             self.logger.info("Sending to Gemini API...")
             result = self.gemini_processor.process_audio(
                 mp3_path, known_attendees=known_attendees or None,
                 channel_segments=channel_vad.segments if channel_vad else None,
+                diarization_segments=diarization_segments,
             )
 
             processing_time = time.time() - start_time
@@ -1137,6 +1218,164 @@ class TranscribeWatcher:
         except Exception as e:
             self.logger.warning(f"Counterpart inference failed: {e}")
             return cal_match
+
+    def _classify_source_topology_safe(self, audio_file: Path):
+        """Classify source topology. Never raises."""
+        try:
+            topology = classify_source_topology(audio_file)
+            self.logger.info(
+                f"Source topology: {topology.topology} "
+                f"(channels={topology.total_channels}, "
+                f"active={topology.active_channels})"
+            )
+            return topology
+        except Exception as e:
+            self.logger.warning(
+                f"Source topology detection failed for {audio_file.name}: {e}; "
+                "falling back to legacy channel VAD behavior"
+            )
+            return None
+
+    def _merge_configured_diarization_roster(
+        self, audio_file: Path, known_attendees: list[dict]
+    ) -> list[dict]:
+        """Merge optional explicit roster entries into calendar attendees.
+
+        Supported low-friction inputs:
+          - config.yaml: diarization.roster: ["Name", {name, company, role}]
+          - per-recording sidecar: <recording>.diarization.json with
+            {"roster": [...]} or {"attendees": [...]}
+        """
+        roster_items = []
+        cfg = self.config.get("diarization", {}) or {}
+        roster_items.extend(cfg.get("roster") or [])
+
+        sidecar = audio_file.with_suffix(".diarization.json")
+        if sidecar.exists():
+            try:
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    roster_items.extend(
+                        data.get("roster") or data.get("attendees") or []
+                    )
+            except Exception as e:
+                self.logger.warning(
+                    f"Diarization sidecar roster unreadable "
+                    f"({sidecar.name}): {e}"
+                )
+
+        if not roster_items:
+            return known_attendees
+
+        merged = list(known_attendees or [])
+        existing = {
+            (p.get("name") or "").strip().lower()
+            for p in merged
+            if isinstance(p, dict)
+        }
+        for item in roster_items:
+            if isinstance(item, str):
+                entry = {"name": item.strip(), "role": "participant"}
+            elif isinstance(item, dict):
+                entry = dict(item)
+                entry.setdefault("role", "participant")
+            else:
+                continue
+            name = (entry.get("name") or "").strip()
+            if not name or name.lower() in existing:
+                continue
+            entry["name"] = name
+            merged.append(entry)
+            existing.add(name.lower())
+        return merged
+
+    def _diarization_num_speakers(
+        self, audio_file: Path, known_attendees: list[dict]
+    ) -> Optional[int]:
+        """Return explicit pyannote speaker count, or None for auto mode."""
+        candidates = []
+        sidecar = audio_file.with_suffix(".diarization.json")
+        if sidecar.exists():
+            try:
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    candidates.append(data.get("num_speakers"))
+            except Exception as e:
+                self.logger.warning(
+                    f"Diarization sidecar unreadable ({sidecar.name}): {e}"
+                )
+        candidates.append(os.environ.get("MEETINGMEMORY_NUM_SPEAKERS"))
+        candidates.append(
+            (self.config.get("diarization", {}) or {}).get("num_speakers")
+        )
+
+        for value in candidates:
+            if value in (None, "", "auto"):
+                continue
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    f"Ignoring invalid diarization num_speakers={value!r}"
+                )
+                continue
+            if n > 0:
+                self.logger.info(f"Using explicit pyannote num_speakers={n}")
+                return n
+
+        attendee_count = len([
+            p for p in known_attendees or []
+            if isinstance(p, dict) and (p.get("name") or "").strip()
+        ])
+        if attendee_count:
+            self.logger.info(
+                f"Calendar/roster attendee count is {attendee_count}; "
+                "leaving pyannote num_speakers on auto (soft hint only)"
+            )
+        return None
+
+    def _run_diarization_safe(
+        self, audio_file: Path, num_speakers: Optional[int] = None
+    ) -> Optional[list[dict]]:
+        """Run pyannote prior generation. Never raises."""
+        if not DIARIZATION_AVAILABLE:
+            self.logger.warning(
+                f"diarization module unavailable; no pyannote prior "
+                f"({_DIARIZATION_IMPORT_ERROR})"
+            )
+            return None
+        if not PYANNOTE_AVAILABLE:
+            self.logger.warning(
+                f"pyannote unavailable; no diarization prior "
+                f"({PYANNOTE_IMPORT_ERROR})"
+            )
+            return None
+        cfg = self.config.get("diarization", {}) or {}
+        timeout = int(cfg.get("timeout_seconds", 3600))
+        device = str(cfg.get("device", ""))
+        try:
+            return run_pyannote_diarization(
+                audio_file,
+                num_speakers=num_speakers,
+                timeout_seconds=timeout,
+                device=device,
+            )
+        except Exception as e:
+            self.logger.warning(f"pyannote prior failed: {e}")
+            return None
+
+    @staticmethod
+    def _should_run_diarization_prior(topology, channel_fusion: bool) -> bool:
+        """Default-on only for single-source; remote fusion is opt-in."""
+        if topology is None:
+            return False
+        topo = getattr(topology, "topology", None)
+        return (
+            topo == TOPOLOGY_SINGLE_SOURCE
+            or (channel_fusion and topo == TOPOLOGY_MULTI_SOURCE_GENUINE)
+        )
 
     def _compute_channel_vad_safe(self, audio_file: Path):
         """Compute channel VAD from the original WAV. Never raises.

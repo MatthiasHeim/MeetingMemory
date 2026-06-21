@@ -95,11 +95,80 @@ def pyannote_proc_entrypoint(args: dict, q):
             else:
                 diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate}, hook=hook)
 
+        # The local pyannote pipeline exposes hard diarization segments here,
+        # but this worker does not cheaply expose per-segment embedding
+        # posteriors or centroid margins. Confidence therefore uses the stable
+        # signals available in this API: segment duration, overlapped-speech
+        # detection, and total evidence for the speaker cluster.
+        speaker_totals = {}
+        raw_turns = []
         for turn, speaker in diarization.speaker_diarization:
+            duration = max(0.0, float(turn.end - turn.start))
+            raw_turns.append((turn, speaker, duration))
+            speaker_totals[speaker] = speaker_totals.get(speaker, 0.0) + duration
+
+        overlap_timeline = None
+        try:
+            overlap_timeline = diarization.speaker_diarization.get_overlap()
+        except Exception:
+            try:
+                overlap_timeline = diarization.get_overlap()
+            except Exception:
+                overlap_timeline = None
+
+        def is_overlapped(turn):
+            if overlap_timeline is None:
+                return False
+            try:
+                for ov in overlap_timeline:
+                    if min(float(turn.end), float(ov.end)) > max(float(turn.start), float(ov.start)):
+                        return True
+            except Exception:
+                return False
+            return False
+
+        def confidence_for(duration, overlapped, cluster_total):
+            score = 0.55
+            if duration >= 3.0:
+                score += 0.25
+            elif duration >= 1.5:
+                score += 0.15
+            else:
+                score += 0.03
+            if cluster_total >= 10.0:
+                score += 0.15
+            elif cluster_total >= 3.0:
+                score += 0.08
+            if overlapped:
+                score -= 0.35
+            score = max(0.0, min(1.0, score))
+            if score >= 0.75:
+                level = "high"
+            elif score >= 0.50:
+                level = "med"
+            else:
+                level = "low"
+            return score, level
+
+        for turn, speaker, duration in raw_turns:
+            overlapped = is_overlapped(turn)
+            confidence, level = confidence_for(
+                duration, overlapped, speaker_totals.get(speaker, duration)
+            )
             seg_list.append({
                 'start': int(turn.start * 1000),
                 'end': int(turn.end * 1000),
                 'label': speaker,
+                'duration': duration,
+                'overlapped': overlapped,
+                'confidence': round(confidence, 3),
+                'level': level,
+                'confidence_signals': {
+                    'duration_sec': round(duration, 3),
+                    'cluster_total_sec': round(speaker_totals.get(speaker, 0.0), 3),
+                    'overlapped': overlapped,
+                    'embedding_margin_available': False,
+                },
             })
 
         try:
@@ -120,4 +189,3 @@ def pyannote_proc_entrypoint(args: dict, q):
             })
         except Exception:
             pass
-

@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 # Absolute paths for launchd compatibility
 FFMPEG_PATH = '/opt/homebrew/bin/ffmpeg'
 FFPROBE_PATH = '/opt/homebrew/bin/ffprobe'
+SILENCE_THRESHOLD_DB = -60.0
+
+TOPOLOGY_SINGLE_SOURCE = "single_source"
+TOPOLOGY_MULTI_SOURCE_GENUINE = "multi_source_genuine"
+TOPOLOGY_UNKNOWN = "unknown"
 
 
 @dataclass
@@ -26,6 +31,16 @@ class AudioInfo:
     sample_rate: int
     duration_seconds: float
     file_size_bytes: int
+
+
+@dataclass
+class SourceTopologyInfo:
+    """Per-channel activity summary used to classify capture topology."""
+
+    total_channels: int
+    active_channels: list[int]
+    channel_mean_db: dict[int, float]
+    topology: str
 
 
 def get_audio_info(audio_path: Path) -> AudioInfo:
@@ -111,20 +126,27 @@ def get_channel_count(audio_path: Path) -> int:
     return int(result.stdout.strip())
 
 
-def detect_active_channels(audio_path: Path, probe_seconds: int = 60,
-                            silence_db: float = -60.0) -> list:
-    """Detect which channels contain audio above the silence threshold.
+def probe_channel_activity(audio_path: Path, probe_seconds: int = 60,
+                           silence_db: float = SILENCE_THRESHOLD_DB
+                           ) -> SourceTopologyInfo:
+    """Probe per-channel mean volume and classify source topology.
 
     Some macOS capture pipelines (e.g. BlackHole with unusual routing) put
     audio on only one of the 3 channels, with the other two at digital silence.
     Equal-weight pre-mixing attenuates the real signal; extracting only the
     active channel(s) preserves Swiss German ASR accuracy.
 
-    Returns list of channel indices that exceed the silence threshold.
+    Topology is intentionally conservative:
+      - single_source: zero/one active channel, including 3-channel files with
+        only ch0 active (in-room single mic) or only one routed channel active.
+      - multi_source_genuine: MeetingRecorder hybrid layout where ch0 (host
+        mic) and at least one system channel (ch1+) are both active.
+      - unknown: multiple active channels, but not the host+system shape.
     """
     import re
     channels = get_channel_count(audio_path)
     active = []
+    channel_mean_db: dict[int, float] = {}
     for i in range(channels):
         p = subprocess.run(
             [FFMPEG_PATH, '-i', str(audio_path), '-t', str(probe_seconds),
@@ -133,9 +155,38 @@ def detect_active_channels(audio_path: Path, probe_seconds: int = 60,
         )
         m = re.search(r'mean_volume:\s*(-?[0-9.]+)\s*dB', p.stderr)
         mean_db = float(m.group(1)) if m else float('-inf')
+        channel_mean_db[i] = mean_db
         logger.debug(f"  channel {i}: mean_volume={mean_db} dB")
         if mean_db > silence_db:
             active.append(i)
+
+    if len(active) <= 1:
+        topology = TOPOLOGY_SINGLE_SOURCE
+    elif channels >= 3 and 0 in active and any(i >= 1 for i in active):
+        topology = TOPOLOGY_MULTI_SOURCE_GENUINE
+    else:
+        topology = TOPOLOGY_UNKNOWN
+
+    return SourceTopologyInfo(
+        total_channels=channels,
+        active_channels=active,
+        channel_mean_db=channel_mean_db,
+        topology=topology,
+    )
+
+
+def classify_source_topology(audio_path: Path, probe_seconds: int = 60,
+                             silence_db: float = SILENCE_THRESHOLD_DB
+                             ) -> SourceTopologyInfo:
+    """Return active-channel info and source topology for a recording."""
+    return probe_channel_activity(audio_path, probe_seconds, silence_db)
+
+
+def detect_active_channels(audio_path: Path, probe_seconds: int = 60,
+                            silence_db: float = SILENCE_THRESHOLD_DB) -> list:
+    """Detect which channels contain audio above the silence threshold."""
+    info = probe_channel_activity(audio_path, probe_seconds, silence_db)
+    active = info.active_channels
     return active
 
 

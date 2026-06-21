@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -70,3 +71,20 @@ def test_git_sha_returns_string_or_none():
     """_git_sha must not raise; it returns a short SHA or None on failure."""
     out = tw._git_sha()
     assert out is None or (isinstance(out, str) and len(out) >= 4)
+
+
+def test_remote_topology_diarization_fusion_default_off():
+    topology = SimpleNamespace(topology=tw.TOPOLOGY_MULTI_SOURCE_GENUINE)
+    assert tw.TranscribeWatcher._should_run_diarization_prior(
+        topology, channel_fusion=False
+    ) is False
+    assert tw.TranscribeWatcher._should_run_diarization_prior(
+        topology, channel_fusion=True
+    ) is True
+
+
+def test_single_source_runs_diarization_prior_by_default():
+    topology = SimpleNamespace(topology=tw.TOPOLOGY_SINGLE_SOURCE)
+    assert tw.TranscribeWatcher._should_run_diarization_prior(
+        topology, channel_fusion=False
+    ) is True

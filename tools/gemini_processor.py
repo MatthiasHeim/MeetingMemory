@@ -222,6 +222,45 @@ def _build_channel_map_prefix(channel_segments: Optional[list]) -> str:
     )
 
 
+def _build_diarization_map_prefix(diarization_segments: Optional[list]) -> str:
+    """Render an acoustic speaker-map prior for Gemini.
+
+    Pyannote runs on the same mono audio Gemini receives, so these timestamps
+    align with Gemini's audio. It is a prior, not physical ground truth:
+    pyannote is good at turn boundaries and anonymous speaker changes, while
+    Gemini still decides which real person each anonymous speaker is from
+    names, intros, language, and the attendee list.
+    """
+    if not diarization_segments:
+        return ""
+    try:
+        from diarize import render_map_text
+        map_text = render_map_text(diarization_segments)
+    except Exception as e:
+        logger.warning(f"diarization map rendering failed ({e}); no prior")
+        return ""
+    if not map_text:
+        return ""
+    return (
+        "## ACOUSTIC SPEAKER MAP (PRIOR)\n\n"
+        "A local diarization model analyzed the same mono audio you are "
+        "transcribing and estimated anonymous speaker turns. Use this as a "
+        "confidence-annotated prior for turn boundaries and speaker changes, "
+        "not as a final naming authority.\n\n"
+        "- High-confidence spans: strongly prefer the shown turn boundary and "
+        "anonymous speaker change unless the audio content clearly contradicts it.\n"
+        "- Medium-confidence spans: use the map as helpful evidence together "
+        "with voice, content, language, and conversational flow.\n"
+        "- Low-confidence or overlapped spans: treat the map as uncertain; "
+        "decide by content, language, and the actual audio.\n\n"
+        "Bind anonymous labels such as SPEAKER_00/SPEAKER_01 to real names "
+        "using the KNOWN ATTENDEES block, self-introductions, direct address, "
+        "and context. If a label cannot be identified, keep a generic speaker "
+        "label consistently instead of inventing a name.\n\n"
+        + map_text + "\n\n"
+    )
+
+
 @dataclass
 class GeminiResult:
     """Result from Gemini audio processing — audio-derived signals only.
@@ -422,6 +461,7 @@ class GeminiAudioProcessor:
         custom_prompt: Optional[str] = None,
         known_attendees: Optional[list[dict]] = None,
         channel_segments: Optional[list] = None,
+        diarization_segments: Optional[list] = None,
     ) -> GeminiResult:
         """Process an audio file with Gemini, returning transcript and analysis.
 
@@ -440,6 +480,9 @@ class GeminiAudioProcessor:
                 prepended so Gemini anchors host/remote attribution to the
                 physical mic channel instead of voice similarity. Timestamps
                 are meeting-global; the chunked path slices them per chunk.
+            diarization_segments: Optional pyannote prior segments
+                (`{start,end,label,confidence,level,overlapped}`). Timestamps
+                are meeting-global; the chunked path slices them per chunk.
 
         Returns:
             GeminiResult with transcript and audio-derived signals.
@@ -457,6 +500,7 @@ class GeminiAudioProcessor:
                 audio_path, custom_prompt, total_duration,
                 known_attendees=known_attendees,
                 channel_segments=channel_segments,
+                diarization_segments=diarization_segments,
             )
 
         # Short-enough audio: one single-shot call (no chunk boundaries → no
@@ -468,6 +512,7 @@ class GeminiAudioProcessor:
                 audio_path, custom_prompt, total_duration,
                 known_attendees=known_attendees,
                 channel_segments=channel_segments,
+                diarization_segments=diarization_segments,
             )
         except Exception as e:
             if total_duration > self.CHUNK_DURATION_SEC:
@@ -478,6 +523,7 @@ class GeminiAudioProcessor:
                     audio_path, custom_prompt, total_duration,
                     known_attendees=known_attendees,
                     channel_segments=channel_segments,
+                    diarization_segments=diarization_segments,
                 )
             raise
 
@@ -488,6 +534,7 @@ class GeminiAudioProcessor:
         total_duration: float,
         known_attendees: Optional[list[dict]] = None,
         channel_segments: Optional[list] = None,
+        diarization_segments: Optional[list] = None,
     ) -> GeminiResult:
         """Transcribe an audio file in a single Gemini call (no chunking).
 
@@ -498,6 +545,7 @@ class GeminiAudioProcessor:
         base_prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
         prompt = (
             _build_attendees_prefix(known_attendees)
+            + _build_diarization_map_prefix(diarization_segments)
             + _build_channel_map_prefix(channel_segments)
             + base_prompt
         )
@@ -672,6 +720,7 @@ class GeminiAudioProcessor:
                           total_duration: float,
                           known_attendees: Optional[list[dict]] = None,
                           channel_segments: Optional[list] = None,
+                          diarization_segments: Optional[list] = None,
                           ) -> GeminiResult:
         """Chunk long audio, transcribe each chunk, merge with reduce-pass.
 
@@ -684,9 +733,10 @@ class GeminiAudioProcessor:
 
         `known_attendees` is forwarded to EVERY chunk's Gemini call so all
         chunks anchor to the same calendar attendee list — that's the fix
-        for cross-chunk speaker-name drift. `channel_segments` (meeting-global
-        times) is sliced per chunk and re-based to chunk-relative time so the
-        map matches each chunk's local [MM:SS] timestamps.
+        for cross-chunk speaker-name drift. `channel_segments` and
+        `diarization_segments` (meeting-global times) are sliced per chunk and
+        re-based to chunk-relative time so their maps match each chunk's local
+        [MM:SS] timestamps.
         """
         start_time = time.time()
         chunks = self._chunk_audio(audio_path)
@@ -698,6 +748,12 @@ class GeminiAudioProcessor:
                 from channel_vad import slice_segments as slice_fn
             except ImportError:
                 logger.warning("channel_vad not importable; chunks get no map")
+        diarize_slice_fn = None
+        if diarization_segments:
+            try:
+                from diarize import slice_segments as diarize_slice_fn
+            except ImportError:
+                logger.warning("diarize not importable; chunks get no prior")
 
         merged_transcript_parts = []
         input_tokens_total = 0
@@ -710,6 +766,7 @@ class GeminiAudioProcessor:
         for i, (chunk_path, offset) in enumerate(chunks):
             logger.info(f"  Chunk {i+1}/{len(chunks)} at offset {offset/60:.1f}min")
             chunk_segments = None
+            chunk_diarization_segments = None
             if slice_fn is not None:
                 # Single-chunk case: the "chunk" IS the whole file (single-
                 # shot fallback for a 15-60 min recording) — slice to the
@@ -725,6 +782,19 @@ class GeminiAudioProcessor:
                     ) or None
                 except Exception as e:
                     logger.warning(f"channel map slice failed ({e}); no map")
+            if diarize_slice_fn is not None:
+                chunk_end = (
+                    total_duration if len(chunks) == 1
+                    else offset + self.CHUNK_DURATION_SEC
+                )
+                try:
+                    chunk_diarization_segments = diarize_slice_fn(
+                        diarization_segments, offset, chunk_end
+                    ) or None
+                except Exception as e:
+                    logger.warning(
+                        f"diarization prior slice failed ({e}); no prior"
+                    )
             try:
                 # Call the single-shot path directly (chunks are ≤15min;
                 # the degenerate single chunk is the original file). NOT
@@ -737,6 +807,7 @@ class GeminiAudioProcessor:
                     self._get_duration(chunk_path),
                     known_attendees=known_attendees,
                     channel_segments=chunk_segments,
+                    diarization_segments=chunk_diarization_segments,
                 )
             except Exception as e:
                 logger.error(f"  Chunk {i+1} failed: {e}, continuing with others")
@@ -1031,6 +1102,7 @@ def process_audio_file(
     audio_path: Path,
     api_key: Optional[str] = None,
     known_attendees: Optional[list[dict]] = None,
+    diarization_segments: Optional[list] = None,
 ) -> GeminiResult:
     """Convenience function to process an audio file.
 
@@ -1039,12 +1111,18 @@ def process_audio_file(
         api_key: Optional API key (default: from environment)
         known_attendees: Optional calendar attendee records — see
             GeminiAudioProcessor.process_audio for semantics.
+        diarization_segments: Optional pyannote prior segments — see
+            GeminiAudioProcessor.process_audio for semantics.
 
     Returns:
         GeminiResult with transcript and analysis
     """
     processor = GeminiAudioProcessor(api_key=api_key)
-    return processor.process_audio(audio_path, known_attendees=known_attendees)
+    return processor.process_audio(
+        audio_path,
+        known_attendees=known_attendees,
+        diarization_segments=diarization_segments,
+    )
 
 
 if __name__ == "__main__":

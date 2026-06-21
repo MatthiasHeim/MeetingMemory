@@ -16,6 +16,7 @@ from gemini_processor import (  # noqa: E402
     REDUCE_PASS_PROMPT,
     GeminiAudioProcessor,
     _build_attendees_prefix,
+    _build_diarization_map_prefix,
     process_audio_file,
 )
 
@@ -55,6 +56,39 @@ def test_prefix_renders_attendees_with_company():
     assert prefix.endswith("\n\n")
 
 
+def test_diarization_prefix_empty_when_no_segments():
+    assert _build_diarization_map_prefix(None) == ""
+    assert _build_diarization_map_prefix([]) == ""
+
+
+def test_diarization_prefix_renders_prior_wording():
+    prefix = _build_diarization_map_prefix([
+        {
+            "start": 0.0,
+            "end": 2.2,
+            "label": "SPEAKER_00",
+            "confidence": 0.82,
+            "level": "high",
+            "overlapped": False,
+        },
+        {
+            "start": 2.2,
+            "end": 3.0,
+            "label": "SPEAKER_01",
+            "confidence": 0.41,
+            "level": "low",
+            "overlapped": True,
+        },
+    ])
+    assert "ACOUSTIC SPEAKER MAP (PRIOR)" in prefix
+    assert "GROUND TRUTH" not in prefix
+    assert "map wins" not in prefix
+    assert "not as a final naming authority" in prefix
+    assert "SPEAKER_00 confidence=high (0.82)" in prefix
+    assert "SPEAKER_01 confidence=low (0.41) overlapped" in prefix
+    assert "KNOWN ATTENDEES" in prefix
+
+
 def test_prefix_falls_back_to_role_when_company_none():
     """`calendar_resolve._company_from_email` returns None for unknown domains.
     The prefix must still render those attendees — fall back to role."""
@@ -91,6 +125,8 @@ def test_process_audio_accepts_known_attendees_kwarg():
     # Must be optional (default None) — single-shot callers without calendar
     # context must keep working.
     assert sig.parameters["known_attendees"].default is None
+    assert "diarization_segments" in sig.parameters
+    assert sig.parameters["diarization_segments"].default is None
 
 
 def test_process_audio_file_convenience_forwards_kwarg():
@@ -98,6 +134,8 @@ def test_process_audio_file_convenience_forwards_kwarg():
     sig = inspect.signature(process_audio_file)
     assert "known_attendees" in sig.parameters
     assert sig.parameters["known_attendees"].default is None
+    assert "diarization_segments" in sig.parameters
+    assert sig.parameters["diarization_segments"].default is None
 
 
 # ── prompt assembly with attendees ────────────────────────────────────
@@ -250,7 +288,8 @@ def test_single_chunk_fallback_gets_full_channel_map(monkeypatch, tmp_path):
     captured: list = []
 
     def fake_single_shot(audio_path, custom_prompt, total_duration,
-                         known_attendees=None, channel_segments=None):
+                         known_attendees=None, channel_segments=None,
+                         diarization_segments=None):
         captured.append(channel_segments)
         return GeminiResult(transcript="[00:00] Matthias: hi", language="en")
 
