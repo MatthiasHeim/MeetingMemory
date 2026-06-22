@@ -49,6 +49,8 @@ diarize_x86_64_mod_unsigned
 .env
 .env.mcp
 .env.example
+.env.bak
+.env.*
 workflows/
 transcript-mcp-server/
 .claude/

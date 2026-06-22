@@ -638,7 +638,7 @@ class GeminiAudioProcessor:
         return result
 
     def _generate_with_retry(self, prompt: str, audio_content: Optional[Any] = None,
-                              max_attempts: int = 3) -> tuple:
+                              max_attempts: int = 3, validate_json: bool = True) -> tuple:
         """Stream generate_content with retry on transient disconnects.
 
         Gemini's server disconnects with RemoteProtocolError on ~30% of
@@ -646,6 +646,10 @@ class GeminiAudioProcessor:
 
         Pass `audio_content=None` for a text-only call (used by the reduce-pass
         merge over chunked transcripts).
+
+        With `validate_json=True` (default) a completed-but-unparseable JSON
+        response is also retried, not just transport-level disconnects — a
+        malformed/truncated Gemini reply used to silently drop the recording.
 
         Returns: (text, response) where response has usage_metadata and text.
         """
@@ -670,6 +674,13 @@ class GeminiAudioProcessor:
                 text = ''.join(chunks)
                 if not text:
                     raise RuntimeError("Empty response from Gemini")
+                if validate_json:
+                    # A stream can complete yet still be unusable: truncated
+                    # mid-JSON ("Unterminated string") or wrapped in prose
+                    # ("Extra data"). Treat that like a disconnect — retry it —
+                    # instead of returning unparseable text that silently
+                    # dropped the recording downstream.
+                    self._strip_and_parse_json(text)
                 return text, final_response
             except Exception as e:
                 last_error = e
@@ -907,7 +918,15 @@ class GeminiAudioProcessor:
 
     @staticmethod
     def _strip_and_parse_json(text: str) -> dict:
-        """Strip markdown fences and parse JSON; raise on failure."""
+        """Strip markdown fences and parse JSON, salvaging two common Gemini
+        formatting faults before giving up:
+          - ```json fences around the object
+          - prose before/after the object ("Extra data" / leading commentary),
+            by extracting the outermost {...} span.
+        Genuine truncation (no closing brace — "Unterminated string") still
+        raises JSONDecodeError, which `_generate_with_retry` treats as a
+        retryable generation failure rather than dropping the recording.
+        """
         s = text.strip()
         if s.startswith("```json"):
             s = s[7:]
@@ -915,7 +934,16 @@ class GeminiAudioProcessor:
             s = s[3:]
         if s.endswith("```"):
             s = s[:-3]
-        return json.loads(s.strip())
+        s = s.strip()
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            # Salvage a JSON object wrapped in prose / trailing commentary.
+            start = s.find("{")
+            end = s.rfind("}")
+            if start != -1 and end > start:
+                return json.loads(s[start:end + 1])
+            raise
 
     @staticmethod
     def _build_reduce_input(merged_transcript: str, chunk_results: list,

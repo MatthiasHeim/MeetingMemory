@@ -346,6 +346,111 @@ def test_chunk_loop_does_not_recurse_into_process_audio(monkeypatch, tmp_path):
     assert result.error == "All chunks failed"
 
 
+# ── malformed-JSON salvage + retry ────────────────────────────────────
+#
+# A Gemini stream can COMPLETE yet still be unusable: truncated mid-object
+# ("Unterminated string") or wrapped in prose ("Extra data: line 1 col 2").
+# Before this fix _parse_response just logged + returned an error result and
+# the watcher dropped the recording silently. Two real losses prompted it:
+# the 2026-06-22 10:17 recording (truncation, recovered on retry) and an
+# 888 MB 2026-06-12 recording ("Extra data").
+
+
+def test_strip_and_parse_json_salvages_trailing_prose():
+    """'Extra data' — model appends commentary after the JSON object."""
+    raw = '{"language": "en", "transcript": "[00:00] M: hi"}\n\nHope that helps!'
+    assert GeminiAudioProcessor._strip_and_parse_json(raw) == {
+        "language": "en", "transcript": "[00:00] M: hi"}
+
+
+def test_strip_and_parse_json_salvages_leading_prose_and_fence():
+    """Leading prose plus a ```json fence — extract the outermost object."""
+    raw = 'Sure, here is the result:\n```json\n{"a": 1, "b": 2}\n```'
+    assert GeminiAudioProcessor._strip_and_parse_json(raw) == {"a": 1, "b": 2}
+
+
+def test_strip_and_parse_json_raises_on_truncation():
+    """Genuine truncation has no closing brace — must RAISE so the caller
+    retries the generation rather than salvaging a half object."""
+    import json as _json
+
+    import pytest
+    with pytest.raises(_json.JSONDecodeError):
+        GeminiAudioProcessor._strip_and_parse_json('{"transcript": "[00:00] M: hi')
+
+
+def _scripted_processor(payloads, monkeypatch):
+    """Bare processor whose streaming API yields each payload in turn."""
+    import gemini_processor as gp
+
+    p = _bare_processor()
+    p.model = "test-model"
+    p.temperature = 0.0
+    p.max_output_tokens = 1024
+
+    class _Types:
+        @staticmethod
+        def GenerateContentConfig(**kwargs):
+            return kwargs
+
+    p.types = _Types()
+
+    class _Chunk:
+        def __init__(self, text):
+            self.text = text
+            self.usage_metadata = None
+
+    class _Models:
+        def generate_content_stream(self, model, contents, config):
+            return iter([_Chunk(payloads.pop(0))])
+
+    class _Client:
+        models = _Models()
+
+    p.client = _Client()
+    monkeypatch.setattr(gp.time, "sleep", lambda *_a, **_k: None)
+    return p
+
+
+def test_generate_with_retry_retries_on_unparseable_json(monkeypatch):
+    """First attempt streams truncated JSON; the call must retry and return the
+    clean second response — not pass the broken text downstream. This is the
+    exact failure that silently dropped the 2026-06-22 10:17 recording."""
+    bad = '{"transcript": "[00:00] M: hi'  # unterminated
+    good = '{"transcript": "[00:00] M: hi", "language": "en"}'
+    payloads = [bad, good]
+    p = _scripted_processor(payloads, monkeypatch)
+
+    text, _response = p._generate_with_retry(
+        prompt="x", audio_content=None, max_attempts=3)
+
+    assert text == good
+    assert payloads == []  # both attempts consumed
+
+
+def test_generate_with_retry_raises_after_persistent_bad_json(monkeypatch):
+    """If every attempt is unparseable, raise (→ watcher fires the failure
+    alert) rather than returning junk."""
+    import pytest
+    payloads = ['{"transcript": "oops'] * 3
+    p = _scripted_processor(payloads, monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        p._generate_with_retry(prompt="x", audio_content=None, max_attempts=3)
+
+
+def test_generate_with_retry_skips_validation_when_disabled(monkeypatch):
+    """validate_json=False returns raw text untouched (kept as an escape hatch
+    for any non-JSON call)."""
+    payloads = ['not json at all']
+    p = _scripted_processor(payloads, monkeypatch)
+
+    text, _response = p._generate_with_retry(
+        prompt="x", audio_content=None, max_attempts=2, validate_json=False)
+
+    assert text == 'not json at all'
+
+
 def test_short_single_shot_failure_propagates(monkeypatch, tmp_path):
     """A sub-15-min recording can't meaningfully chunk; a single-shot failure
     must propagate, not silently no-op through the chunked path."""

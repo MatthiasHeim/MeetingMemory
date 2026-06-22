@@ -846,6 +846,7 @@ class TranscribeWatcher:
 
             if result.error:
                 self.logger.error(f"Gemini processing error: {result.error}")
+                self._notify_telegram_failure(audio_file, f"Gemini error: {result.error}")
                 return
 
             # Log some stats
@@ -907,6 +908,7 @@ class TranscribeWatcher:
             self.logger.error(f"Gemini processing failed: {e}")
             import traceback
             self.logger.debug(traceback.format_exc())
+            self._notify_telegram_failure(audio_file, f"{type(e).__name__}: {e}")
 
     def _send_gemini_webhook(self, audio_file: Path, mp3_path: Path,
                              result: 'GeminiResult', audio_duration: float,
@@ -1522,6 +1524,36 @@ class TranscribeWatcher:
             self.logger.info(f"Telegram ping sent for source_id={source_id}")
         except Exception as e:
             self.logger.warning(f"Telegram ping failed: {e}")
+
+    def _notify_telegram_failure(self, audio_file: Path, reason: str) -> None:
+        """Alert that a recording FAILED transcription and was NOT captured.
+
+        Without this the watcher dropped failed recordings silently — a
+        malformed Gemini JSON response looked identical to "no meeting today",
+        so a real meeting could vanish unnoticed (happened 2026-06-22 10:17 and
+        an 888 MB 2026-06-12 recording). The audio is retained, so the file can
+        be re-triggered after a fix. Best-effort.
+        """
+        notify_path = os.path.expanduser(
+            "~/.claude/scripts/telegram_notify.py"
+        )
+        if not os.path.exists(notify_path):
+            self.logger.debug("telegram_notify.py not found; skipping failure alert")
+            return
+        msg = (
+            f"⚠️ Transcription FAILED — recording not captured\n"
+            f"{audio_file.name}\n"
+            f"{reason}\n"
+            f"Audio retained; re-trigger after a fix."
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.logger.info(f"Telegram failure alert sent for {audio_file.name}")
+        except Exception as e:
+            self.logger.warning(f"Telegram failure alert failed: {e}")
 
     def _trigger_claude(self, transcript_path: Path, source_id: Optional[int] = None):
         """Fire-and-forget headless Claude session to process transcript.
