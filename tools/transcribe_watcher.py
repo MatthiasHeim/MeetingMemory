@@ -1479,6 +1479,25 @@ class TranscribeWatcher:
                 f"Calendar UPDATE failed for source_id={source_id}: {e}"
             )
 
+    @staticmethod
+    def _telegram_notify_script() -> Optional[str]:
+        """Resolve telegram_notify.py across known locations.
+
+        The canonical copy lives in the Brain repo; an older deploy expected
+        ~/.claude/scripts. Hardcoding the latter silently disabled ALL pings
+        (captured + failure alerts) once the script moved — checked both now so
+        a repo move can't break alerting unnoticed. Optional env override first.
+        """
+        candidates = [
+            os.environ.get("TELEGRAM_NOTIFY_SCRIPT", ""),
+            os.path.expanduser("~/Repos/Brain/.claude/scripts/telegram_notify.py"),
+            os.path.expanduser("~/.claude/scripts/telegram_notify.py"),
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
+        return None
+
     def _notify_telegram_meeting_captured(self, source_id: Optional[int],
                                             result, cal_match: Optional[dict],
                                             audio_duration: float) -> None:
@@ -1487,11 +1506,11 @@ class TranscribeWatcher:
         Fires BEFORE the Claude session — user knows the row exists and the
         transcript is ready to be pulled into a session if needed. Best-effort.
         """
-        notify_path = os.path.expanduser(
-            "~/.claude/scripts/telegram_notify.py"
-        )
-        if not os.path.exists(notify_path):
-            self.logger.debug("telegram_notify.py not found; skipping ping")
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            self.logger.warning(
+                "telegram_notify.py not found in any known location; skipping ping"
+            )
             return
 
         title = (cal_match or {}).get("calendar_event_id") and (
@@ -1534,11 +1553,12 @@ class TranscribeWatcher:
         an 888 MB 2026-06-12 recording). The audio is retained, so the file can
         be re-triggered after a fix. Best-effort.
         """
-        notify_path = os.path.expanduser(
-            "~/.claude/scripts/telegram_notify.py"
-        )
-        if not os.path.exists(notify_path):
-            self.logger.debug("telegram_notify.py not found; skipping failure alert")
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            self.logger.warning(
+                "telegram_notify.py not found in any known location; "
+                "skipping failure alert"
+            )
             return
         msg = (
             f"⚠️ Transcription FAILED — recording not captured\n"
