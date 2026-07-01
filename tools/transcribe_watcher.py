@@ -161,6 +161,13 @@ except ImportError as e:
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
 
+# Recordings below this size are treated as corrupt/empty and skipped rather
+# than queued: at 48kHz/3ch/16-bit a real recording is ~288 KB per second, so
+# anything under ~0.1 MB has no usable audio. Without this guard a truncated
+# capture (e.g. a 102-byte file) is re-queued on every startup, fails ffprobe
+# ("Invalid data found"), and fires a Telegram failure alert each time.
+MIN_RECORDING_BYTES = 100_000
+
 
 def _git_sha() -> Optional[str]:
     """Return the short git SHA of this repo, or None if unavailable."""
@@ -348,11 +355,16 @@ class AudioFileHandler(FileSystemEventHandler):
         if file_path in self.pending_files:
             del self.pending_files[file_path]
 
-        # Verify file still exists and has content
-        if file_path.exists() and file_path.stat().st_size > 0:
-            self.queue.add(file_path)
-        else:
+        # Verify file still exists and holds a usable amount of audio.
+        if not file_path.exists() or file_path.stat().st_size == 0:
             self.logger.warning(f"File no longer exists or is empty: {file_path.name}")
+        elif file_path.stat().st_size < MIN_RECORDING_BYTES:
+            self.logger.warning(
+                f"Skipping corrupt/too-small recording "
+                f"({file_path.stat().st_size} bytes < {MIN_RECORDING_BYTES}): {file_path.name}"
+            )
+        else:
+            self.queue.add(file_path)
 
 
 class TranscribeWatcher:
@@ -477,6 +489,15 @@ class TranscribeWatcher:
         """Check for WAV files that don't have corresponding outputs."""
         for wav_file in self.recordings_dir.glob("*.wav"):
             needs_processing = False
+
+            # Corrupt/empty captures never produce a transcript, so without
+            # this they'd be re-queued (and fail-alert) on every startup.
+            if wav_file.stat().st_size < MIN_RECORDING_BYTES:
+                self.logger.warning(
+                    f"Skipping corrupt/too-small recording "
+                    f"({wav_file.stat().st_size} bytes): {wav_file.name}"
+                )
+                continue
 
             if self.processing_mode in ('whisper', 'both'):
                 # Check for Whisper HTML transcript

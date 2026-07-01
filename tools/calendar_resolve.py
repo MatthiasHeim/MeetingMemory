@@ -168,9 +168,19 @@ def _pick_best_event(events: list[dict], target: datetime) -> Optional[dict]:
         if not start:
             return None
         try:
-            return datetime.fromisoformat(start.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
         except ValueError:
             return None
+        # All-day events carry a date only ("2026-06-30") and parse as a
+        # NAIVE midnight, while `target` is timezone-aware (UTC). Subtracting
+        # them below then raised "can't subtract offset-naive and offset-aware
+        # datetimes" and crashed the whole resolution whenever an all-day
+        # event fell inside the search window (silently losing all speaker
+        # attribution). Normalize to aware UTC; an all-day event then scores
+        # far from a timed recording and loses to the real meeting.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
     def has_conference(ev: dict) -> bool:
         if ev.get("hangoutLink") or ev.get("conferenceData"):
