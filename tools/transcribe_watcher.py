@@ -397,6 +397,22 @@ class TranscribeWatcher:
                     timeout_seconds=gemini_config.get('timeout', 600)
                 )
                 self.logger.info(f"Gemini processor initialized with model: {gemini_config.get('model', 'gemini-2.5-flash')}")
+                # Length-based model routing. The flash models intermittently
+                # fail long multi-source recordings with "Server disconnected
+                # without sending a response" (0 bytes back, all retries +
+                # chunk fallback exhausted -> the recording is silently
+                # dropped). gemini-2.5-pro is reliable on that same audio, so
+                # meetings longer than `long_duration_min` are routed to it;
+                # shorter meetings stay on the cheap/fast `model`. Applied
+                # per-file in _process_with_gemini.
+                self._gemini_model_short = gemini_config.get('model', 'gemini-2.5-flash')
+                self._gemini_model_long = gemini_config.get('model_long', 'gemini-2.5-pro')
+                self._gemini_long_min = float(gemini_config.get('long_duration_min', 30))
+                if self._gemini_model_long != self._gemini_model_short:
+                    self.logger.info(
+                        f"Model routing enabled: >{self._gemini_long_min:.0f}min -> "
+                        f"{self._gemini_model_long}, else {self._gemini_model_short}"
+                    )
             else:
                 self.logger.error(f"GEMINI_API_KEY not found in environment. Gemini processing disabled.")
                 if self.processing_mode == 'gemini':
@@ -756,6 +772,19 @@ class TranscribeWatcher:
             # Step 2: Get audio duration
             audio_duration = get_audio_duration(mp3_path)
             self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
+
+            # Route long recordings to the reliable model (see __init__).
+            _routed_model = (
+                self._gemini_model_long
+                if audio_duration / 60 > self._gemini_long_min
+                else self._gemini_model_short
+            )
+            if _routed_model != self.gemini_processor.model:
+                self.logger.info(
+                    f"Model routing: {audio_duration / 60:.1f}min -> {_routed_model} "
+                    f"(was {self.gemini_processor.model})"
+                )
+                self.gemini_processor.model = _routed_model
 
             # Step 2b: JSON output path used downstream (and as the source
             # of truth for calendar timestamp parsing — filename-derived).
