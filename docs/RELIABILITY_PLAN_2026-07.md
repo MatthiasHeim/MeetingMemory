@@ -28,6 +28,22 @@ Meetings ≤ 60 min (nearly all of them) already go single-call, which has **zer
 - ✅ Source 429 insights flagged for re-extraction (`flag_reextraction.py`, 14 insights).
 - ☐ Optional: re-transcribe 2026-06-30_15-31-11.wav (source 429's audio) single-call on pro and UPDATE `sources.content_text` in place (do NOT re-seed — would duplicate the source row). Recovers the missing min 29–43 and fixes the flipped labels.
 
+## Model choice: gemini-3.5-flash evaluated and REJECTED (2026-07-08)
+
+3.5 Flash (stable, released 2026-05-19) replaces the deprecated `gemini-3-flash-preview` we were running. Tested empirically because specs can't reveal the disconnect issue. Two findings, both against a switch:
+
+- **Reliability: still broken.** On the 28.5-min multi-source recording that killed the old flash, 3.5-flash failed **2 of 3 runs** ("Server disconnected without sending a response", 0 bytes, all single-call retries + all chunk-fallback retries exhausted); each failure burned ~440 s. It also failed the 59-min recording. gemini-2.5-pro transcribed the same 28.5-min file cleanly in 130 s. The disconnect is a streaming-endpoint problem for long/multi-source audio on the Flash tier, not a model-intelligence issue — 3.5-flash inherits it.
+- **Cost: not actually cheaper.** Audio transcription is input-token-dominated (~1920 tok/audio-min). 3.5-flash is $1.50/M in ÷ $9/M out; 2.5-pro is $1.00/M in ÷ $10/M out. A 28.5-min meeting (~61k in / 8.6k out) ≈ $0.17 on flash vs ≈ $0.15 on pro. Flash is ~15% *more* expensive here. ("3x the model it replaced"; the cheap-Flash era is over.)
+
+**Decision: stay on gemini-2.5-pro for all meetings** (Phase 0). Re-evaluate only a *pro*-tier successor (e.g. gemini-3.5-pro) via the Phase 4 eval harness; do not put any Flash-tier model back on the live path until a batch reliability test shows 0 disconnects across ≥10 long/multi-source runs.
+
+### Second finding from the same test: pro silently TRUNCATES long single calls
+
+The A/B test surfaced a failure mode independent of the model question. On a 50.5-min single call, gemini-2.5-pro returned **valid JSON that ended at [08:17]** — 16.4% coverage, 3,349 output tokens (nowhere near the 32k cap), no disconnect, no error. The current pipeline would insert this as a complete 50-min meeting. This is the same silent-partial-data class as `[CHUNK N FAILED]` but with no marker at all. Two consequences:
+
+1. **The Phase 1 coverage gate (last-timestamp ≥ 90% of audio duration) is the single highest-priority fix** — it is the only thing that catches this.
+2. **Lower `CHUNK_THRESHOLD_SEC` from 60 min to ~35 min.** The 60-min single-call window was chosen (doc `transcription-single-call-investigation.md`) to avoid cross-chunk drift, but it trades drift for truncation/disconnect risk on 40–60 min calls. With Phase 3 drift-proof chunking (silence-aligned, zero-overlap, continuity context), chunking no longer causes drift, so the reason to push single-call so long is gone. Route > ~35 min to drift-proof chunks; keep single-call for the short majority.
+
 ## Phase 1 — Validation gate + no silent loss (highest ROI, ~1 day)
 
 New module `tools/transcript_validator.py`, called in `_process_with_gemini` between the Gemini result and the JSON write. A transcript must pass ALL checks or the meeting is retried/escalated — never silently inserted:
