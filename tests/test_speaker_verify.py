@@ -98,20 +98,55 @@ def test_host_label_on_remote_span_flips_to_dominant_remote():
 # ── conservatism gates ────────────────────────────────────────────────
 
 
-def test_short_turn_never_flipped():
-    """Gemini timestamps are ±few-seconds; turns under 8 s are untouchable
-    even when the channel evidence contradicts the label."""
+def test_short_turn_with_ambiguous_evidence_never_flipped():
+    """Gemini timestamps are ±few-seconds; a short turn with AMBIGUOUS VAD
+    evidence (not extreme host_share) is untouchable — the 8 s floor still
+    applies when confidence isn't high."""
+    g = _gem(
+        "[00:00] Speaker B: Kurz und gemischt.\n"
+        "[00:05] Matthias: Lang genug um sicher zu sein, dass hier wirklich "
+        "jemand spricht.\n"
+    )
+    # host_share for [0,5) is 50% (mixed) -- not high confidence.
+    vad = StubVAD([(0, 2.5, 'host'), (2.5, 5, 'remote'), (5, 60, 'host')],
+                  duration_sec=60)
+    log = verify(g, vad)
+    assert log["flips"] == []
+    assert log["skipped"]["short"] == 1
+    assert "Speaker B: Kurz und gemischt." in g["transcript"]
+
+
+def test_short_turn_with_high_confidence_evidence_flips():
+    """docs/RELIABILITY_PLAN_2026-07.md Phase 2 fix (429 [01:06]): a short
+    turn (< 8 s but >= 2.5 s) whose channel evidence is nearly unanimous
+    (host_share > 95%) now flips despite being short -- the ±few-second
+    timestamp noise can't plausibly explain away a near-100% mic signal."""
     g = _gem(
         "[00:00] Speaker B: Kurz.\n"
         "[00:05] Matthias: Lang genug um sicher zu sein, dass hier wirklich "
         "jemand spricht.\n"
     )
+    # host_share for [0,5) is 100% -- the mic was active the whole turn.
     vad = StubVAD([(0, 5, 'host'), (5, 60, 'host')], duration_sec=60)
     log = verify(g, vad)
-    # First turn (5 s, mislabeled) skipped as short; second is correct.
+    assert len(log["flips"]) == 1
+    assert log["flips"][0]["from"] == "Speaker B"
+    assert log["flips"][0]["to"] == "Matthias"
+
+
+def test_very_short_turn_below_high_confidence_floor_never_flipped():
+    """Even a maximally-confident VAD signal can't rescue a turn under the
+    2.5 s absolute floor -- Gemini's timestamp noise dominates at that
+    length regardless of channel evidence."""
+    g = _gem(
+        "[00:00] Speaker B: Ja.\n"
+        "[00:02] Matthias: Lang genug um sicher zu sein, dass hier wirklich "
+        "jemand spricht und die Aufnahme weitergeht.\n"
+    )
+    vad = StubVAD([(0, 2, 'host'), (2, 60, 'host')], duration_sec=60)
+    log = verify(g, vad)
     assert log["flips"] == []
     assert log["skipped"]["short"] == 1
-    assert "Speaker B: Kurz." in g["transcript"]
 
 
 def test_overlap_dominated_turn_skipped():

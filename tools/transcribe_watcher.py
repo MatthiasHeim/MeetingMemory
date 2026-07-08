@@ -131,6 +131,18 @@ except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
     _SPEAKER_VERIFY_IMPORT_ERROR = str(e)
 
+# Import transcript_validator for the coverage/completeness gate (see
+# docs/RELIABILITY_PLAN_2026-07.md Phase 1) that runs on every Gemini result
+# before it's written to disk. Unavailable is treated as "cannot validate" —
+# _validate_gemini_result degrades to a permissive pass rather than blocking
+# the pipeline, matching every other optional module in this file.
+try:
+    from transcript_validator import validate_transcript as _validate_transcript
+    TRANSCRIPT_VALIDATOR_AVAILABLE = True
+except ImportError as e:
+    TRANSCRIPT_VALIDATOR_AVAILABLE = False
+    _TRANSCRIPT_VALIDATOR_IMPORT_ERROR = str(e)
+
 try:
     from diarize import (
         PYANNOTE_AVAILABLE,
@@ -275,6 +287,65 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     logger.addHandler(ch)
 
     return logger
+
+
+def _fmt_mmss(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class _PermissiveValidation:
+    """Stand-in for transcript_validator.ValidationResult when that module
+    is unavailable — always passes so a missing optional module never
+    blocks the pipeline, matching the rest of this file's degrade style."""
+
+    def __init__(self, reasons: list[str]):
+        self.passed = True
+        self.coverage_pct = 100.0
+        self.last_timestamp_sec = 0.0
+        self.reasons = reasons
+        self.has_chunk_failure_marker = False
+        self.has_repetition_loop = False
+        self.has_duplicate_span = False
+
+    def to_dict(self) -> dict:
+        return {
+            "passed": self.passed,
+            "coverage_pct": self.coverage_pct,
+            "last_timestamp_sec": self.last_timestamp_sec,
+            "reasons": self.reasons,
+        }
+
+
+def _validate_gemini_result(result, audio_duration_seconds: float):
+    """transcript_validator.validate_transcript, plus a GeminiResult-specific
+    check the text-only validator can't see: a chunk that failed after
+    retries leaves a hole in the middle of an otherwise full-coverage
+    transcript (e.g. chunks 1 and 3 succeed, chunk 2 doesn't) — the trailing
+    timestamp still reaches near the end, so the coverage percentage alone
+    would pass it. `GeminiResult.missing_time_ranges` (see gemini_processor)
+    forces a failure in that case.
+
+    Degrades to a permissive pass if transcript_validator is unavailable —
+    never blocks the pipeline on a missing optional module.
+    """
+    if not TRANSCRIPT_VALIDATOR_AVAILABLE:
+        return _PermissiveValidation(
+            [f"transcript_validator unavailable: {_TRANSCRIPT_VALIDATOR_IMPORT_ERROR}"]
+        )
+    validation = _validate_transcript(result.transcript, audio_duration_seconds)
+    missing = getattr(result, "missing_time_ranges", None) or []
+    if missing:
+        validation.passed = False
+        ranges_str = ", ".join(
+            f"{_fmt_mmss(s)}-{_fmt_mmss(e)}" for s, e in missing
+        )
+        validation.reasons.append(
+            f"Missing time range(s) from failed chunk(s): {ranges_str}"
+        )
+    return validation
 
 
 def html_to_text(html_content: str) -> str:
@@ -885,9 +956,10 @@ class TranscribeWatcher:
 
             # Step 3: Process with Gemini (attendees + channel map injected)
             self.logger.info("Sending to Gemini API...")
+            channel_segments = channel_vad.segments if channel_vad else None
             result = self.gemini_processor.process_audio(
                 mp3_path, known_attendees=known_attendees or None,
-                channel_segments=channel_vad.segments if channel_vad else None,
+                channel_segments=channel_segments,
                 diarization_segments=diarization_segments,
             )
 
@@ -898,6 +970,20 @@ class TranscribeWatcher:
                 self.logger.error(f"Gemini processing error: {result.error}")
                 self._notify_telegram_failure(audio_file, f"Gemini error: {result.error}")
                 return
+
+            # Step 3b: Coverage/completeness gate + escalation ladder (see
+            # docs/RELIABILITY_PLAN_2026-07.md Phase 1). Never store a
+            # failed-validation transcript as a clean success — this is the
+            # fix for the silent-truncation and undeduped-overlap failure
+            # modes, neither of which raises `result.error` above.
+            result, validation, partial = self._validate_and_escalate(
+                audio_file, mp3_path, audio_duration, result,
+                known_attendees=known_attendees or None,
+                channel_segments=channel_segments,
+                diarization_segments=diarization_segments,
+            )
+            result.validation_report = validation.to_dict()
+            result.partial = partial
 
             # Log some stats
             if result.input_tokens and result.output_tokens:
@@ -1576,6 +1662,7 @@ class TranscribeWatcher:
             sum(len(e.get("arc", []) or []) for e in (result.speaker_emotions or []))
             if result else 0
         )
+        partial = bool(result and getattr(result, "partial", False))
         msg = (
             f"Meeting captured (#{source_id})\n"
             f"{title}\n"
@@ -1583,6 +1670,7 @@ class TranscribeWatcher:
             f"sentiment {sentiment}/{intensity}\n"
             f"{n_emotions} emotion arc events"
             + (" • chunked" if chunked else "")
+            + (" • ⚠️ PARTIAL" if partial else "")
             + "\nClaude /meeting-actions running…"
         )
         try:
@@ -1624,6 +1712,126 @@ class TranscribeWatcher:
             self.logger.info(f"Telegram failure alert sent for {audio_file.name}")
         except Exception as e:
             self.logger.warning(f"Telegram failure alert failed: {e}")
+
+    def _validate_and_escalate(self, audio_file: Path, mp3_path: Path,
+                                audio_duration: float, result,
+                                known_attendees: Optional[list[dict]],
+                                channel_segments: Optional[list],
+                                diarization_segments: Optional[list]):
+        """Coverage/completeness gate + escalation ladder
+        (docs/RELIABILITY_PLAN_2026-07.md Phase 1). Never store a
+        failed-validation transcript as a clean success:
+
+          1. Validate the Gemini result already in hand.
+          2. On failure, retry a FRESH single-call on pro.
+          3. On failure, try drift-proof chunked mode (skipped for
+             recordings too short to meaningfully chunk).
+          4. If every step still fails validation, accept the best-available
+             candidate (highest coverage_pct) with partial=True and fire a
+             Telegram alert naming what's missing — never silently.
+
+        Returns (result, validation, partial). `result` is always the
+        result to persist; `partial` is True iff it did not pass validation.
+        """
+        validation = _validate_gemini_result(result, audio_duration)
+        if validation.passed:
+            self.logger.info(
+                f"Validation passed: coverage {validation.coverage_pct:.1f}%"
+            )
+            return result, validation, False
+
+        self.logger.warning(
+            f"Validation FAILED (coverage {validation.coverage_pct:.1f}%): "
+            f"{'; '.join(validation.reasons)}"
+        )
+        best_result, best_validation = result, validation
+
+        self.logger.info("Escalation: retrying fresh single-call on pro...")
+        try:
+            retry_result = self.gemini_processor._process_single_shot(
+                mp3_path, None, audio_duration,
+                known_attendees=known_attendees,
+                channel_segments=channel_segments,
+                diarization_segments=diarization_segments,
+            )
+            retry_validation = _validate_gemini_result(retry_result, audio_duration)
+            if retry_validation.passed:
+                self.logger.info("Escalation: fresh single-call retry passed validation")
+                return retry_result, retry_validation, False
+            self.logger.warning(
+                f"Escalation: fresh single-call retry still failed "
+                f"(coverage {retry_validation.coverage_pct:.1f}%): "
+                f"{'; '.join(retry_validation.reasons)}"
+            )
+            if retry_validation.coverage_pct > best_validation.coverage_pct:
+                best_result, best_validation = retry_result, retry_validation
+        except Exception as e:
+            self.logger.warning(f"Escalation: fresh single-call retry raised: {e}")
+
+        if audio_duration > self.gemini_processor.CHUNK_DURATION_SEC:
+            self.logger.info("Escalation: trying drift-proof chunked mode...")
+            try:
+                chunked_result = self.gemini_processor._process_chunked(
+                    mp3_path, None, audio_duration,
+                    known_attendees=known_attendees,
+                    channel_segments=channel_segments,
+                    diarization_segments=diarization_segments,
+                    force_chunk=True,
+                )
+                chunked_validation = _validate_gemini_result(chunked_result, audio_duration)
+                if chunked_validation.passed:
+                    self.logger.info("Escalation: chunked mode passed validation")
+                    return chunked_result, chunked_validation, False
+                self.logger.warning(
+                    f"Escalation: chunked mode still failed "
+                    f"(coverage {chunked_validation.coverage_pct:.1f}%): "
+                    f"{'; '.join(chunked_validation.reasons)}"
+                )
+                if chunked_validation.coverage_pct > best_validation.coverage_pct:
+                    best_result, best_validation = chunked_result, chunked_validation
+            except Exception as e:
+                self.logger.warning(f"Escalation: chunked mode raised: {e}")
+        else:
+            self.logger.info(
+                f"Escalation: skipping chunked mode — {audio_duration:.0f}s "
+                f"is too short to meaningfully chunk"
+            )
+
+        self.logger.error(
+            f"Escalation exhausted — accepting best-available result as "
+            f"PARTIAL (coverage {best_validation.coverage_pct:.1f}%): "
+            f"{'; '.join(best_validation.reasons)}"
+        )
+        self._notify_telegram_partial(audio_file, best_validation)
+        return best_result, best_validation, True
+
+    def _notify_telegram_partial(self, audio_file: Path, validation) -> None:
+        """Alert that a meeting was captured but FAILED the completeness
+        gate after every escalation step — stored anyway (partial=true in
+        _meta) rather than lost, but needs human review. Best-effort.
+        """
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            self.logger.warning(
+                "telegram_notify.py not found in any known location; "
+                "skipping partial-transcript alert"
+            )
+            return
+        msg = (
+            f"⚠️ Meeting captured but INCOMPLETE (coverage "
+            f"{validation.coverage_pct:.1f}%)\n"
+            f"{audio_file.name}\n"
+            f"{'; '.join(validation.reasons)}\n"
+            f"Stored as partial — needs review/reprocessing."
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.logger.info(f"Telegram partial-transcript alert sent for {audio_file.name}")
+        except Exception as e:
+            self.logger.warning(f"Telegram partial-transcript alert failed: {e}")
 
     def _trigger_claude(self, transcript_path: Path, source_id: Optional[int] = None):
         """Fire-and-forget headless Claude session to process transcript.

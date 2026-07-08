@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 from datetime import datetime
 
+from transcript_validator import validate_transcript
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,6 +183,34 @@ def _build_attendees_prefix(known_attendees: Optional[list[dict]]) -> str:
     )
 
 
+def _build_continuity_prefix(previous_tail: Optional[str]) -> str:
+    """Render a "CONTINUATION FROM PREVIOUS CHUNK" block for drift-proof
+    chunking (see docs/RELIABILITY_PLAN_2026-07.md Phase 3).
+
+    `previous_tail` is the last ~15 transcript lines of the immediately
+    preceding chunk (chunk-local time, same speaker labels Gemini already
+    chose there). Anchoring every chunk after the first to those exact lines
+    keeps speaker labels consistent across the zero-overlap chunk boundary
+    instead of each chunk re-guessing independently. Returns "" for the
+    first chunk (no previous_tail) — prompt stays byte-identical to the
+    legacy no-continuity one.
+    """
+    if not previous_tail:
+        return ""
+    return (
+        "## CONTINUATION FROM PREVIOUS CHUNK\n\n"
+        "This audio is a continuation of the same meeting recording. The "
+        "final lines transcribed from the immediately preceding segment "
+        "were:\n\n"
+        f"{previous_tail}\n\n"
+        "Continue using the exact same speaker labels for the same voices — "
+        "do not rename or swap speakers across this boundary. If a new "
+        "voice appears that wasn't in the previous segment, identify it "
+        "from the KNOWN ATTENDEES list above if possible, otherwise use a "
+        "new generic label.\n\n"
+    )
+
+
 def _build_channel_map_prefix(channel_segments: Optional[list]) -> str:
     """Render an "AUDIO CHANNEL MAP" block to prepend to the audio prompt.
 
@@ -296,6 +326,17 @@ class GeminiResult:
     chunked: bool = False
     chunk_count: int = 1
     reduce_pass_used: bool = False
+    # Time ranges (meeting-global seconds) dropped by chunks that failed
+    # validation after all retries. Populated only by _process_chunked; the
+    # chunk's audio is not represented in `transcript` for these ranges (no
+    # "[CHUNK N FAILED]" marker is concatenated in — see its docstring).
+    missing_time_ranges: list[tuple[float, float]] = field(default_factory=list)
+
+    # Set by the watcher's _validate_and_escalate after the fact (mirrors
+    # speaker_verification_log below) so the completeness-gate outcome is
+    # visible in the on-disk JSON regardless of which attempt was accepted.
+    validation_report: Optional[dict] = None
+    partial: bool = False
 
     # Raw response for debugging
     raw_response: Optional[dict] = None
@@ -331,8 +372,12 @@ class GeminiResult:
                 "output_tokens": self.output_tokens,
                 "processing_time_seconds": self.processing_time_seconds,
                 "audio_duration_seconds": self.audio_duration_seconds,
+                "missing_time_ranges": [list(r) for r in self.missing_time_ranges],
+                "partial": self.partial,
             },
         }
+        if self.validation_report is not None:
+            out["_meta"]["validation"] = self.validation_report
         if self.speaker_verification_log is not None:
             out["speaker_verification"] = self.speaker_verification_log
         return out
@@ -387,19 +432,26 @@ class GeminiAudioProcessor:
 
     # Audio duration (seconds) above which chunked processing is used.
     # History: 15 min was the old sweet spot for gemini-2.5-flash, which
-    # hallucinated (repeat-loops) on long single-shot audio. The pipeline now
-    # runs gemini-3-flash-preview, which transcribes a full 60-min meeting in
-    # one call cleanly — no repeat-loop, and crucially NO cross-chunk speaker
-    # drift/swap (verified 2026-06-04 on a real 60-min Swiss-German 1:1; see
-    # docs/transcription-single-call-investigation.md). So the threshold is
-    # raised to 60 min: meetings up to an hour go single-call and skip the
-    # chunk-boundary speaker bugs entirely. Recordings beyond 60 min still
-    # chunk (output-token + request-reliability headroom), and process_audio
-    # falls back to chunked if a single-call attempt fails, so a long
-    # single-call disconnect never loses the whole meeting.
-    CHUNK_THRESHOLD_SEC = 60 * 60
+    # hallucinated (repeat-loops) on long single-shot audio. It was later
+    # raised to 60 min once gemini-3-flash-preview transcribed a full 60-min
+    # meeting in one call cleanly with no cross-chunk speaker drift (verified
+    # 2026-06-04; see docs/transcription-single-call-investigation.md).
+    #
+    # Lowered back to 35 min (docs/RELIABILITY_PLAN_2026-07.md, 2026-07-08):
+    # an empirical A/B test found gemini-2.5-pro silently TRUNCATES long
+    # single calls — a 50.5min call returned valid, error-free JSON that
+    # stopped at [08:17] (16% coverage). The 60-min single-call window traded
+    # drift for truncation/disconnect risk on 40-60 min calls. Chunking is
+    # now drift-proof (zero overlap + continuity context carried across
+    # chunks — see _process_chunked), so the reason to push single-call out
+    # to an hour is gone; the transcript_validator coverage gate catches any
+    # residual truncation on either path regardless. (Seams are NOT yet
+    # silence-aligned — that's a further Phase 3 refinement; a mid-word cut
+    # at a fixed 15-min boundary is an acceptable interim per the plan.)
+    CHUNK_THRESHOLD_SEC = 35 * 60
     CHUNK_DURATION_SEC = 15 * 60
-    CHUNK_OVERLAP_SEC = 30
+    CHUNK_OVERLAP_SEC = 0
+    CHUNK_RETRY_ATTEMPTS = 2
 
     def _get_duration(self, audio_path: Path) -> float:
         import subprocess
@@ -410,15 +462,27 @@ class GeminiAudioProcessor:
             capture_output=True, text=True)
         return float(r.stdout.strip() or 0)
 
-    def _chunk_audio(self, audio_path: Path) -> list:
-        """Split audio into overlapping chunks for reliable long-audio transcription.
+    def _chunk_audio(self, audio_path: Path, force_chunk: bool = False) -> list:
+        """Split audio into zero-overlap chunks for reliable long-audio transcription.
 
-        Returns list of (chunk_path, offset_seconds) tuples.
-        Single-element list if audio doesn't need chunking.
+        Returns list of (chunk_path, offset_seconds) tuples. Single-element
+        list (the whole file, unsplit) if audio doesn't need chunking and
+        `force_chunk` is False.
+
+        `force_chunk=True` bypasses the CHUNK_THRESHOLD_SEC gate and always
+        splits — used by the escalation ladder's "drift-proof chunked mode"
+        step (_validate_and_escalate). Without it, a sub-threshold recording
+        (the common case — most meetings are under 35min) would make that
+        escalation step a no-op disguise for a THIRD single-shot call on the
+        exact same audio, since _chunk_audio would just return the whole
+        file as one degenerate "chunk" — observed empirically on source 427
+        (2026-07-08), where a genuinely corrupt single-call output survived
+        two single-shot attempts and only real chunking gave the escalation
+        ladder distinct sub-problems to retry independently.
         """
         import subprocess, tempfile
         duration = self._get_duration(audio_path)
-        if duration <= self.CHUNK_THRESHOLD_SEC:
+        if duration <= self.CHUNK_THRESHOLD_SEC and not force_chunk:
             return [(audio_path, 0.0)]
 
         temp_dir = Path(tempfile.gettempdir()) / f"gemini_chunks_{audio_path.stem}"
@@ -535,8 +599,13 @@ class GeminiAudioProcessor:
         known_attendees: Optional[list[dict]] = None,
         channel_segments: Optional[list] = None,
         diarization_segments: Optional[list] = None,
+        continuity_context: Optional[str] = None,
     ) -> GeminiResult:
         """Transcribe an audio file in a single Gemini call (no chunking).
+
+        `continuity_context` is the previous chunk's tail (see
+        _build_continuity_prefix) — None for a non-chunked call or the first
+        chunk of a drift-proof chunked run.
 
         Raises on upload/generation failure; the caller decides whether to
         fall back to chunked processing.
@@ -545,6 +614,7 @@ class GeminiAudioProcessor:
         base_prompt = custom_prompt or AUDIO_ANALYSIS_PROMPT
         prompt = (
             _build_attendees_prefix(known_attendees)
+            + _build_continuity_prefix(continuity_context)
             + _build_diarization_map_prefix(diarization_segments)
             + _build_channel_map_prefix(channel_segments)
             + base_prompt
@@ -727,11 +797,63 @@ class GeminiAudioProcessor:
             if isinstance(data, dict) and 'arc' in data:
                 data['arc'] = self._shift_event_times(data['arc'], offset_sec)
 
+    @staticmethod
+    def _last_transcript_lines(transcript: str, n: int = 15) -> str:
+        """Last `n` non-empty lines of a chunk-local transcript, for the next
+        chunk's continuity context (see _build_continuity_prefix)."""
+        lines = [ln for ln in transcript.split("\n") if ln.strip()]
+        return "\n".join(lines[-n:])
+
+    def _process_chunk_with_retries(
+        self,
+        chunk_path: Path,
+        custom_prompt: Optional[str],
+        chunk_duration: float,
+        known_attendees: Optional[list[dict]] = None,
+        channel_segments: Optional[list] = None,
+        diarization_segments: Optional[list] = None,
+        continuity_context: Optional[str] = None,
+    ) -> Optional['GeminiResult']:
+        """Process one chunk, validating its own coverage before accepting it.
+
+        A chunk that never passes validation (within CHUNK_RETRY_ATTEMPTS
+        fresh attempts) returns None. The caller (_process_chunked) records
+        that as a missing time range instead of papering over it with a
+        "[CHUNK N FAILED]" marker concatenated into the transcript — a
+        chunk that fails must fail validation, not silently drop audio
+        while still reporting overall success (docs/RELIABILITY_PLAN_2026-07.md
+        Phase 3).
+        """
+        for attempt in range(1, self.CHUNK_RETRY_ATTEMPTS + 1):
+            try:
+                result = self._process_single_shot(
+                    chunk_path, custom_prompt, chunk_duration,
+                    known_attendees=known_attendees,
+                    channel_segments=channel_segments,
+                    diarization_segments=diarization_segments,
+                    continuity_context=continuity_context,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"    Chunk attempt {attempt}/{self.CHUNK_RETRY_ATTEMPTS} "
+                    f"raised: {e}"
+                )
+                continue
+            validation = validate_transcript(result.transcript, chunk_duration)
+            if validation.passed:
+                return result
+            logger.warning(
+                f"    Chunk attempt {attempt}/{self.CHUNK_RETRY_ATTEMPTS} "
+                f"failed per-chunk validation: {'; '.join(validation.reasons)}"
+            )
+        return None
+
     def _process_chunked(self, audio_path: Path, custom_prompt: Optional[str],
                           total_duration: float,
                           known_attendees: Optional[list[dict]] = None,
                           channel_segments: Optional[list] = None,
                           diarization_segments: Optional[list] = None,
+                          force_chunk: bool = False,
                           ) -> GeminiResult:
         """Chunk long audio, transcribe each chunk, merge with reduce-pass.
 
@@ -747,10 +869,23 @@ class GeminiAudioProcessor:
         for cross-chunk speaker-name drift. `channel_segments` and
         `diarization_segments` (meeting-global times) are sliced per chunk and
         re-based to chunk-relative time so their maps match each chunk's local
-        [MM:SS] timestamps.
+        [MM:SS] timestamps. Each chunk after the first also gets the previous
+        chunk's tail as continuity context (see _build_continuity_prefix),
+        and chunks are zero-overlap (CHUNK_OVERLAP_SEC=0) so there is no
+        duplicated text to dedup.
+
+        `force_chunk` bypasses CHUNK_THRESHOLD_SEC (see _chunk_audio) — set
+        by the escalation ladder so its chunked-mode step genuinely splits
+        sub-threshold audio instead of silently degenerating into a third
+        single-shot call on the same file.
+
+        A chunk that fails per-chunk validation after retries is recorded in
+        the result's `missing_time_ranges` and otherwise skipped — never
+        papered over with a "[CHUNK N FAILED]" marker (see
+        _process_chunk_with_retries).
         """
         start_time = time.time()
-        chunks = self._chunk_audio(audio_path)
+        chunks = self._chunk_audio(audio_path, force_chunk=force_chunk)
         logger.info(f"Processing {len(chunks)} chunks of {audio_path.name}")
 
         slice_fn = None
@@ -773,14 +908,17 @@ class GeminiAudioProcessor:
         chunk_offsets: list[float] = []
         chunk_language = "unknown"
         chunk_participants: list[dict] = []
+        missing_time_ranges: list[tuple[float, float]] = []
+        continuity_context: Optional[str] = None
 
         for i, (chunk_path, offset) in enumerate(chunks):
             logger.info(f"  Chunk {i+1}/{len(chunks)} at offset {offset/60:.1f}min")
+            chunk_duration = self._get_duration(chunk_path)
             chunk_segments = None
             chunk_diarization_segments = None
             if slice_fn is not None:
                 # Single-chunk case: the "chunk" IS the whole file (single-
-                # shot fallback for a 15-60 min recording) — slice to the
+                # shot fallback for a 15-35 min recording) — slice to the
                 # full duration, not CHUNK_DURATION_SEC, or the map would
                 # silently truncate at 15:00 while claiming ground truth.
                 chunk_end = (
@@ -806,23 +944,28 @@ class GeminiAudioProcessor:
                     logger.warning(
                         f"diarization prior slice failed ({e}); no prior"
                     )
-            try:
-                # Call the single-shot path directly (chunks are ≤15min;
-                # the degenerate single chunk is the original file). NOT
-                # process_audio: for the single-chunk fallback that would
-                # recurse single-shot→chunked→single-shot indefinitely on
-                # a deterministic failure. Forward known_attendees so every
-                # chunk sees the same list.
-                chunk_result = self._process_single_shot(
-                    chunk_path, custom_prompt,
-                    self._get_duration(chunk_path),
-                    known_attendees=known_attendees,
-                    channel_segments=chunk_segments,
-                    diarization_segments=chunk_diarization_segments,
+
+            # Call the single-shot path directly (chunks are ≤15min; the
+            # degenerate single chunk is the original file). NOT
+            # process_audio: for the single-chunk fallback that would
+            # recurse single-shot→chunked→single-shot indefinitely on a
+            # deterministic failure. Forward known_attendees so every chunk
+            # sees the same list, and continuity_context so speaker labels
+            # stay consistent across the zero-overlap boundary.
+            chunk_result = self._process_chunk_with_retries(
+                chunk_path, custom_prompt, chunk_duration,
+                known_attendees=known_attendees,
+                channel_segments=chunk_segments,
+                diarization_segments=chunk_diarization_segments,
+                continuity_context=continuity_context,
+            )
+            if chunk_result is None:
+                logger.error(
+                    f"  Chunk {i+1} failed validation after "
+                    f"{self.CHUNK_RETRY_ATTEMPTS} attempts — recording gap "
+                    f"{offset:.0f}-{offset + chunk_duration:.0f}s"
                 )
-            except Exception as e:
-                logger.error(f"  Chunk {i+1} failed: {e}, continuing with others")
-                merged_transcript_parts.append(f"\n\n[CHUNK {i+1} FAILED: {e}]\n\n")
+                missing_time_ranges.append((offset, offset + chunk_duration))
                 continue
 
             input_tokens_total += chunk_result.input_tokens
@@ -834,6 +977,10 @@ class GeminiAudioProcessor:
                 chunk_language = chunk_result.language
             if not chunk_participants and chunk_result.participants:
                 chunk_participants = chunk_result.participants
+
+            # Next chunk's continuity anchor, before timestamps get shifted
+            # to global time (Gemini sees chunk-local time on both sides).
+            continuity_context = self._last_transcript_lines(chunk_result.transcript)
 
             # Shift all timestamps to global time
             chunk_result.transcript = self._shift_timestamps(chunk_result.transcript, offset)
@@ -865,6 +1012,7 @@ class GeminiAudioProcessor:
                 chunk_count=len(chunks),
                 reduce_pass_used=False,
                 error="All chunks failed",
+                missing_time_ranges=missing_time_ranges,
             )
 
         # Reduce-pass: text-only call to merge per-chunk analyses
@@ -914,6 +1062,7 @@ class GeminiAudioProcessor:
             chunk_count=len(chunks),
             reduce_pass_used=reduce_pass_ok,
             raw_response={"chunks": [c.parsed_response for c in chunk_results], "reduce": reduce_data},
+            missing_time_ranges=missing_time_ranges,
         )
 
     @staticmethod
