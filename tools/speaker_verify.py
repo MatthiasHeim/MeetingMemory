@@ -15,11 +15,19 @@ where physics and label confidently disagree:
     → relabel to the meeting's dominant remote speaker.
   - Turn ≥ 8 s labeled non-host with host-share > 85 %
     → relabel to Matthias.
+  - Turn ≥ 2.5 s (down from 8 s) is also eligible when the channel evidence
+    is nearly unanimous (host-share < 5 % or > 95 %) — a near-100% mic
+    signal isn't plausibly explained away by ±few-second timestamp noise.
+    Fixes the short-question misattribution class (docs/RELIABILITY_PLAN_
+    2026-07.md Phase 2, source 429 [01:06]).
 
 Conservatism, because Gemini timestamps are only ±few-seconds accurate and
 ~40-50 % of windows carry overlapped ('both') speech:
 
-  - Turns shorter than MIN_TURN_SEC are never touched.
+  - Turns shorter than MIN_TURN_SEC_HIGH_CONFIDENCE (2.5 s) are never
+    touched, regardless of channel evidence. Turns between that floor and
+    MIN_TURN_SEC (8 s) are only touched when host-share is extreme; the
+    ambiguous middle ground is still off-limits below 8 s.
   - Turns whose VAD interval holds < MIN_SPEECH_SEC of detected speech are
     skipped (no evidence).
   - Turns where 'both' overlap dominates (> MAX_BOTH_SHARE of speech time)
@@ -46,6 +54,9 @@ SELF_FIRST = "Matthias"
 
 MIN_TURN_SEC = 8.0          # Gemini timestamps are ±few-seconds; short turns
                             # can't be judged against them
+MIN_TURN_SEC_HIGH_CONFIDENCE = 2.5  # floor when host-share is extreme
+HIGH_CONFIDENCE_HOST_SHARE_LOW = 0.05
+HIGH_CONFIDENCE_HOST_SHARE_HIGH = 0.95
 MIN_SPEECH_SEC = 4.0        # need this much VAD-detected speech in the turn
 FLIP_TO_REMOTE_MAX_HOST_SHARE = 0.15
 FLIP_TO_HOST_MIN_HOST_SHARE = 0.85
@@ -274,7 +285,9 @@ def verify(gemini_dict: dict, vad) -> dict:
             log["skipped"]["untimed"] += 1
             continue
         dur = t1 - t0
-        if dur < MIN_TURN_SEC:
+        # Below the absolute floor, no amount of channel confidence can
+        # rescue the turn — decide that WITHOUT computing shares.
+        if dur < MIN_TURN_SEC_HIGH_CONFIDENCE:
             log["skipped"]["short"] += 1
             continue
         shares = vad.shares(t0, t1)
@@ -286,10 +299,17 @@ def verify(gemini_dict: dict, vad) -> dict:
         if both_share > MAX_BOTH_SHARE:
             log["skipped"]["overlap_dominated"] += 1
             continue
-        log["turns_checked"] += 1
         # 'both' counts toward the host: his mic carried speech. This biases
         # against flipping in BOTH directions (see module docstring).
         host_share = (shares["host_only"] + shares["both"]) / speech
+        high_confidence = (
+            host_share < HIGH_CONFIDENCE_HOST_SHARE_LOW
+            or host_share > HIGH_CONFIDENCE_HOST_SHARE_HIGH
+        )
+        if dur < MIN_TURN_SEC and not high_confidence:
+            log["skipped"]["short"] += 1
+            continue
+        log["turns_checked"] += 1
 
         is_self = _is_self_label(turn["speaker"])
         new_speaker = None

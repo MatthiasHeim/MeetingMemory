@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""transcript_validator — completeness/coverage gate for Gemini transcripts.
+
+Sits between the Gemini result and the JSON write in
+transcribe_watcher._process_with_gemini (see docs/RELIABILITY_PLAN_2026-07.md
+Phase 1). A transcript must pass every check here before it is stored as a
+clean success — the two failure modes it exists to catch both look like
+valid, error-free output otherwise:
+
+  - Silent truncation: pro can return well-formed JSON that stops far short
+    of the audio's actual length (a 50.5min call once ended at [08:17], 16%
+    coverage, no error, no disconnect).
+  - Undeduped chunk overlap: the old chunked fallback concatenated a 30s
+    overlap with no dedup and diarized each chunk independently, producing
+    duplicated text with inverted speaker labels.
+
+`validate_transcript` never raises on malformed input — a transcript that
+fails to parse is itself a validation failure, not an exception.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+# Coverage: max transcript timestamp must reach this fraction of the audio's
+# actual duration. Below this, the transcript is treated as truncated.
+COVERAGE_MIN_PCT = 90.0
+
+# A phrase of 1-4 words repeating more than this many times *consecutively*
+# is a runaway-generation loop (observed: "s'heisst" x~400 in source 429).
+REPETITION_MAX_CONSECUTIVE = 15
+REPETITION_MAX_PHRASE_WORDS = 4
+
+# An 8-word shingle appearing twice more than this many words apart indicates
+# duplicated text from an undeduped chunk overlap, not natural repetition.
+SHINGLE_SIZE = 8
+SHINGLE_MIN_DISTANCE_WORDS = 30
+
+_TIMESTAMP_RE = re.compile(r"\[(\d{1,2}(?::\d{2}){1,2})\]")
+_CHUNK_FAILED_RE = re.compile(r"\[CHUNK\s+\d+\s+FAILED\b", re.IGNORECASE)
+
+
+@dataclass
+class ValidationResult:
+    """Outcome of validating one transcript against its audio duration."""
+
+    passed: bool
+    coverage_pct: float
+    last_timestamp_sec: float
+    reasons: list[str] = field(default_factory=list)
+    has_chunk_failure_marker: bool = False
+    has_repetition_loop: bool = False
+    has_duplicate_span: bool = False
+
+    def to_dict(self) -> dict:
+        """JSON-serializable form for persistence into result `_meta`."""
+        return {
+            "passed": self.passed,
+            "coverage_pct": self.coverage_pct,
+            "last_timestamp_sec": self.last_timestamp_sec,
+            "reasons": list(self.reasons),
+            "has_chunk_failure_marker": self.has_chunk_failure_marker,
+            "has_repetition_loop": self.has_repetition_loop,
+            "has_duplicate_span": self.has_duplicate_span,
+        }
+
+
+def _ts_to_sec(ts: str) -> float:
+    parts = [int(x) for x in ts.split(":")]
+    return float(sum(p * 60 ** (len(parts) - 1 - i) for i, p in enumerate(parts)))
+
+
+def _max_timestamp_sec(transcript: str) -> float:
+    matches = _TIMESTAMP_RE.findall(transcript)
+    if not matches:
+        return -1.0
+    return max(_ts_to_sec(m) for m in matches)
+
+
+def _has_chunk_failure_marker(transcript: str) -> bool:
+    return bool(_CHUNK_FAILED_RE.search(transcript))
+
+
+def _consecutive_line_repetition(transcript: str) -> bool:
+    """True if any non-empty line repeats >REPETITION_MAX_CONSECUTIVE times
+    in a row (verbatim, after stripping surrounding whitespace)."""
+    lines = [ln.strip() for ln in transcript.split("\n") if ln.strip()]
+    run_line = None
+    run_len = 0
+    for ln in lines:
+        if ln == run_line:
+            run_len += 1
+        else:
+            run_line = ln
+            run_len = 1
+        if run_len > REPETITION_MAX_CONSECUTIVE:
+            return True
+    return False
+
+
+def _consecutive_phrase_repetition(transcript: str) -> bool:
+    """True if any 1-4 word phrase repeats >REPETITION_MAX_CONSECUTIVE times
+    back-to-back anywhere in the token stream (catches loops inside a single
+    turn's text, not just whole-line repeats)."""
+    words = transcript.split()
+    n_words = len(words)
+    for n in range(1, REPETITION_MAX_PHRASE_WORDS + 1):
+        i = 0
+        while i + n <= n_words:
+            j = i + n
+            count = 1
+            while j + n <= n_words and words[j:j + n] == words[i:i + n]:
+                count += 1
+                j += n
+            if count > REPETITION_MAX_CONSECUTIVE:
+                return True
+            i = j if count > 1 else i + 1
+    return False
+
+
+def _duplicate_span(transcript: str) -> bool:
+    """True if an 8-gram shingle recurs more than SHINGLE_MIN_DISTANCE_WORDS
+    words apart — the signature of an undeduped chunk-overlap duplicate."""
+    words = transcript.split()
+    if len(words) < SHINGLE_SIZE + 1:
+        return False
+    first_seen: dict[tuple, int] = {}
+    for i in range(len(words) - SHINGLE_SIZE + 1):
+        shingle = tuple(words[i:i + SHINGLE_SIZE])
+        prev = first_seen.get(shingle)
+        if prev is not None and (i - prev) > SHINGLE_MIN_DISTANCE_WORDS:
+            return True
+        if prev is None:
+            first_seen[shingle] = i
+    return False
+
+
+def validate_transcript(transcript: str, audio_duration_seconds: float) -> ValidationResult:
+    """Validate a Gemini transcript against the recording's actual duration.
+
+    Returns a ValidationResult; `passed` is False if any check fails. Never
+    raises — malformed/empty input is itself represented as a failure.
+    """
+    reasons: list[str] = []
+
+    last_ts = _max_timestamp_sec(transcript)
+    if last_ts < 0:
+        coverage_pct = 0.0
+        reasons.append("No timestamps found in transcript — cannot verify coverage")
+        last_timestamp_sec = 0.0
+    else:
+        last_timestamp_sec = last_ts
+        if audio_duration_seconds and audio_duration_seconds > 0:
+            coverage_pct = round(100.0 * last_ts / audio_duration_seconds, 4)
+        else:
+            coverage_pct = 0.0
+            reasons.append("Invalid audio_duration_seconds — cannot compute coverage")
+        if coverage_pct < COVERAGE_MIN_PCT:
+            reasons.append(
+                f"Coverage {coverage_pct:.1f}% is below the "
+                f"{COVERAGE_MIN_PCT:.0f}% minimum (last timestamp "
+                f"{last_timestamp_sec:.0f}s of {audio_duration_seconds:.0f}s)"
+            )
+
+    has_chunk_failure_marker = _has_chunk_failure_marker(transcript)
+    if has_chunk_failure_marker:
+        reasons.append("Transcript contains a [CHUNK N FAILED] marker — a chunk was silently dropped")
+
+    has_repetition_loop = (
+        _consecutive_line_repetition(transcript)
+        or _consecutive_phrase_repetition(transcript)
+    )
+    if has_repetition_loop:
+        reasons.append(
+            f"Repetition loop detected — a line or short phrase repeats more "
+            f"than {REPETITION_MAX_CONSECUTIVE}x consecutively"
+        )
+
+    has_duplicate_span = _duplicate_span(transcript)
+    if has_duplicate_span:
+        reasons.append(
+            f"Duplicate span detected — an {SHINGLE_SIZE}-word sequence "
+            f"recurs more than {SHINGLE_MIN_DISTANCE_WORDS} words apart "
+            f"(likely an undeduped chunk overlap)"
+        )
+
+    passed = (
+        coverage_pct >= COVERAGE_MIN_PCT
+        and not has_chunk_failure_marker
+        and not has_repetition_loop
+        and not has_duplicate_span
+    )
+
+    return ValidationResult(
+        passed=passed,
+        coverage_pct=coverage_pct,
+        last_timestamp_sec=last_timestamp_sec,
+        reasons=reasons,
+        has_chunk_failure_marker=has_chunk_failure_marker,
+        has_repetition_loop=has_repetition_loop,
+        has_duplicate_span=has_duplicate_span,
+    )

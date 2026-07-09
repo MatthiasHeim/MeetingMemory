@@ -218,16 +218,19 @@ def _bare_processor() -> GeminiAudioProcessor:
     return GeminiAudioProcessor.__new__(GeminiAudioProcessor)
 
 
-def test_threshold_is_one_hour():
-    """Regression: the single-call window is 60 min (raised from 15)."""
-    assert GeminiAudioProcessor.CHUNK_THRESHOLD_SEC == 60 * 60
+def test_threshold_is_35_minutes():
+    """Lowered from 60 min (docs/RELIABILITY_PLAN_2026-07.md Phase 0/3): pro
+    silently truncates long single calls without erroring, and drift-proof
+    chunking (zero overlap + continuity context) removes the reason to push
+    single-call out to an hour."""
+    assert GeminiAudioProcessor.CHUNK_THRESHOLD_SEC == 35 * 60
 
 
 def test_audio_over_threshold_goes_straight_to_chunked(monkeypatch, tmp_path):
     p = _bare_processor()
     f = tmp_path / "long.mp3"
     f.write_bytes(b"x")
-    monkeypatch.setattr(p, "_get_duration", lambda path: 90 * 60)  # 90 min
+    monkeypatch.setattr(p, "_get_duration", lambda path: 45 * 60)  # 45 min
     seen: list[str] = []
     monkeypatch.setattr(p, "_process_chunked", lambda *a, **k: seen.append("chunked") or "R")
     monkeypatch.setattr(p, "_process_single_shot", lambda *a, **k: seen.append("single") or "R")
@@ -239,7 +242,7 @@ def test_audio_under_threshold_uses_single_shot(monkeypatch, tmp_path):
     p = _bare_processor()
     f = tmp_path / "mid.mp3"
     f.write_bytes(b"x")
-    monkeypatch.setattr(p, "_get_duration", lambda path: 45 * 60)  # 45 min
+    monkeypatch.setattr(p, "_get_duration", lambda path: 20 * 60)  # 20 min
     seen: list[str] = []
     monkeypatch.setattr(p, "_process_chunked", lambda *a, **k: seen.append("chunked") or "R")
     monkeypatch.setattr(p, "_process_single_shot", lambda *a, **k: seen.append("single") or "R")
@@ -248,12 +251,13 @@ def test_audio_under_threshold_uses_single_shot(monkeypatch, tmp_path):
 
 
 def test_single_shot_failure_falls_back_to_chunked(monkeypatch, tmp_path):
-    """A 45-min recording (> CHUNK_DURATION_SEC) whose single call fails must
-    fall back to chunked rather than lose the whole meeting."""
+    """A 30-min recording (> CHUNK_DURATION_SEC, <= CHUNK_THRESHOLD_SEC)
+    whose single call fails must fall back to chunked rather than lose the
+    whole meeting."""
     p = _bare_processor()
     f = tmp_path / "mid.mp3"
     f.write_bytes(b"x")
-    monkeypatch.setattr(p, "_get_duration", lambda path: 45 * 60)
+    monkeypatch.setattr(p, "_get_duration", lambda path: 30 * 60)
     seen: list[str] = []
 
     def boom(*a, **k):
@@ -280,7 +284,7 @@ def test_single_chunk_fallback_gets_full_channel_map(monkeypatch, tmp_path):
     f.write_bytes(b"x")
     duration = 50 * 60  # 50 min: single chunk in _process_chunked
     monkeypatch.setattr(p, "_get_duration", lambda path: duration)
-    monkeypatch.setattr(p, "_chunk_audio", lambda path: [(path, 0.0)])
+    monkeypatch.setattr(p, "_chunk_audio", lambda path, force_chunk=False: [(path, 0.0)])
     # Reduce-pass must not hit the API.
     monkeypatch.setattr(p, "_generate_with_retry",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no api")))
@@ -289,9 +293,11 @@ def test_single_chunk_fallback_gets_full_channel_map(monkeypatch, tmp_path):
 
     def fake_single_shot(audio_path, custom_prompt, total_duration,
                          known_attendees=None, channel_segments=None,
-                         diarization_segments=None):
+                         diarization_segments=None, continuity_context=None):
         captured.append(channel_segments)
-        return GeminiResult(transcript="[00:00] Matthias: hi", language="en")
+        # Full coverage (49:00 of 50:00 = 98%) so per-chunk validation passes
+        # on the first attempt -- this test is about map slicing, not retry.
+        return GeminiResult(transcript="[49:00] Matthias: hi", language="en")
 
     monkeypatch.setattr(p, "_process_single_shot", fake_single_shot)
 
@@ -318,7 +324,7 @@ def test_chunk_loop_does_not_recurse_into_process_audio(monkeypatch, tmp_path):
     f.write_bytes(b"x")
     duration = 50 * 60
     monkeypatch.setattr(p, "_get_duration", lambda path: duration)
-    monkeypatch.setattr(p, "_chunk_audio", lambda path: [(path, 0.0)])
+    monkeypatch.setattr(p, "_chunk_audio", lambda path, force_chunk=False: [(path, 0.0)])
     monkeypatch.setattr(p, "_generate_with_retry",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no api")))
 
@@ -339,9 +345,10 @@ def test_chunk_loop_does_not_recurse_into_process_audio(monkeypatch, tmp_path):
     monkeypatch.setattr(p, "process_audio", counting_process_audio)
 
     result = p._process_chunked(f, None, duration)
-    # Chunk failed exactly once; no re-entry into process_audio; the
-    # all-chunks-failed error result comes back instead of a RecursionError.
-    assert calls["single_shot"] == 1
+    # Chunk failed on every retry attempt (CHUNK_RETRY_ATTEMPTS=2); no
+    # re-entry into process_audio; the all-chunks-failed error result comes
+    # back instead of a RecursionError.
+    assert calls["single_shot"] == GeminiAudioProcessor.CHUNK_RETRY_ATTEMPTS
     assert calls["process_audio"] == 0
     assert result.error == "All chunks failed"
 
