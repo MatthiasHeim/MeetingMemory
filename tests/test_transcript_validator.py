@@ -13,7 +13,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
-from transcript_validator import validate_transcript  # noqa: E402
+from transcript_validator import (  # noqa: E402
+    sanitize_repetition_loops,
+    validate_transcript,
+)
 
 
 def _turns(specs: list[tuple[str, str]]) -> str:
@@ -39,6 +42,34 @@ def test_coverage_fails_below_90_percent():
     assert result.passed is False
     assert round(result.coverage_pct, 1) == 16.4
     assert any("coverage" in r.lower() for r in result.reasons)
+
+
+def test_coverage_fails_above_110_percent_timestamp_drift():
+    """F4 (RC4, docs/SPEC-error-path-escalation-2026-07-10.md): the
+    drift-proof chunking continuity prefix can make Gemini continue the
+    previous chunk's timestamp sequence instead of restarting at [00:00];
+    _shift_timestamps then double-counts the offset. Observed: 143.2%."""
+    transcript = _turns([("00:00", "hello"), ("14:19", "way past the end")])
+    result = validate_transcript(transcript, audio_duration_seconds=600)  # 10min audio, 14:19 last ts
+    assert round(result.coverage_pct, 1) == 143.2
+    assert result.passed is False
+    assert any("drift" in r.lower() for r in result.reasons)
+
+
+def test_coverage_passes_at_105_percent():
+    """Normal rounding/dictation slop at the very end must not trip drift."""
+    transcript = _turns([("00:00", "hello"), ("10:30", "closing")])
+    result = validate_transcript(transcript, audio_duration_seconds=600)  # 105%
+    assert result.coverage_pct == 105.0
+    assert result.passed is True
+    assert result.reasons == []
+
+
+def test_coverage_passes_at_exactly_110_percent_boundary():
+    transcript = _turns([("00:00", "hello"), ("11:00", "closing")])
+    result = validate_transcript(transcript, audio_duration_seconds=600)  # exactly 110%
+    assert result.coverage_pct == 110.0
+    assert result.passed is True
 
 
 def test_coverage_handles_hh_mm_ss_timestamps():
@@ -200,3 +231,107 @@ def test_to_dict_serializes_for_meta_persistence():
     assert d["passed"] is True
     assert d["coverage_pct"] == 90.0
     assert d["reasons"] == []
+    assert d["sanitized"] is False
+    assert d["sanitized_locations"] == []
+
+
+# ── F6: sanitize-and-revalidate ───────────────────────────────────────────
+# docs/SPEC-error-path-escalation-2026-07-10.md — real incident: source 463,
+# 2026-07-10, "de," x595 replacing ~5s of audio between [19:28] and [19:33],
+# with the other 23.9 minutes transcribed correctly. Three independent
+# single-shot generations reproduced the same loop, so retrying doesn't
+# help; rejecting the whole transcript over a 5-second glitch is too blunt.
+
+
+def test_sanitize_collapses_inline_phrase_loop_matching_source_463():
+    """Mirrors the real fixture's exact shape: a short phrase repeated
+    hundreds of times mid-turn, sandwiched between clean content."""
+    loop = " ".join(["de,"] * 595)
+    transcript = (
+        "[00:00] Matthias: hallo zusammen, los gehts heute\n"
+        "[19:25] Philipp Baltensperger: Ich gseh im Moment nöd.\n"
+        f"[19:28] Philipp Baltensperger: Aber drum würd ich jetzt mal, {loop} "
+        "de-Stufe, dass mir mit de ablenkt.\n"
+        "[19:33] Matthias: Okay, ja. Okay.\n"
+        "[23:54] Matthias: Perfekt, dann sehen wir uns naechste Woche. Tschuess."
+    )
+    audio_duration = 24 * 60  # 24.0min recording (matches the incident)
+
+    before = validate_transcript(transcript, audio_duration)
+    assert before.passed is False
+    assert before.has_repetition_loop is True
+    assert before.has_duplicate_span is True  # cascade from the loop's own shingles
+
+    sanitized, locations = sanitize_repetition_loops(transcript)
+    assert sanitized != transcript
+    assert "[transcription glitch]" in sanitized
+    assert sanitized.count("de,") == 1  # collapsed from 595 to 1
+    assert len(locations) == 1
+    assert locations[0]["count"] == 595
+    assert locations[0]["timestamp"] == "[19:28]"
+
+    after = validate_transcript(sanitized, audio_duration)
+    assert after.passed is True
+    assert after.has_repetition_loop is False
+    assert after.has_duplicate_span is False
+    # Surrounding clean content must survive untouched.
+    assert "Philipp Baltensperger: Ich gseh im Moment nöd." in sanitized
+    assert "[23:54] Matthias: Perfekt" in sanitized
+
+
+def test_sanitize_collapses_repeated_whole_line():
+    lines = ["[10:00] Matthias: s'heisst."] * 20
+    transcript = "\n".join(lines) + "\n[10:05] Matthias: closing remarks here today."
+    sanitized, locations = sanitize_repetition_loops(transcript)
+    assert sanitized.count("[transcription glitch]") == 1
+    assert sanitized.count("s'heisst.") == 1
+    assert locations[0]["count"] == 20
+    assert locations[0]["kind"] == "line"
+
+
+def test_sanitize_does_not_touch_genuine_duplicate_span_without_loop():
+    """Sanitizer must not mask a real undeduped chunk-overlap duplicate --
+    it only collapses runaway consecutive repeats, and a duplicate span 30+
+    words apart is not a consecutive repeat."""
+    shared = "wir sollten definitiv auf die neue Plattform wechseln naechstes Jahr"
+    filler = " ".join(f"wort{i}" for i in range(60))
+    transcript = (
+        f"[06:49] Matthias: {shared}\n"
+        f"[07:30] Matthias: {filler}\n"
+        f"[08:51] Matthias: {shared}\n"
+        "[54:00] Matthias: closing"
+    )
+    before = validate_transcript(transcript, audio_duration_seconds=3600)
+    assert before.has_repetition_loop is False
+    assert before.has_duplicate_span is True
+
+    sanitized, locations = sanitize_repetition_loops(transcript)
+    assert sanitized == transcript
+    assert locations == []
+
+    after = validate_transcript(sanitized, audio_duration_seconds=3600)
+    assert after.passed is False
+    assert after.has_duplicate_span is True
+
+
+def test_sanitize_leaves_natural_repetition_below_threshold_untouched():
+    transcript = (
+        "[00:00] Matthias: ja, ja, ja, ja, ja, genau das stimmt\n"
+        "[54:00] Matthias: closing remarks"
+    )
+    before = validate_transcript(transcript, audio_duration_seconds=60 * 60)
+    assert before.has_repetition_loop is False
+
+    sanitized, locations = sanitize_repetition_loops(transcript)
+    assert sanitized == transcript
+    assert locations == []
+
+
+def test_sanitize_repetition_exactly_at_boundary_untouched():
+    """Exactly REPETITION_MAX_CONSECUTIVE (15) repeats is not a loop -- the
+    sanitizer must not touch it (mirrors validate_transcript's own boundary)."""
+    loop = ("echo " * 15).strip()
+    transcript = f"[00:00] Matthias: {loop}\n[54:00] Matthias: closing"
+    sanitized, locations = sanitize_repetition_loops(transcript)
+    assert sanitized == transcript
+    assert locations == []

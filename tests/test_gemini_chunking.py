@@ -109,6 +109,17 @@ def test_continuity_prefix_renders_instruction_and_lines():
     assert "same speaker labels" in prefix.lower()
 
 
+def test_continuity_prefix_instructs_timestamp_restart():
+    """F4 (RC4, docs/SPEC-error-path-escalation-2026-07-10.md): without an
+    explicit instruction, Gemini sometimes continues the previous chunk's
+    timestamp sequence instead of restarting at [00:00] for the new chunk's
+    audio -- _shift_timestamps then double-counts the chunk offset on top
+    (observed: 143.2% coverage, 2026-07-09)."""
+    prefix = _build_continuity_prefix("[14:30] Matthias: line three")
+    assert "[00:00]" in prefix
+    assert "restart" in prefix.lower()
+
+
 def test_process_single_shot_includes_continuity_context_in_prompt(monkeypatch, tmp_path):
     """The continuity block must actually reach the assembled prompt, not
     just exist as an unused helper function."""
@@ -423,3 +434,77 @@ def test_all_chunks_failing_still_returns_all_chunks_failed_error(monkeypatch, t
     result = p._process_chunked(f, None, chunk_duration)
     assert result.error == "All chunks failed"
     assert result.missing_time_ranges == [(0.0, 900.0)]
+
+
+# ── F2: process_audio's single-shot->chunked fallback must force real chunking ──
+
+
+def test_process_audio_single_shot_exception_forces_real_chunking(monkeypatch, tmp_path):
+    """RC2 regression (source 463, 2026-07-10, docs/SPEC-error-path-escalation
+    -2026-07-10.md): process_audio's exception handler used to call
+    _process_chunked WITHOUT force_chunk=True. For a 24-min recording (under
+    CHUNK_THRESHOLD_SEC=35min), that made _chunk_audio return the whole file
+    as one degenerate "chunk" -- the "fallback" was just replaying the
+    identical failing single-shot request. force_chunk=True must make it
+    genuinely split into >= 2 real chunks."""
+    p = _bare_processor()
+    p.model = "test-model"
+    f = tmp_path / "rec.mp3"
+    f.write_bytes(b"x")
+    total_duration = 24 * 60  # under 35min threshold, over the 15min chunk size
+
+    # The top-level call's own duration probe (process_audio, _chunk_audio)
+    # sees the real 24min; each split chunk reports the real per-chunk
+    # duration so its own transcript's timestamp clears the 90% coverage bar.
+    monkeypatch.setattr(
+        p, "_get_duration",
+        lambda path: total_duration if path == f else p.CHUNK_DURATION_SEC,
+    )
+    monkeypatch.setattr(
+        p, "_generate_with_retry",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no api")),
+    )
+
+    class _FakeCompleted:
+        returncode = 0
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeCompleted())
+
+    def flaky_single_shot(audio_path, custom_prompt, total_dur, known_attendees=None,
+                           channel_segments=None, diarization_segments=None,
+                           continuity_context=None):
+        if audio_path == f:
+            # The whole-file single-shot call always fails -- simulates the
+            # disconnect storm that killed source 463.
+            raise RuntimeError("Server disconnected without sending a response.")
+        # Real per-chunk sub-files (force_chunk=True) succeed -- timestamp
+        # matches the CHUNK_DURATION_SEC duration reported above so per-chunk
+        # validation's coverage check passes.
+        return GeminiResult(transcript="[15:00] Matthias: chunk content here", language="de")
+
+    monkeypatch.setattr(p, "_process_single_shot", flaky_single_shot)
+
+    result = p.process_audio(f)
+
+    assert result.error is None
+    assert result.chunked is True
+    assert result.chunk_count >= 2
+
+
+def test_process_audio_single_shot_exception_short_audio_still_raises(monkeypatch, tmp_path):
+    """Regression: audio too short to meaningfully chunk (<= CHUNK_DURATION_SEC)
+    must still just re-raise, unchanged by the F2 fix."""
+    p = _bare_processor()
+    p.model = "test-model"
+    f = tmp_path / "rec.mp3"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(p, "_get_duration", lambda path: 5 * 60)  # 5min, under CHUNK_DURATION_SEC
+
+    def always_raise(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(p, "_process_single_shot", always_raise)
+
+    with pytest.raises(RuntimeError):
+        p.process_audio(f)
