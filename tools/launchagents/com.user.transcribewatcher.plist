@@ -50,10 +50,21 @@
          work fine from a daemon; only launchd's std-io redirect needed moving
          out of ~/Documents (see StandardOutPath above). -->
 
+    <!-- Quota isolation (2026-07-10 incident): the fire-and-forget headless
+         `claude -p /meeting-actions` sessions this watcher spawns get their OWN
+         Claude quota pool via CLAUDE_CONFIG_DIR, so automation stops competing
+         with interactive usage for one shared pool (which is what starved every
+         session into a "session limit" death, silently dropping all downstream
+         actions). Quota is keyed by CLAUDE_CONFIG_DIR. The watcher forwards this
+         to the child session (see transcribe_watcher._trigger_claude).
+         ONE-TIME: `CLAUDE_CONFIG_DIR=/Users/Matthias/.claude-automation claude`
+         then run /login there. See tools/CLAUDE_QUOTA_ISOLATION.md. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin</string>
+        <key>CLAUDE_CONFIG_DIR</key>
+        <string>/Users/Matthias/.claude-automation</string>
     </dict>
 
     <!-- Minimum seconds between (re)launches. Was 10s, which let a fast-failing
