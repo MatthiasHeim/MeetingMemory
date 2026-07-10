@@ -82,13 +82,31 @@ This turns "meeting lost during a Gemini outage" into "meeting delayed until the
 2. **Validator**: add an upper coverage bound — `coverage_pct > 110%` fails validation with reason "last timestamp exceeds audio duration — timestamp drift". (110% allows normal rounding/dictation slop; genuine drift lands at ~130–200%.)
 3. **Per-chunk validation** already runs against `chunk_duration`, so the upper bound also catches the drift at the chunk level, where a retry with the corrected prompt can fix it cheaply.
 
+### F6: Sanitize-and-revalidate before rejecting (quick win — do this first)
+
+Evidence from the 14:45 retry (see §6): the "repetition loop" was `"de,"` × 595 — a runaway generation covering **~5 seconds of audio** (`[19:28]` → `[19:33]`); the remaining 23.9 minutes were transcribed correctly. Three independent single-shot generations all reproduced a loop on the same audio spot, so retrying does not help — but rejecting the whole transcript over a 5-second glitch is far too blunt.
+
+Add a sanitization step in the validation gate:
+
+1. When (and only when) the repetition-loop check fires, collapse any run of a 1–4-word phrase (or repeated line) exceeding `REPETITION_MAX_CONSECUTIVE` down to one instance plus a `[transcription glitch]` marker.
+2. Re-validate the sanitized transcript. If it now passes, accept it as **clean** (record `sanitized: true` and the collapsed span's location in `_meta.validation`) — do not enter the escalation ladder at all.
+3. Run the duplicate-span check **after** sanitization: the loop's own shingles trivially recur ≥ 30 words apart, so on 2026-07-10 the duplicate-span flag was a cascade of the same loop, not independent evidence of chunk-overlap duplication.
+
+This converts the entire class "tiny audio glitch → whole transcript rejected → hours of expensive pro retries → partial/lost meeting" into a first-pass clean success. It would have saved every failed Gemini call made on 2026-07-10.
+
 ### F5 (open decision — NOT in scope until decided): last-resort model fallback
 
 When pro fails every ladder step, a final attempt on `gemini-2.5-flash` (fully validation-gated) would trade the "never Flash" quality rule against total loss of the meeting. Since F1+F3 already convert most total losses into delayed successes, recommendation is to **defer F5** and revisit only if post-fix telemetry still shows terminal failures.
 
 ## 4. Test plan
 
-Unit tests (follow the existing `tests/test_watcher_validation_escalation.py` pattern, mocked Gemini):
+F6 tests (add first):
+
+1. Transcript with `"de,"` × 595 mid-sentence (real fixture: `2026-07-10_13-59-12.json`) → sanitizer collapses it, re-validation passes, `_meta.validation.sanitized == true`, no escalation calls made.
+2. Transcript with a genuine undeduped chunk-overlap duplicate but no runaway loop → duplicate-span still fails after sanitization (sanitizer must not mask real overlap bugs).
+3. Natural repetition below threshold ("ja, ja, ja" × 5) → untouched, passes.
+
+Ladder / rescan / drift tests (follow the existing `tests/test_watcher_validation_escalation.py` pattern, mocked Gemini):
 
 1. **RC1 regression**: processor returns `error="All chunks failed"` → assert `_validate_and_escalate` is entered and a passing rescue result is stored clean.
 2. **F1 junk guard**: all ladder steps fail with empty transcripts → assert no JSON is written and failure alert fires once.
@@ -100,7 +118,19 @@ Integration smoke test: replay `2026-07-10_13-59-12.mp3` through the patched pip
 
 ## 5. Rollout
 
-1. Implement F1–F4 in MeetingMemory (branch, PR, tests green).
+1. Implement F6 first (smallest diff, converts the observed failure class into clean passes), then F1–F4 in MeetingMemory (branch, PR, tests green).
 2. Restart watcher (`launchctl kickstart -k gui/501/com.user.transcribewatcher`) — required; the stale-code check warns but does not hot-reload.
-3. Verify next 2–3 live meetings pass validation clean; check `_meta.validation` in their JSONs.
-4. Backfill: re-run the known-truncated meetings list from `RELIABILITY_PLAN_2026-07.md` (ids 410, 427, 142, 419) now that the coverage gate + drift fix make re-transcription safe.
+3. Re-transcribe `2026-07-10_13-59-12` cleanly: the incident file now HAS a JSON (stored partial, see §6) and InsightBase source **463**, so the startup rescan will NOT pick it up. Re-run the pipeline on its MP3 and **UPDATE source 463** (do not seed a duplicate row); with F6 in place the 5-second glitch collapses and the transcript passes clean.
+4. Verify next 2–3 live meetings pass validation clean; check `_meta.validation` in their JSONs.
+5. Backfill: re-run the known-truncated meetings list from `RELIABILITY_PLAN_2026-07.md` (ids 410, 427, 142, 419) now that the coverage gate + drift fix make re-transcription safe.
+
+## 6. Addendum — outcome of the 14:45 recovery attempt (same day)
+
+A watcher restart at ~14:45 re-queued the WAV (no JSON existed). This run took the *garbage* path instead of the *error* path, which exercised the escalation ladder end-to-end and produced the F6 evidence:
+
+1. Single-shot completed in 161s (no disconnects this time) → coverage 99.7% but repetition loop + duplicate span → validation FAILED.
+2. Ladder step 2 (fresh single-call): 99.5%, same two flags → FAILED.
+3. Ladder step 3 (force-chunked): chunk 1 attempt 1 truncated (47.6%, stopped at 428s/900s), attempt 2 hit a fresh disconnect storm → chunk 1 lost; overall FAILED (missing 00:00–15:00).
+4. Ladder exhausted → best candidate (the 99.7% single-shot) stored as **PARTIAL**, Telegram partial alert sent, source id **463** seeded, meeting-actions triggered.
+
+Post-hoc inspection of the stored JSON: the sole defect is `"de,"` × 595 (~2.4k chars) replacing ~5 seconds of audio between `[19:28]` and `[19:33]`; the duplicate-span flag is a cascade of that same loop. The other 23.9 minutes (Matthias + Philipp Baltensperger) are intact. Gemini API disconnect storms were observed at ~14:00 and ~14:50 HKT on both 2026-07-09 and 2026-07-10 — supports F3's ≥ 30 min retry spacing.
