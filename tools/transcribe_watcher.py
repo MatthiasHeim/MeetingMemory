@@ -137,7 +137,10 @@ except ImportError as e:
 # _validate_gemini_result degrades to a permissive pass rather than blocking
 # the pipeline, matching every other optional module in this file.
 try:
-    from transcript_validator import validate_transcript as _validate_transcript
+    from transcript_validator import (
+        validate_transcript as _validate_transcript,
+        sanitize_repetition_loops as _sanitize_repetition_loops,
+    )
     TRANSCRIPT_VALIDATOR_AVAILABLE = True
 except ImportError as e:
     TRANSCRIPT_VALIDATOR_AVAILABLE = False
@@ -179,6 +182,42 @@ DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.ya
 # capture (e.g. a 102-byte file) is re-queued on every startup, fails ffprobe
 # ("Invalid data found"), and fires a Telegram failure alert each time.
 MIN_RECORDING_BYTES = 100_000
+
+# F3 periodic rescan (docs/SPEC-error-path-escalation-2026-07-10.md RC3):
+# _process_existing_files used to run only at watcher startup, so a meeting
+# that ended inside a Gemini outage sat unprocessed until someone manually
+# restarted the watcher. Re-running it on a timer turns that into "delayed",
+# bounded by a per-WAV attempt cap + min spacing so a flapping watcher
+# (crash-restart loop) can't burn through retries in seconds, and an
+# alert-dedup so an ongoing outage doesn't re-alert every tick.
+RESCAN_INTERVAL_SEC = 30 * 60
+RESCAN_MAX_ATTEMPTS = 4
+RESCAN_MIN_SPACING_SEC = 30 * 60
+RESCAN_STATE_FILENAME = ".rescan_state.json"
+
+
+def _load_rescan_state(path: Path) -> dict:
+    """Load the per-WAV rescan attempt-tracking state.
+
+    Tolerates a missing or corrupt file (treated as "no attempts recorded
+    yet") so a bad state file can never block processing.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_rescan_state(path: Path, state: dict) -> None:
+    """Persist rescan attempt-tracking state. Best-effort — a failed write
+    just means the next watcher restart re-attempts from attempt 0, which is
+    the safe direction to fail in (extra retries, not lost meetings)."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except OSError:
+        pass
 
 
 def _git_sha() -> Optional[str]:
@@ -319,6 +358,17 @@ class _PermissiveValidation:
         }
 
 
+def _apply_missing_ranges(validation, missing: list) -> None:
+    if missing:
+        validation.passed = False
+        ranges_str = ", ".join(
+            f"{_fmt_mmss(s)}-{_fmt_mmss(e)}" for s, e in missing
+        )
+        validation.reasons.append(
+            f"Missing time range(s) from failed chunk(s): {ranges_str}"
+        )
+
+
 def _validate_gemini_result(result, audio_duration_seconds: float):
     """transcript_validator.validate_transcript, plus a GeminiResult-specific
     check the text-only validator can't see: a chunk that failed after
@@ -327,6 +377,18 @@ def _validate_gemini_result(result, audio_duration_seconds: float):
     timestamp still reaches near the end, so the coverage percentage alone
     would pass it. `GeminiResult.missing_time_ranges` (see gemini_processor)
     forces a failure in that case.
+
+    F6 (docs/SPEC-error-path-escalation-2026-07-10.md): when the failure is
+    a runaway repetition loop, a tiny glitch (observed: "de," x595 covering
+    ~5s of a 24-min recording, source 463) shouldn't cost the whole
+    transcript. Sanitize it (collapse the loop to one instance + a glitch
+    marker) and re-validate; if the sanitized transcript now passes, mutate
+    `result.transcript` in place and accept it as a clean success with
+    `sanitized: true` recorded, instead of entering the escalation ladder.
+    The duplicate-span check runs as part of that re-validation — i.e.
+    AFTER sanitization — because the loop's own shingles trivially recur
+    >30 words apart and would otherwise cascade into a second false
+    "duplicate span" failure reason for the same root cause.
 
     Degrades to a permissive pass if transcript_validator is unavailable —
     never blocks the pipeline on a missing optional module.
@@ -337,14 +399,19 @@ def _validate_gemini_result(result, audio_duration_seconds: float):
         )
     validation = _validate_transcript(result.transcript, audio_duration_seconds)
     missing = getattr(result, "missing_time_ranges", None) or []
-    if missing:
-        validation.passed = False
-        ranges_str = ", ".join(
-            f"{_fmt_mmss(s)}-{_fmt_mmss(e)}" for s, e in missing
-        )
-        validation.reasons.append(
-            f"Missing time range(s) from failed chunk(s): {ranges_str}"
-        )
+    _apply_missing_ranges(validation, missing)
+
+    if not validation.passed and validation.has_repetition_loop:
+        sanitized_text, locations = _sanitize_repetition_loops(result.transcript)
+        if locations:
+            resanitized = _validate_transcript(sanitized_text, audio_duration_seconds)
+            _apply_missing_ranges(resanitized, missing)
+            if resanitized.passed:
+                result.transcript = sanitized_text
+                resanitized.sanitized = True
+                resanitized.sanitized_locations = locations
+                return resanitized
+
     return validation
 
 
@@ -516,6 +583,11 @@ class TranscribeWatcher:
 
         self.running = False
 
+        # F3 periodic rescan state (see RESCAN_* constants above).
+        self._rescan_state_path = self.transcripts_dir / RESCAN_STATE_FILENAME
+        self._rescan_state = _load_rescan_state(self._rescan_state_path)
+        self._last_rescan_monotonic = time.time()
+
     def start(self):
         """Start watching for new files."""
         self.logger.info(f"Starting TranscribeWatcher...")
@@ -537,6 +609,13 @@ class TranscribeWatcher:
         try:
             while self.running:
                 self._process_queue()
+                now = time.time()
+                if now - self._last_rescan_monotonic >= RESCAN_INTERVAL_SEC:
+                    self._last_rescan_monotonic = now
+                    try:
+                        self._rescan_unprocessed_wavs(now)
+                    except Exception as e:
+                        self.logger.error(f"Periodic rescan failed: {e}")
                 time.sleep(self.config.get('watcher', {}).get('poll_interval', 1))
         except KeyboardInterrupt:
             self.stop()
@@ -556,11 +635,22 @@ class TranscribeWatcher:
         self.observer.join()
         self.logger.info("Watcher stopped.")
 
-    def _process_existing_files(self):
-        """Check for WAV files that don't have corresponding outputs."""
-        for wav_file in self.recordings_dir.glob("*.wav"):
-            needs_processing = False
+    def _wav_needs_processing(self, wav_file: Path) -> bool:
+        """True if wav_file lacks the output(s) required by processing_mode."""
+        if self.processing_mode in ('whisper', 'both'):
+            if not (self.transcripts_dir / f"{wav_file.stem}.html").exists():
+                return True
+        if self.processing_mode in ('gemini', 'both'):
+            if not (self.transcripts_dir / f"{wav_file.stem}.json").exists():
+                return True
+        return False
 
+    def _process_existing_files(self):
+        """Check for WAV files that don't have corresponding outputs.
+
+        Runs once at watcher startup (see _rescan_unprocessed_wavs for the
+        F3 periodic retry that covers files that fail *after* startup)."""
+        for wav_file in self.recordings_dir.glob("*.wav"):
             # Corrupt/empty captures never produce a transcript, so without
             # this they'd be re-queued (and fail-alert) on every startup.
             if wav_file.stat().st_size < MIN_RECORDING_BYTES:
@@ -570,21 +660,88 @@ class TranscribeWatcher:
                 )
                 continue
 
-            if self.processing_mode in ('whisper', 'both'):
-                # Check for Whisper HTML transcript
-                transcript_file = self.transcripts_dir / f"{wav_file.stem}.html"
-                if not transcript_file.exists():
-                    needs_processing = True
-
-            if self.processing_mode in ('gemini', 'both'):
-                # Check for Gemini JSON output
-                gemini_json = self.transcripts_dir / f"{wav_file.stem}.json"
-                if not gemini_json.exists():
-                    needs_processing = True
-
-            if needs_processing:
+            if self._wav_needs_processing(wav_file):
                 self.logger.info(f"Found unprocessed file: {wav_file.name}")
                 self.queue.add(wav_file)
+
+    def _rescan_attempt_count(self, audio_file: Path) -> int:
+        """Number of F3 rescan-triggered (re)queues recorded for this WAV.
+
+        0 means this file has never needed a rescan retry — either it's
+        being processed for the first time via the live file-watcher, or it
+        hasn't been seen by the rescan mechanism at all. Deliberately
+        defensive (getattr) so code paths / tests that construct a
+        TranscribeWatcher without going through __init__ (bare stubs) don't
+        need to know about rescan state to keep working exactly as before.
+        """
+        return getattr(self, "_rescan_state", {}).get(audio_file.stem, {}).get("attempts", 0)
+
+    def _rescan_unprocessed_wavs(self, now: float) -> None:
+        """Periodic retry for WAVs still lacking output after their first
+        attempt (F3, docs/SPEC-error-path-escalation-2026-07-10.md RC3).
+
+        _process_existing_files used to run only at startup, so a meeting
+        that failed (and, per F1's junk guard, left no JSON) during a
+        Gemini outage sat unprocessed until someone manually restarted the
+        watcher. Called every RESCAN_INTERVAL_SEC from the main loop.
+
+        Per-WAV bookkeeping (persisted to a state-file sidecar so a watcher
+        restart doesn't reset it):
+          - Requeue at most RESCAN_MAX_ATTEMPTS times, spaced at least
+            RESCAN_MIN_SPACING_SEC apart (protects against a flapping
+            watcher burning through retries via repeated startup scans).
+          - Once attempts reach the cap and the file *still* has no output,
+            give up permanently (until the state entry is cleared or a JSON
+            appears) and fire exactly one "giving up" alert.
+
+        The per-attempt failure/partial Telegram alerts fired from inside
+        normal processing (_notify_telegram_failure / _notify_telegram_partial)
+        are suppressed for every rescan-triggered attempt (attempts >= 1) —
+        only the original live attempt's alert and this method's own
+        give-up alert reach Telegram, so an ongoing outage doesn't re-alert
+        every 30 minutes.
+        """
+        state = self._rescan_state
+        changed = False
+        for wav_file in self.recordings_dir.glob("*.wav"):
+            if wav_file.stat().st_size < MIN_RECORDING_BYTES:
+                continue
+            if not self._wav_needs_processing(wav_file):
+                continue
+
+            stem = wav_file.stem
+            entry = state.get(stem, {"attempts": 0, "last_attempt_ts": 0.0, "gave_up": False})
+
+            if entry.get("gave_up"):
+                continue
+
+            if entry["attempts"] >= RESCAN_MAX_ATTEMPTS:
+                entry["gave_up"] = True
+                state[stem] = entry
+                changed = True
+                self.logger.error(
+                    f"Rescan: giving up on {wav_file.name} after "
+                    f"{entry['attempts']} automatic attempts — manual "
+                    f"reprocess needed"
+                )
+                self._notify_telegram_giveup(wav_file, entry["attempts"])
+                continue
+
+            if entry["attempts"] > 0 and (now - entry["last_attempt_ts"]) < RESCAN_MIN_SPACING_SEC:
+                continue  # too soon since the last attempt
+
+            entry["attempts"] += 1
+            entry["last_attempt_ts"] = now
+            state[stem] = entry
+            changed = True
+            self.logger.info(
+                f"Rescan: re-queueing {wav_file.name} "
+                f"(attempt {entry['attempts']}/{RESCAN_MAX_ATTEMPTS})"
+            )
+            self.queue.add(wav_file)
+
+        if changed:
+            _save_rescan_state(self._rescan_state_path, state)
 
     def _process_queue(self):
         """Process the next file in the queue based on processing mode."""
@@ -967,9 +1124,21 @@ class TranscribeWatcher:
             self.logger.info(f"Gemini processing complete in {processing_time:.1f}s")
 
             if result.error:
-                self.logger.error(f"Gemini processing error: {result.error}")
-                self._notify_telegram_failure(audio_file, f"Gemini error: {result.error}")
-                return
+                # F1 (docs/SPEC-error-path-escalation-2026-07-10.md RC1): a
+                # hard error result (e.g. "All chunks failed" after a
+                # disconnect storm) used to short-circuit here BEFORE the
+                # escalation ladder ever ran — the ladder's fresh single-call
+                # and force-chunked steps are exactly the moves that would
+                # rescue this once the disconnect storm passes or on a
+                # genuinely smaller sub-problem. _validate_gemini_result on
+                # an error-result already yields passed=False (empty
+                # transcript -> no timestamps -> 0% coverage), so it falls
+                # straight into the same ladder a validation failure does.
+                self.logger.warning(
+                    f"Gemini processing error: {result.error} — routing "
+                    f"into the validation/escalation ladder instead of "
+                    f"giving up immediately"
+                )
 
             # Step 3b: Coverage/completeness gate + escalation ladder (see
             # docs/RELIABILITY_PLAN_2026-07.md Phase 1). Never store a
@@ -982,6 +1151,13 @@ class TranscribeWatcher:
                 channel_segments=channel_segments,
                 diarization_segments=diarization_segments,
             )
+            if result is None:
+                # F1 junk guard: every ladder step produced no usable
+                # transcript at all (coverage 0%, empty) — do NOT write a
+                # JSON (that would mark the file "processed" forever).
+                # _validate_and_escalate already fired the failure alert;
+                # the file stays eligible for F3's periodic rescan.
+                return
             result.validation_report = validation.to_dict()
             result.partial = partial
 
@@ -1690,7 +1866,19 @@ class TranscribeWatcher:
         so a real meeting could vanish unnoticed (happened 2026-06-22 10:17 and
         an 888 MB 2026-06-12 recording). The audio is retained, so the file can
         be re-triggered after a fix. Best-effort.
+
+        F3 alert dedup: suppressed for any rescan-triggered retry (attempt
+        count >= 1) — the original live attempt already alerted once, and
+        _rescan_unprocessed_wavs fires its own distinct "giving up" alert
+        when the attempt cap is reached. Without this an ongoing outage
+        would re-alert every ~30min for as long as it lasted.
         """
+        if self._rescan_attempt_count(audio_file) >= 1:
+            self.logger.info(
+                f"Suppressing failure alert for {audio_file.name} "
+                f"(rescan retry in progress: {reason})"
+            )
+            return
         notify_path = self._telegram_notify_script()
         if not notify_path:
             self.logger.warning(
@@ -1722,16 +1910,24 @@ class TranscribeWatcher:
         (docs/RELIABILITY_PLAN_2026-07.md Phase 1). Never store a
         failed-validation transcript as a clean success:
 
-          1. Validate the Gemini result already in hand.
+          1. Validate the Gemini result already in hand (this also runs the
+             F6 sanitize-and-revalidate step — see _validate_gemini_result).
           2. On failure, retry a FRESH single-call on pro.
           3. On failure, try drift-proof chunked mode (skipped for
              recordings too short to meaningfully chunk).
           4. If every step still fails validation, accept the best-available
              candidate (highest coverage_pct) with partial=True and fire a
-             Telegram alert naming what's missing — never silently.
+             Telegram alert naming what's missing — never silently. EXCEPT
+             (F1 junk guard): if that best candidate has no usable
+             transcript at all (0% coverage AND empty), don't store a junk
+             JSON that would mark the file "processed" forever — fire the
+             plain failure alert instead and return `result=None`, which
+             tells the caller to skip the JSON write so F3's periodic
+             rescan can retry the file later.
 
-        Returns (result, validation, partial). `result` is always the
-        result to persist; `partial` is True iff it did not pass validation.
+        Returns (result, validation, partial). `result` is the result to
+        persist, or None if the junk guard fired (nothing should be
+        persisted). `partial` is True iff `result` did not pass validation.
         """
         validation = _validate_gemini_result(result, audio_duration)
         if validation.passed:
@@ -1797,6 +1993,24 @@ class TranscribeWatcher:
                 f"is too short to meaningfully chunk"
             )
 
+        if best_validation.coverage_pct == 0.0 and not (best_result.transcript or "").strip():
+            # F1 junk guard: nothing rescued anything -- every step returned
+            # an effectively empty transcript (e.g. the original RC1
+            # "All chunks failed" error result, with no valid retry either).
+            # Storing this as a "partial" JSON would mark the file processed
+            # forever, permanently defeating F3's periodic rescan.
+            self.logger.error(
+                f"Escalation exhausted with NO usable transcript at all — "
+                f"not writing a JSON so the periodic rescan can retry: "
+                f"{'; '.join(best_validation.reasons)}"
+            )
+            self._notify_telegram_failure(
+                audio_file,
+                f"All escalation steps failed with no usable transcript: "
+                f"{'; '.join(best_validation.reasons)}",
+            )
+            return None, best_validation, True
+
         self.logger.error(
             f"Escalation exhausted — accepting best-available result as "
             f"PARTIAL (coverage {best_validation.coverage_pct:.1f}%): "
@@ -1832,6 +2046,34 @@ class TranscribeWatcher:
             self.logger.info(f"Telegram partial-transcript alert sent for {audio_file.name}")
         except Exception as e:
             self.logger.warning(f"Telegram partial-transcript alert failed: {e}")
+
+    def _notify_telegram_giveup(self, audio_file: Path, attempts: int) -> None:
+        """F3 final alert: the periodic rescan exhausted its attempt cap and
+        the file still has no output. Distinct from _notify_telegram_failure
+        (suppressed for the quiet intermediate retries in between) so the
+        user gets exactly two signals across a whole outage: the first
+        failure, then this. Best-effort.
+        """
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            self.logger.warning(
+                "telegram_notify.py not found in any known location; "
+                "skipping give-up alert"
+            )
+            return
+        msg = (
+            f"🛑 Giving up on transcription after {attempts} automatic attempts\n"
+            f"{audio_file.name}\n"
+            f"Manual reprocess needed — audio retained."
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.logger.info(f"Telegram give-up alert sent for {audio_file.name}")
+        except Exception as e:
+            self.logger.warning(f"Telegram give-up alert failed: {e}")
 
     def _trigger_claude(self, transcript_path: Path, source_id: Optional[int] = None):
         """Fire-and-forget headless Claude session to process transcript.

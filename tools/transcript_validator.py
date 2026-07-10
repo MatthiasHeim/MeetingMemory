@@ -27,6 +27,16 @@ from dataclasses import dataclass, field
 # actual duration. Below this, the transcript is treated as truncated.
 COVERAGE_MIN_PCT = 90.0
 
+# Upper coverage bound (F4, docs/SPEC-error-path-escalation-2026-07-10.md
+# RC4): the drift-proof chunking continuity prefix shows Gemini the previous
+# chunk's tail with chunk-local timestamps and says "continue" -- Gemini
+# sometimes obeys too literally and keeps counting from there instead of
+# restarting at [00:00], so _shift_timestamps then double-counts the chunk
+# offset on top. That drift lands at ~130-200% coverage (observed 143.2%,
+# source 427-adjacent incident 2026-07-09); 110% leaves headroom for normal
+# rounding/dictation slop at the very end of a recording.
+COVERAGE_MAX_PCT = 110.0
+
 # A phrase of 1-4 words repeating more than this many times *consecutively*
 # is a runaway-generation loop (observed: "s'heisst" x~400 in source 429).
 REPETITION_MAX_CONSECUTIVE = 15
@@ -37,8 +47,14 @@ REPETITION_MAX_PHRASE_WORDS = 4
 SHINGLE_SIZE = 8
 SHINGLE_MIN_DISTANCE_WORDS = 30
 
+# Marker spliced in where sanitize_repetition_loops() collapsed a runaway
+# repeat (F6) -- makes the glitch visible in the stored transcript instead
+# of silently vanishing.
+GLITCH_MARKER = "[transcription glitch]"
+
 _TIMESTAMP_RE = re.compile(r"\[(\d{1,2}(?::\d{2}){1,2})\]")
 _CHUNK_FAILED_RE = re.compile(r"\[CHUNK\s+\d+\s+FAILED\b", re.IGNORECASE)
+_LEADING_TS_RE = re.compile(r"^\[(\d{1,2}(?::\d{2}){1,2})\]")
 
 
 @dataclass
@@ -52,6 +68,8 @@ class ValidationResult:
     has_chunk_failure_marker: bool = False
     has_repetition_loop: bool = False
     has_duplicate_span: bool = False
+    sanitized: bool = False
+    sanitized_locations: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """JSON-serializable form for persistence into result `_meta`."""
@@ -63,6 +81,8 @@ class ValidationResult:
             "has_chunk_failure_marker": self.has_chunk_failure_marker,
             "has_repetition_loop": self.has_repetition_loop,
             "has_duplicate_span": self.has_duplicate_span,
+            "sanitized": self.sanitized,
+            "sanitized_locations": list(self.sanitized_locations),
         }
 
 
@@ -162,6 +182,13 @@ def validate_transcript(transcript: str, audio_duration_seconds: float) -> Valid
                 f"{COVERAGE_MIN_PCT:.0f}% minimum (last timestamp "
                 f"{last_timestamp_sec:.0f}s of {audio_duration_seconds:.0f}s)"
             )
+        elif coverage_pct > COVERAGE_MAX_PCT:
+            reasons.append(
+                f"Coverage {coverage_pct:.1f}% exceeds the "
+                f"{COVERAGE_MAX_PCT:.0f}% maximum (last timestamp "
+                f"{last_timestamp_sec:.0f}s of {audio_duration_seconds:.0f}s) "
+                f"— last timestamp exceeds audio duration — timestamp drift"
+            )
 
     has_chunk_failure_marker = _has_chunk_failure_marker(transcript)
     if has_chunk_failure_marker:
@@ -186,7 +213,7 @@ def validate_transcript(transcript: str, audio_duration_seconds: float) -> Valid
         )
 
     passed = (
-        coverage_pct >= COVERAGE_MIN_PCT
+        COVERAGE_MIN_PCT <= coverage_pct <= COVERAGE_MAX_PCT
         and not has_chunk_failure_marker
         and not has_repetition_loop
         and not has_duplicate_span
@@ -201,3 +228,112 @@ def validate_transcript(transcript: str, audio_duration_seconds: float) -> Valid
         has_repetition_loop=has_repetition_loop,
         has_duplicate_span=has_duplicate_span,
     )
+
+
+def _collapse_phrase_repeats(words: list[str]) -> tuple[list[str], list[tuple[str, int]]]:
+    """Collapse runs of a 1-4 word phrase repeating more than
+    REPETITION_MAX_CONSECUTIVE times consecutively to one instance + a
+    GLITCH_MARKER. Mirrors _consecutive_phrase_repetition's detection loop
+    but rewrites the run instead of just flagging it."""
+    out: list[str] = []
+    hits: list[tuple[str, int]] = []
+    n_words = len(words)
+    i = 0
+    while i < n_words:
+        collapsed = False
+        for n in range(1, REPETITION_MAX_PHRASE_WORDS + 1):
+            if i + n > n_words:
+                continue
+            phrase = words[i:i + n]
+            j = i + n
+            count = 1
+            while j + n <= n_words and words[j:j + n] == phrase:
+                count += 1
+                j += n
+            if count > REPETITION_MAX_CONSECUTIVE:
+                out.extend(phrase)
+                out.append(GLITCH_MARKER)
+                hits.append((" ".join(phrase), count))
+                i = j
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(words[i])
+            i += 1
+    return out, hits
+
+
+def sanitize_repetition_loops(transcript: str) -> tuple[str, list[dict]]:
+    """Collapse runaway repetition loops down to one instance + GLITCH_MARKER.
+
+    Handles two shapes, both observed in practice:
+      - a whole line repeated verbatim (the 429 "s'heisst" case, when it
+        lands as separate turns);
+      - a 1-4 word phrase repeating within a single turn's line (source 463,
+        2026-07-10: "de," x595 mid-sentence, ~5s of audio replaced by a
+        runaway loop while the surrounding 23.9 minutes were fine).
+
+    Scoped per-line rather than over the whole token stream: an observed
+    runaway loop stays within one transcribed turn, so this is both simpler
+    and safe -- it can never bridge a timestamp boundary into the next turn.
+
+    Returns (sanitized_transcript, locations); locations is empty if nothing
+    was collapsed (transcript returned unchanged, same string).
+    """
+    lines = transcript.split("\n")
+    out_lines: list[str] = []
+    locations: list[dict] = []
+
+    # Pass 1: whole-line repeats.
+    i = 0
+    n_lines = len(lines)
+    while i < n_lines:
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            out_lines.append(line)
+            i += 1
+            continue
+        j = i + 1
+        count = 1
+        while j < n_lines and lines[j].strip() == stripped:
+            count += 1
+            j += 1
+        if count > REPETITION_MAX_CONSECUTIVE:
+            out_lines.append(line)
+            out_lines.append(GLITCH_MARKER)
+            ts_match = _LEADING_TS_RE.match(stripped)
+            locations.append({
+                "kind": "line",
+                "phrase": stripped[:80],
+                "count": count,
+                "timestamp": f"[{ts_match.group(1)}]" if ts_match else None,
+            })
+            i = j
+        else:
+            out_lines.extend(lines[i:j])
+            i = j
+
+    # Pass 2: in-line repeated 1-4 word phrases.
+    final_lines: list[str] = []
+    for line in out_lines:
+        if line == GLITCH_MARKER:
+            final_lines.append(line)
+            continue
+        words = line.split()
+        if not words:
+            final_lines.append(line)
+            continue
+        new_words, hits = _collapse_phrase_repeats(words)
+        if hits:
+            ts_match = _LEADING_TS_RE.match(line.strip())
+            ts = f"[{ts_match.group(1)}]" if ts_match else None
+            for phrase, count in hits:
+                locations.append({
+                    "kind": "phrase", "phrase": phrase, "count": count, "timestamp": ts,
+                })
+            final_lines.append(" ".join(new_words))
+        else:
+            final_lines.append(line)
+
+    return "\n".join(final_lines), locations

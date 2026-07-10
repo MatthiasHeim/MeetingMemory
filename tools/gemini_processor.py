@@ -208,6 +208,11 @@ def _build_continuity_prefix(previous_tail: Optional[str]) -> str:
         "voice appears that wasn't in the previous segment, identify it "
         "from the KNOWN ATTENDEES list above if possible, otherwise use a "
         "new generic label.\n\n"
+        "Timestamps in this segment MUST restart at [00:00] for the "
+        "beginning of THIS audio file — do not continue the timestamp "
+        "sequence shown above. The lines above are shown only so you keep "
+        "using the same speaker labels; they are not part of THIS audio's "
+        "timeline.\n\n"
     )
 
 
@@ -580,14 +585,26 @@ class GeminiAudioProcessor:
             )
         except Exception as e:
             if total_duration > self.CHUNK_DURATION_SEC:
+                # F2 (docs/SPEC-error-path-escalation-2026-07-10.md RC2):
+                # force_chunk=True is required here. Without it, audio at or
+                # below CHUNK_THRESHOLD_SEC (the common case — most meetings
+                # are under 35min) makes _chunk_audio return the whole file
+                # as one degenerate "chunk", so this "fallback" is just 2
+                # more attempts x CHUNK_RETRY_ATTEMPTS retries of the
+                # IDENTICAL single-shot request that just failed — observed
+                # verbatim on source 463 (2026-07-10): the single-shot
+                # disconnect storm repeated instead of getting genuinely
+                # smaller sub-problems to retry independently.
                 logger.warning(
-                    f"Single-shot failed ({e}); falling back to chunked processing."
+                    f"Single-shot failed ({e}); falling back to chunked "
+                    f"processing (force_chunk=True)."
                 )
                 return self._process_chunked(
                     audio_path, custom_prompt, total_duration,
                     known_attendees=known_attendees,
                     channel_segments=channel_segments,
                     diarization_segments=diarization_segments,
+                    force_chunk=True,
                 )
             raise
 

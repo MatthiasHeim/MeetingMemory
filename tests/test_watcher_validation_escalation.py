@@ -10,8 +10,11 @@ Written FIRST (red) before the corresponding transcribe_watcher.py changes.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
@@ -68,8 +71,12 @@ def _watcher(gemini_processor):
     w.logger = _StubLogger()
     w.gemini_processor = gemini_processor
     w._telegram_alerts = []
+    w._telegram_failures = []
     w._notify_telegram_partial = (
         lambda audio_file, validation: w._telegram_alerts.append((audio_file, validation))
+    )
+    w._notify_telegram_failure = (
+        lambda audio_file, reason: w._telegram_failures.append((audio_file, reason))
     )
     return w
 
@@ -254,3 +261,145 @@ def test_chunked_escalation_exception_still_returns_best_available():
     assert partial is True
     assert final_result is retry_bad
     assert len(w._telegram_alerts) == 1
+
+
+# ── F1: error results must enter the escalation ladder (RC1) ─────────────
+
+
+def test_error_result_enters_escalation_ladder_and_is_rescued():
+    """RC1 regression (docs/SPEC-error-path-escalation-2026-07-10.md): a
+    hard error result ("All chunks failed" after a disconnect storm) used to
+    short-circuit before the ladder ever ran. _validate_gemini_result on an
+    error-result already yields passed=False (empty transcript -> 0%
+    coverage), so it must fall into the same ladder as any other
+    validation failure and get a real rescue attempt."""
+    error_result = GeminiResult(transcript="", language="unknown", error="All chunks failed")
+    good = _clean_result()
+    proc = _StubProcessor(single_shot_results=[good])
+    w = _watcher(proc)
+    final_result, validation, partial = w._validate_and_escalate(
+        Path("/tmp/rec.wav"), Path("/tmp/rec.mp3"), 60 * 60, error_result,
+        known_attendees=None, channel_segments=None, diarization_segments=None,
+    )
+    assert final_result is good
+    assert validation.passed is True
+    assert partial is False
+    assert proc.single_shot_calls == 1
+    assert w._telegram_failures == []
+
+
+def test_junk_guard_no_json_when_every_step_returns_empty_transcript():
+    """F1 junk guard: if every ladder step comes back with no usable
+    transcript at all (0% coverage, empty), _validate_and_escalate must
+    return result=None (the caller's contract: don't write a JSON, so F3's
+    periodic rescan can retry later instead of the file being marked
+    "processed" forever with a junk result) -- and fire exactly one
+    (non-partial) failure alert, not the partial-transcript alert."""
+    error_result = GeminiResult(transcript="", language="unknown", error="All chunks failed")
+    still_empty_retry = GeminiResult(transcript="", language="unknown")
+    still_empty_chunked = GeminiResult(transcript="", language="unknown", error="All chunks failed")
+    proc = _StubProcessor(single_shot_results=[still_empty_retry], chunked_result=still_empty_chunked)
+    w = _watcher(proc)
+    final_result, validation, partial = w._validate_and_escalate(
+        Path("/tmp/rec.wav"), Path("/tmp/rec.mp3"), 60 * 60, error_result,
+        known_attendees=None, channel_segments=None, diarization_segments=None,
+    )
+    assert final_result is None
+    assert partial is True
+    assert validation.coverage_pct == 0.0
+    assert len(w._telegram_failures) == 1
+    assert w._telegram_alerts == []  # the partial-transcript alert must NOT fire
+
+
+# ── F6: sanitize-and-revalidate, exercised through the watcher's gate ────
+
+
+def _fixture_path() -> Path:
+    return (
+        Path.home() / "Documents" / "MeetingRecorder" / "Transcripts"
+        / "2026-07-10_13-59-12.json"
+    )
+
+
+def test_validate_gemini_result_sanitizes_repetition_glitch_clean():
+    """Mirrors the real incident (source 463): a runaway 'de,' loop covering
+    ~5s of an otherwise-clean 24min recording must sanitize to a clean pass
+    instead of entering the escalation ladder."""
+    loop = " ".join(["de,"] * 595)
+    transcript = (
+        "[00:00] Matthias: hallo zusammen, los gehts heute\n"
+        "[19:25] Philipp Baltensperger: Ich gseh im Moment nöd.\n"
+        f"[19:28] Philipp Baltensperger: Aber drum würd ich jetzt mal, {loop} "
+        "de-Stufe, dass mir mit de ablenkt.\n"
+        "[19:33] Matthias: Okay, ja. Okay.\n"
+        "[23:54] Matthias: Perfekt, dann sehen wir uns naechste Woche. Tschuess."
+    )
+    result = GeminiResult(transcript=transcript, language="de")
+    validation = tw._validate_gemini_result(result, 24 * 60)
+
+    assert validation.passed is True
+    assert validation.sanitized is True
+    assert len(validation.sanitized_locations) == 1
+    assert validation.sanitized_locations[0]["count"] == 595
+    # result.transcript was mutated in place to the sanitized text.
+    assert "[transcription glitch]" in result.transcript
+    assert result.transcript.count("de,") == 1
+
+
+def test_validate_and_escalate_accepts_sanitized_result_without_escalating():
+    """No ladder step should ever run when F6 sanitization alone is enough
+    to pass -- that's the whole point (saves the expensive pro retries)."""
+    loop = " ".join(["de,"] * 595)
+    transcript = (
+        "[00:00] Matthias: hallo zusammen, los gehts heute\n"
+        f"[19:28] Matthias: jetzt mal, {loop} de-Stufe, weiter gehts.\n"
+        "[23:54] Matthias: Perfekt, tschuess."
+    )
+    result = GeminiResult(transcript=transcript, language="de")
+    proc = _StubProcessor()
+    w = _watcher(proc)
+    final_result, validation, partial = w._validate_and_escalate(
+        Path("/tmp/rec.wav"), Path("/tmp/rec.mp3"), 24 * 60, result,
+        known_attendees=None, channel_segments=None, diarization_segments=None,
+    )
+    assert final_result is result
+    assert validation.passed is True
+    assert validation.sanitized is True
+    assert partial is False
+    assert proc.single_shot_calls == 0
+    assert proc.chunked_calls == 0
+
+
+def test_validate_gemini_result_does_not_sanitize_pure_duplicate_span():
+    """Sanitization must only trigger on has_repetition_loop -- a duplicate
+    span with no runaway repeat must still fail and reach the ladder."""
+    shared = "wir sollten definitiv auf die neue Plattform wechseln naechstes Jahr"
+    filler = " ".join(f"wort{i}" for i in range(60))
+    transcript = (
+        f"[06:49] Matthias: {shared}\n"
+        f"[07:30] Matthias: {filler}\n"
+        f"[08:51] Matthias: {shared}\n"
+        "[54:00] Matthias: closing"
+    )
+    result = GeminiResult(transcript=transcript, language="de")
+    original_transcript = result.transcript
+    validation = tw._validate_gemini_result(result, 60 * 60)
+
+    assert validation.passed is False
+    assert validation.has_duplicate_span is True
+    assert validation.sanitized is False
+    assert result.transcript == original_transcript  # untouched
+
+
+@pytest.mark.skipif(not _fixture_path().exists(), reason="real incident fixture only available locally")
+def test_real_fixture_source_463_sanitizes_clean():
+    """Integration check against the actual stored incident JSON (source
+    463, 2026-07-10) -- skipped automatically where the local recording
+    archive isn't present (e.g. CI)."""
+    data = json.loads(_fixture_path().read_text(encoding="utf-8"))
+    audio_duration = data["_meta"]["audio_duration_seconds"]
+    result = GeminiResult(transcript=data["transcript"], language=data.get("language", "de"))
+    validation = tw._validate_gemini_result(result, audio_duration)
+    assert validation.passed is True
+    assert validation.sanitized is True
+    assert "[transcription glitch]" in result.transcript
