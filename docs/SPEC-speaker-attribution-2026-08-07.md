@@ -232,7 +232,7 @@ rounding up, including where the gate does not help.
 | raw Gemini | 2/6 | `[13:26]`+`[13:58]` swapped as a pair; `[15:07]`, `[15:29]` wrong |
 | **+ `speaker_verify` — shipped behaviour** | **2/6** | 12 one-way flips; **94 % Matthias**; breaks `[15:39]`, fixes `[13:26]` |
 | + bleed guard alone | 2/6 | flips suppressed, Gemini's own errors remain — but the 94 % collapse is gone and speaking time is a plausible 1469 s / 638 s |
-| + bleed guard + coherence gate | **see below** | |
+| **+ bleed guard + coherence gate** | **4/6** | end-to-end on the real production input; speaking time 1388 s / 719 s |
 
 **Verified separately: the guard does exactly what it claims.** Re-running the
 real recording through the fixed code: `host_bleed_rate = 0.71`, channel map
@@ -260,6 +260,21 @@ release?", "vo **eurer** Siite") is not part of it — and an instruction to
 establish each speaker's identity first and check every line against it rather
 than relying on turn-taking. This is the general rule symmetric to the existing
 one, not a patch fitted to the fixture.
+
+With that rule in place the end-to-end result on raw Gemini output is **4/6**.
+The audit resolved the swapped pair by citing exactly the intended evidence —
+`[13:26]` → Matthias because "dünd ihr, ihr dünd monatlich release … addresses
+BlueCare", `[13:58]` → Philipp as "the insider answer" — and additionally
+corrected `[14:13]` and `[18:53]` ("mer händ ja das Blue Medication Produkt
+scho mal als Standalone abotte" — first-person company voice).
+
+That run also surfaced a defect in this module rather than in the pipeline:
+the relabel targeted `Philipp Baltensperger` while the identity binding wrote
+`Philipp`, leaving one person under two labels in the same transcript. Both
+forms are in the allowed universe by design, so the write path now
+canonicalises to a single form per person — never merging two people who share
+a first name. Covered by
+`test_full_name_and_first_name_do_not_split_one_speaker`.
 
 **Known remaining gap:** `[15:07]` / `[15:29]` — Matthias's own argument, which
 Gemini attributed to Speaker 2 and the audit read as the counterpart agreeing

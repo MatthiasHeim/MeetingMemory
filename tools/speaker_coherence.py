@@ -349,6 +349,42 @@ def _screen(proposals, lines: list[dict], allowed: set[str]) -> tuple[list, list
     return applied, rejected
 
 
+def canonical_label_map(known_attendees: Optional[list[dict]]) -> dict[str, str]:
+    """Map every known person's name forms onto ONE transcript label.
+
+    The allowed universe deliberately accepts both "Philipp Baltensperger" and
+    "Philipp", so a relabel and an identity binding can legitimately pick
+    different forms for the same person — which is how source 767's first
+    end-to-end run ended up with `Philipp:` and `Philipp Baltensperger:` as two
+    separate speakers in one transcript. Everything downstream counts labels,
+    so that split is a real defect, not cosmetics.
+
+    Canonical form is the first name (the convention `speaker_verify` already
+    uses). A first name shared by two known people is NOT canonicalised —
+    merging two speakers is worse than leaving both full names intact.
+    """
+    # Dedupe by name: the host is usually in known_attendees too, and counting
+    # him twice would make him his own namesake and disable canonicalisation.
+    names: list[str] = []
+    for n in [SELF_NAME] + [
+        (p.get("name") or "").strip() for p in (known_attendees or [])
+        if isinstance(p, dict)
+    ]:
+        if n and n.lower() not in {x.lower() for x in names}:
+            names.append(n)
+    first_counts: dict[str, int] = {}
+    for n in names:
+        first_counts[_first_tok(n)] = first_counts.get(_first_tok(n), 0) + 1
+    out: dict[str, str] = {}
+    for full in names:
+        first = full.split()[0]
+        if first_counts[first.lower()] > 1:
+            continue  # namesakes: keep them distinguishable
+        out[full] = first
+        out[first] = first
+    return out
+
+
 def _bind_identities(speakers, lines: list[dict], allowed: set[str],
                      known_attendees: Optional[list[dict]]) -> list[dict]:
     """Generic label -> real name, but ONLY for names the calendar confirms.
@@ -579,7 +615,9 @@ def check_and_repair(gemini_dict: dict, *,
         return log
 
     # Rewrite. Per-line relabels first (indices refer to pre-rename labels),
-    # then the global generic->name binding.
+    # then the global generic->name binding, then canonicalisation so one
+    # person cannot end up under two spellings.
+    canonical = canonical_label_map(known_attendees)
     by_index = {a["line"]: a for a in applied}
     out = transcript.split("\n")
     for n, ln in enumerate(lines, start=1):
@@ -591,9 +629,14 @@ def check_and_repair(gemini_dict: dict, *,
             if label_now == b["label"]:
                 new_label = b["to"]
                 break
+        if new_label:
+            new_label = canonical.get(new_label, new_label)
         if new_label and new_label != ln["label"]:
             out[ln["index"]] = f"{ln['prefix']}{new_label}:{ln['rest']}"
     gemini_dict["transcript"] = "\n".join(out)
+    # Keep the log honest about what was actually written.
+    for a in applied:
+        a["to"] = canonical.get(a["to"], a["to"])
 
     for b in bindings:
         for p in (gemini_dict.get("participants") or []):

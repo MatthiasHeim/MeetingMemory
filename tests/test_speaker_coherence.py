@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from speaker_coherence import (  # noqa: E402
     MAX_RELABEL_FRACTION,
+    canonical_label_map,
     check_and_repair,
     parse_lines,
     parse_response,
@@ -389,3 +390,52 @@ def test_partial_window_failure_is_reported_not_swallowed():
     assert log["ran"] is True
     assert len(log["failed_windows"]) == 1
     assert "were not audited" in log["error"]
+
+
+# ── one person, one label ─────────────────────────────────────────────────
+
+
+def test_full_name_and_first_name_do_not_split_one_speaker():
+    """Regression, source 767 end-to-end run: a relabel targeted
+    'Philipp Baltensperger' while the identity binding wrote 'Philipp', so the
+    transcript ended up with two speakers for one person. Both forms are in
+    the allowed universe by design, so the write path must canonicalise."""
+    g = load_fixture()
+    log = check_and_repair(g, known_attendees=ATTENDEES, runner=stub({
+        "speakers": [{"label": "Speaker 2",
+                      "identity": "Philipp Baltensperger",
+                      "evidence": "describes BlueCare's release process"}],
+        "relabels": [
+            {"line": 11, "from": "Matthias", "to": "Philipp Baltensperger",
+             "confidence": "high", "reason": "insider answer"},
+        ],
+    }))
+    labels = set(labels_by_ts(g["transcript"]).values())
+    assert "Philipp Baltensperger" not in labels
+    assert labels == {"Matthias", "Philipp"}
+    # ...and the log reports the label that was actually written.
+    assert log["relabels_applied"][0]["to"] == "Philipp"
+
+
+def test_host_full_name_canonicalises_to_the_transcript_convention():
+    g = load_fixture()
+    check_and_repair(g, known_attendees=ATTENDEES, runner=stub({
+        "relabels": [{"line": 14, "from": "Speaker 2", "to": "Matthias Heim",
+                      "confidence": "high", "reason": "his own argument"}],
+    }))
+    assert "Matthias Heim:" not in g["transcript"]
+    assert labels_by_ts(g["transcript"])["15:07"] == "Matthias"
+
+
+def test_namesakes_are_never_merged_by_canonicalisation():
+    """Two known people sharing a first name must keep their full names —
+    collapsing them would be the source-434 multi-party merge again."""
+    m = canonical_label_map([
+        {"name": "Philipp Baltensperger"},
+        {"name": "Philipp Meier"},
+        {"name": "Lukas Weber"},
+    ])
+    assert "Philipp Baltensperger" not in m
+    assert "Philipp Meier" not in m
+    assert m["Lukas Weber"] == "Lukas"
+    assert m["Matthias Heim"] == "Matthias"
