@@ -224,13 +224,31 @@ def _build_channel_map_prefix(channel_segments: Optional[list]) -> str:
     hybrid recording's separate mic channel. Returns "" when no segments are
     provided (mono recordings, VAD unavailable) — in that case the prompt is
     byte-identical to the no-map one.
+
+    Also returns "" when the mic channel failed its own bleed self-test
+    (2026-08-07): without headphones the mic hears the loudspeakers, so
+    stretches of pure remote speech get rendered as `host` spans and this
+    block would instruct Gemini — under the banner "GROUND TRUTH", with
+    "the map wins" — to attribute the remote participant's words to Matthias.
+    A recording whose channels don't separate gets the no-map prompt and is
+    diarized on voice alone.
     """
     if not channel_segments:
         return ""
     # Channel attribution is best-effort: ANY failure here must degrade to
     # the no-map prompt, never block transcription.
     try:
-        from channel_vad import render_map_text
+        from channel_vad import channel_separation_report, render_map_text
+        report = channel_separation_report(channel_segments)
+        if not report.get("admissible", True):
+            logger.warning(
+                f"channel map suppressed: {report.get('reason')} "
+                f"(host_bleed_rate={report.get('host_bleed_rate')} > "
+                f"{report.get('max_host_bleed_rate')}) — the mic channel picks "
+                f"up the remote participants, so its host/remote spans are not "
+                f"ground truth. Using the no-map prompt."
+            )
+            return ""
         map_text = render_map_text(channel_segments)
     except Exception as e:
         logger.warning(f"channel map rendering failed ({e}); no-map prompt")
@@ -355,6 +373,16 @@ class GeminiResult:
     # exists to carry them into participant_resolution_log.
     speaker_verification_log: Optional[dict] = None
 
+    # Forensic log of the semantic speaker-coherence repair (speaker_coherence).
+    # Set by the watcher AFTER the repair; records every label it rewrote and
+    # why, plus the regions it could not resolve confidently.
+    speaker_coherence_log: Optional[dict] = None
+
+    # Admissibility verdict for the mic channel on this recording
+    # (channel_vad.channel_separation_report). Distinguishes "attribution was
+    # channel-verified" from "the channel oracle was unusable and skipped".
+    channel_separation: Optional[dict] = None
+
     @property
     def parsed_response(self) -> dict:
         """Dict form for JSON serialization on disk and DB writes."""
@@ -385,6 +413,10 @@ class GeminiResult:
             out["_meta"]["validation"] = self.validation_report
         if self.speaker_verification_log is not None:
             out["speaker_verification"] = self.speaker_verification_log
+        if self.speaker_coherence_log is not None:
+            out["speaker_coherence"] = self.speaker_coherence_log
+        if self.channel_separation is not None:
+            out["_meta"]["channel_separation"] = self.channel_separation
         return out
 
 

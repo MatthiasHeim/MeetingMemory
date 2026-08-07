@@ -15,6 +15,18 @@
 
 **Microphone/channel status (user asked to confirm):** capture is fine. The Aggregate Device records 3 channels (host mic separate from system audio), `channel_vad.py` computes host/remote ground truth from them, and it IS wired into both the Gemini prompt ("AUDIO CHANNEL MAP") and post-hoc `speaker_verify` flips. The remaining weaknesses are: (a) Gemini itself only ever hears a **mono mix** (`audio_converter.py:264-280`) — channel separation is reduced to a text hint; (b) verify thresholds are so conservative (8 s min turn) that most real misattributions survive; (c) the stronger `diarization.channel_fusion` path exists but is **off by default**.
 
+> ### ⚠️ 2026-08-07: "capture is fine" was wrong, and it invalidates Phase 2 as written
+>
+> The paragraph above rests on a measurement that cannot support it. Channel separation was verified by *sample-level* correlation between the mic and system channels (≈ 0.000) — a statistic that stays ≈ 0 even when the mic plainly hears the loudspeakers, because room coupling delays and filters the signal. Re-measured properly (envelope coupling, and the mic's own level during remote speech), the host mic reads "active" during **36–80 % of remote speech on every one of the last 8 recordings**. The channel signal is therefore **not** ground truth on this corpus; it is a saturated signal that reports maximum confidence and carries almost no information.
+>
+> Consequences, all evidenced in `docs/SPEC-speaker-attribution-2026-08-07.md`:
+>
+> - **Every one of the 81 `speaker_verify` flips ever applied across 221 transcripts moved a turn onto Matthias. Not one went the other way.** The reverse rule needs `host_share < 0.15`, which a bleeding recording never produces — it is structurally unreachable.
+> - On source 767 this turned a 70 %-Matthias transcript into a **94 %-Matthias** one in a two-person call.
+> - Weakness (b) above is backwards. The conservative thresholds were the only thing limiting the damage; loosening them, as Phase 2.2 proposes, multiplies it.
+>
+> **Phase 2 must not be implemented as written** — see the revised Phase 2 below. Making a bleeding signal *authoritative* would apply source 767's failure to every meeting with more turns and more confidence.
+
 ## Decision: chunking is NOT essential — retire it as a primary path
 
 Meetings ≤ 60 min (nearly all of them) already go single-call, which has **zero** cross-chunk drift by construction. Chunking exists only as (1) the > 60 min path and (2) the fallback when a single call fails. Both justifications weaken once the model is reliable (pro, not flash). Chunking is demoted to a last-resort emergency mode with a redesigned, drift-proof implementation (Phase 3), and the fallback order becomes *retry single-call on pro* first.
@@ -58,14 +70,54 @@ New module `tools/transcript_validator.py`, called in `_process_with_gemini` bet
 
 **Reconciliation sweep (backstop):** small script + daily launchd job: every `Recordings/*.wav` ≥ MIN_RECORDING_BYTES and > 3 h old must have (a) a Transcripts JSON and (b) a `sources` row (match on filename in `_meta`). Any orphan → Telegram + requeue. This single check would have caught every data-loss incident to date, including failure modes we haven't met yet.
 
-## Phase 2 — Channel-first speaker attribution (~2 days)
+## Phase 2 — Speaker attribution — REVISED 2026-08-07
 
-Make the deterministic signal authoritative instead of advisory:
+The original Phase 2 ("make the deterministic signal authoritative") is
+**withdrawn**: the deterministic signal is not trustworthy on this corpus, and
+promoting it would have industrialised the source-767 failure. What replaced it
+is the inverse — *stop* trusting the channel until it earns it, and add a
+semantic check that works regardless of the audio.
 
-1. **Enable and harden `diarization.channel_fusion`** for `multi_source_genuine` topology (it exists, default-off). pyannote diarizes the remote mix → remote speakers separated acoustically; channel VAD separates host vs remote with hardware certainty.
-2. **Deterministic post-pass replaces conservative verify:** for every transcript turn, compute host_share from VAD. In 1:1 meetings (the majority), assignment becomes near-deterministic: host segments = Matthias, remote = counterpart; Gemini's labels are only consulted inside `both`-overlap spans. Lower flip threshold from 8 s to 2.5 s when VAD confidence is high (host_share < 5% or > 95%) — this fixes the short-question misattribution class (429 [01:06]).
-3. **Multi-party:** flips target the pyannote remote cluster active at that time, removing the "exactly one remote speaker" restriction in `speaker_verify.py:263`. Guard against the known multiparty-collapse failure (memory: `speaker_resolution_multiparty_collapse`) with a rule: never collapse two remote clusters that pyannote separates.
-4. **Mic-channel sanity probe at recording start:** meeting_recorder checks within the first 60 s that the mic channel carries signal (RMS above noise floor) and that channel order matches config; menu-bar warning if not. Confirms "same microphone" regressions immediately instead of post-hoc.
+### 2A — Channel admissibility gate ✅ DONE (2026-08-07)
+
+`channel_vad.host_bleed_rate()` measures `P(mic active | remote speaking)` and
+`channel_separation_report()` refuses the channel above 0.35. One verdict,
+computed in the watcher, applied to every consumer: the Gemini prompt map,
+`channel_fusion`, and `speaker_verify` (which re-checks independently). Recorded
+in `_meta.channel_separation` so an attribution that was channel-verified is
+distinguishable from one that never was. Suppresses all 12 flips on source 767
+and, by the same rule, the other 69 across the corpus.
+
+### 2B — Semantic coherence gate ✅ DONE (2026-08-07)
+
+`tools/speaker_coherence.py`, run by the watcher after transcription and
+**before** the JSON write — hence before the InsightBase seed, so repaired
+labels are what reach `sources.content_text`. Claude audits whether the
+attribution is internally coherent (question/answer adjacency, first- and
+second-person company voice, self-description, direct address) and rewrites
+only what it can prove. Guards: closed label universe, stale-index rejection,
+high-confidence-only, 35 % runaway cap, loud degradation with a Telegram alert
+naming unaudited ranges. Windowed (30 lines + 8 context, 3 parallel) because
+whole-transcript audits do not return in reasonable time.
+
+Measured on source 767 (six hand-confirmed labels) — reported in full, including
+what it does not fix, in `docs/SPEC-speaker-attribution-2026-08-07.md`.
+
+### 2C — Capture-side fix ☐ TODO — the actual root cause
+
+The channel signal is only worth repairing at the source: **headphones restore
+separation.** The bleed rate is now measured and logged on every run and the
+watcher warns explicitly when a recording is inadmissible, so a regression is
+visible the same day instead of being inferred months later from wrong wiki
+pages. The mic sanity probe (old Phase 2.4) should check *bleed*, not just
+signal presence — signal presence was never the failing condition.
+
+### 2D — Multi-party ☐ TODO, now blocked on 2C
+
+Flips targeting the pyannote remote cluster (old Phase 2.3) remain the right
+design, but they require an admissible channel to be worth anything. Blocked
+until 2C lands. Note the two worst-affected sources in the corpus (414, 427 —
+34 and 18 flips) are exactly the multi-party ones.
 
 ## Phase 3 — Drift-proof chunking for > 60 min only (~1 day)
 
@@ -80,6 +132,28 @@ Keep chunking solely for audio the single call cannot cover, redesigned so drift
 
 - Golden set: 5–8 past meetings with human-confirmed labels — start with source 429 (Matthias confirmed the correct attribution on 2026-07-08) and the itesys/Sascha call from the speaker-attribution memory.
 - `tools/eval_attribution.py`: reprocesses golden audio, scores (a) turn-level speaker accuracy vs. confirmed labels, (b) coverage %, (c) validation-gate pass. Run before merging any pipeline change; also the place to trial new models (gemini-3-pro etc.) with data instead of vibes.
+
+**Started 2026-08-07.** `tests/fixtures/source767_region.txt` is the first
+golden entry: the real 12:07–16:26 region of source 767 with six hand-confirmed
+labels, wired into `tests/test_speaker_coherence.py` two-sided (the confirmed
+defects must be repaired AND the confirmed-correct lines must survive
+untouched, with the transcript text byte-identical). `tests/test_speaker_verify.py`
+carries the matching pair for the bleed guard: a clean oracle must still flip,
+a bleeding one must not.
+
+This is fixture-level, not yet the audio-reprocessing harness Phase 4 describes —
+the golden *labels* now exist, which was the missing input. Two things the
+source-767 work showed the harness must score, and which a naive accuracy number
+would hide:
+
+- **Score both directions.** The defect was 81 flips all pointing one way. A
+  one-sided "did it fix the known errors" metric scores a gutted verifier as
+  perfect. Track corrections made AND correct labels destroyed.
+- **Score against the real input.** The coherence gate measured 4/6 against the
+  damaged transcript but 2/6 against raw Gemini output, because the damaged
+  version made errors locally visible that a consistent swap hides. Evaluating
+  a repair stage on anything but the input it will actually receive in
+  production overstates it.
 
 ## Order & effort
 

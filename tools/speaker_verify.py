@@ -21,6 +21,19 @@ where physics and label confidently disagree:
     Fixes the short-question misattribution class (docs/RELIABILITY_PLAN_
     2026-07.md Phase 2, source 429 [01:06]).
 
+**Admissibility gate (2026-08-07).** Every rule below assumes the mic channel
+can tell host from remote. On recordings made without headphones it cannot:
+the mic hears the loudspeakers, `host_share` saturates near 1.0 on EVERY turn,
+`host_label_but_mic_silent` (needs < 0.15) becomes unreachable, and
+`remote_label_but_mic_dominant` fires on whatever survives the both-share gate
+— host and remote turns alike. On source 767 that turned a 70 %-Matthias
+transcript into a 94 %-Matthias one via 12 flips, all in the same direction,
+including Philipp's answer at [15:39]. So `verify` now measures
+`channel_vad.host_bleed_rate` first and refuses to flip anything when the
+oracle is inadmissible — a transcript with Gemini's own errors is strictly
+better than one with Gemini's errors amplified by a broken oracle. See
+docs/SPEC-speaker-attribution-2026-08-07.md.
+
 Conservatism, because Gemini timestamps are only ±few-seconds accurate and
 ~40-50 % of windows carry overlapped ('both') speech:
 
@@ -208,6 +221,30 @@ def _recompute_speaking_stats(gemini_dict: dict, turns: list[dict]) -> bool:
     return updated
 
 
+def _separation_report(vad) -> Optional[dict]:
+    """Admissibility verdict for `vad`, or None when it cannot be computed.
+
+    Accepts a real `channel_vad.ChannelVAD` (uses its own method) or any
+    object exposing `segments` — test stubs and future VAD implementations
+    included. Returning None means "could not judge", which leaves the legacy
+    behaviour intact rather than silently disabling verification.
+    """
+    if vad is None:
+        return None
+    try:
+        reporter = getattr(vad, "separation_report", None)
+        if callable(reporter):
+            return reporter()
+        segments = getattr(vad, "segments", None)
+        if segments is None:
+            return None
+        from channel_vad import channel_separation_report
+        return channel_separation_report(segments)
+    except Exception as e:  # never block attribution on the self-test itself
+        logger.warning(f"speaker_verify: channel separation probe failed: {e}")
+        return None
+
+
 def verify(gemini_dict: dict, vad) -> dict:
     """Flip confidently-misattributed turns in `gemini_dict` (mutates in place).
 
@@ -230,6 +267,8 @@ def verify(gemini_dict: dict, vad) -> dict:
             "speaking_stats_recomputed": bool,
             "speaking_stats_method": "turn_gap",
             "skipped_no_vad": bool,
+            "channel_separation": {...} | None,
+            "skipped_channel_bleed": bool,
         }
     """
     log: dict = {
@@ -241,6 +280,8 @@ def verify(gemini_dict: dict, vad) -> dict:
         "dominant_remote": None,
         "flip_to_remote_suppressed_multiparty": False,
         "speaking_stats_recomputed": False,
+        "channel_separation": None,
+        "skipped_channel_bleed": False,
         # Recomputed totals measure timestamp-to-timestamp turn gaps (incl.
         # intra-turn silence), not Gemini's speech-time estimates — slightly
         # inflated seconds, but consistent across speakers post-flip.
@@ -250,6 +291,24 @@ def verify(gemini_dict: dict, vad) -> dict:
     transcript = (gemini_dict or {}).get("transcript") or ""
     if vad is None or not transcript:
         log["skipped_no_vad"] = True
+        return log
+
+    # Oracle self-test BEFORE any flip. A mic that hears the loudspeakers
+    # reports maximum confidence for every turn while carrying no information
+    # — the one failure mode these thresholds cannot survive.
+    separation = _separation_report(vad)
+    log["channel_separation"] = separation
+    if separation is not None and not separation.get("admissible", True):
+        log["skipped_channel_bleed"] = True
+        logger.warning(
+            "speaker_verify: channel oracle inadmissible (%s, host_bleed_rate=%s "
+            "> %s) — the mic channel is picking up the remote participants, so "
+            "host_share cannot discriminate. No flips applied; Gemini's own "
+            "labels stand and the semantic coherence gate is the repair path.",
+            separation.get("reason"),
+            separation.get("host_bleed_rate"),
+            separation.get("max_host_bleed_rate"),
+        )
         return log
 
     turns = _parse_turns(transcript)
