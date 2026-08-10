@@ -125,7 +125,7 @@ except ImportError as e:
     _CHANNEL_VAD_IMPORT_ERROR = str(e)
 
 try:
-    from speaker_verify import verify as _verify_speakers
+    from speaker_verify import verify as _verify_speakers, SELF_NAME as _SELF_FULL_NAME
     SPEAKER_VERIFY_AVAILABLE = True
 except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
@@ -1815,15 +1815,26 @@ class TranscribeWatcher:
         # Namesake guard: verification anchors every "Matthias ..." label to
         # the host. If the calendar shows a REMOTE participant also named
         # Matthias, that anchor is wrong for half the labels — skip entirely.
+        # Exact full-name duplicates of the host himself (calendar listing
+        # him twice — 2026-08-10: "Matthias Heim, Matthias Heim, Stefan
+        # Sieber") are NOT this case: calendar_resolve dedupes those before
+        # they reach participant_details, but this stays defensive against
+        # any other path (roster merge, counterpart inference) that could
+        # still hand us a duplicate.
         for att in (cal_match or {}).get("participant_details") or []:
-            name = (att.get("name") or "").strip().lower() if isinstance(att, dict) else ""
-            if (name.split() and name.split()[0] == "matthias"
-                    and (att.get("role") or "").lower() != "self"):
-                self.logger.warning(
-                    f"Speaker verification skipped: remote attendee "
-                    f"{att.get('name')!r} shares the host's first name"
-                )
-                return
+            name = (att.get("name") or "").strip() if isinstance(att, dict) else ""
+            name_lower = name.lower()
+            if not name_lower.split() or name_lower.split()[0] != "matthias":
+                continue
+            if (att.get("role") or "").lower() == "self":
+                continue
+            if name_lower == _SELF_FULL_NAME.lower():
+                continue
+            self.logger.warning(
+                f"Speaker verification skipped: remote attendee "
+                f"{att.get('name')!r} shares the host's first name"
+            )
+            return
         try:
             d = result.parsed_response
             verify_log = _verify_speakers(d, channel_vad)

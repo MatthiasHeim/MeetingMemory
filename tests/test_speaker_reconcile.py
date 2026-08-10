@@ -482,3 +482,81 @@ def test_singleton_collapse_merges_pacing_and_energy_collisions():
         assert stale not in g["speaker_pacing"]
         assert stale not in g["energy_levels"]
         assert not any(e["speaker"] == stale for e in g["speaker_emotions"])
+
+
+# ── participants[] backfill (2026-08-10 binding-gap fix) ───────────────
+#
+# Gemini's own participants[] can come back empty even when the calendar
+# resolved real attendees and the transcript carries real speaker labels
+# (the Stefan-Sieber meeting: "Calendar attendees (3)" logged, a rename
+# applied, but the saved JSON's participants[] stayed [] all the way to
+# the DB). reconcile() must not leave a real meeting's participant list
+# empty when it already has everything it needs to fill it in.
+
+
+def test_backfills_empty_participants_from_transcript_labels():
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Stefan Sieber", "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "[00:00] Stefan Sieber: Hoi.\n"
+            "[00:05] Matthias: Hoi Stefan.\n"
+            "[00:10] Stefan Sieber: Alles klar?\n"
+        ),
+        participants=[],  # Gemini returned no participants for this call
+    )
+    log = reconcile(g, cal)
+    assert log["participants_backfilled"] == 2
+    names_roles = {p["name"]: p["role"] for p in g["participants"]}
+    assert names_roles == {"Matthias": "host", "Stefan Sieber": "participant"}
+
+
+def test_backfill_uses_canonical_names_after_rename():
+    """The seeded list must reflect the SAME rename the transcript itself
+    got — not Gemini's raw (possibly wrong) guess."""
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Ladina Walicki-Kasper", "role": "participant"},
+    ])
+    g = _gem(
+        transcript=(
+            "[00:00] Nadine Maricic: Hallo.\n"
+            "[00:05] Matthias: Hi.\n"
+        ),
+        participants=[],
+    )
+    log = reconcile(g, cal)
+    assert log["participants_backfilled"] == 2
+    names = {p["name"] for p in g["participants"]}
+    assert names == {"Matthias", "Ladina Walicki-Kasper"}
+    assert "Nadine Maricic" not in names
+
+
+def test_backfill_skipped_when_participants_already_present():
+    """SIDE B: an already-populated participants[] must never be
+    clobbered by the backfill path — only a genuinely empty list qualifies."""
+    cal = _cal([
+        {"name": "Matthias Heim", "role": "self"},
+        {"name": "Stefan Sieber", "role": "participant"},
+    ])
+    existing = [{"name": "Stefan Sieber", "role": "participant", "speaking_pct": 60}]
+    g = _gem(
+        transcript="[00:00] Stefan Sieber: Hoi.\n[00:05] Matthias: Hoi.\n",
+        participants=existing,
+    )
+    log = reconcile(g, cal)
+    assert log["participants_backfilled"] == 0
+    assert g["participants"] == existing
+
+
+def test_backfill_skipped_when_no_transcript_labels_either():
+    """No calendar attendee AND nothing to harvest from the transcript ->
+    skipped_no_calendar fires first; nothing to backfill from anyway."""
+    cal = _cal([{"name": "Matthias Heim", "role": "self"}])
+    g = _gem(transcript="", participants=[])
+    log = reconcile(g, cal)
+    assert log["skipped_no_calendar"] is True
+    assert g["participants"] == []
+    assert log["participants_backfilled"] == 0
