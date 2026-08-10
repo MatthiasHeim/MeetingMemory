@@ -125,7 +125,7 @@ except ImportError as e:
     _CHANNEL_VAD_IMPORT_ERROR = str(e)
 
 try:
-    from speaker_verify import verify as _verify_speakers
+    from speaker_verify import verify as _verify_speakers, SELF_NAME as _SELF_FULL_NAME
     SPEAKER_VERIFY_AVAILABLE = True
 except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
@@ -208,6 +208,24 @@ RESCAN_INTERVAL_SEC = 30 * 60
 RESCAN_MAX_ATTEMPTS = 4
 RESCAN_MIN_SPACING_SEC = 30 * 60
 RESCAN_STATE_FILENAME = ".rescan_state.json"
+
+# P1 (docs/../meeting-pipeline-investigation-2026-08-10.md §6): the Telegram
+# ping in _notify_telegram_meeting_captured fires when the fire-and-forget
+# Claude trigger STARTS, not when it succeeds — a session that dies on its
+# first line (expired OAuth, hit the org spend limit, no session quota,
+# untrusted workspace) produced a ~400-byte log and no further signal,
+# indistinguishable from a healthy run in progress. Three meetings sat with
+# zero insights for days in 07.08 because of exactly this. _trigger_claude
+# now watches the child for CLAUDE_STARTUP_FAILFAST_SEC and alerts if its
+# log tail matches one of these known fatal-startup signatures.
+CLAUDE_STARTUP_FAILFAST_SEC = 90
+FATAL_STARTUP_SIGNATURES = (
+    "OAuth session expired",
+    "spend limit",
+    "session limit",
+    "not been trusted",
+    "Failed to authenticate",
+)
 
 
 def _load_rescan_state(path: Path) -> dict:
@@ -1797,15 +1815,26 @@ class TranscribeWatcher:
         # Namesake guard: verification anchors every "Matthias ..." label to
         # the host. If the calendar shows a REMOTE participant also named
         # Matthias, that anchor is wrong for half the labels — skip entirely.
+        # Exact full-name duplicates of the host himself (calendar listing
+        # him twice — 2026-08-10: "Matthias Heim, Matthias Heim, Stefan
+        # Sieber") are NOT this case: calendar_resolve dedupes those before
+        # they reach participant_details, but this stays defensive against
+        # any other path (roster merge, counterpart inference) that could
+        # still hand us a duplicate.
         for att in (cal_match or {}).get("participant_details") or []:
-            name = (att.get("name") or "").strip().lower() if isinstance(att, dict) else ""
-            if (name.split() and name.split()[0] == "matthias"
-                    and (att.get("role") or "").lower() != "self"):
-                self.logger.warning(
-                    f"Speaker verification skipped: remote attendee "
-                    f"{att.get('name')!r} shares the host's first name"
-                )
-                return
+            name = (att.get("name") or "").strip() if isinstance(att, dict) else ""
+            name_lower = name.lower()
+            if not name_lower.split() or name_lower.split()[0] != "matthias":
+                continue
+            if (att.get("role") or "").lower() == "self":
+                continue
+            if name_lower == _SELF_FULL_NAME.lower():
+                continue
+            self.logger.warning(
+                f"Speaker verification skipped: remote attendee "
+                f"{att.get('name')!r} shares the host's first name"
+            )
+            return
         try:
             d = result.parsed_response
             verify_log = _verify_speakers(d, channel_vad)
@@ -2318,8 +2347,97 @@ class TranscribeWatcher:
             if not hasattr(self, '_claude_pids'):
                 self._claude_pids = []
             self._claude_pids.append(proc)
+            threading.Thread(
+                target=self._monitor_claude_startup,
+                args=(proc, log_file, source_id),
+                daemon=True,
+            ).start()
         except Exception as e:
             self.logger.error(f"Failed to trigger Claude: {e}")
+
+    def _monitor_claude_startup(self, proc: subprocess.Popen,
+                                 log_file: Path,
+                                 source_id: Optional[int]) -> None:
+        """Fail-fast feedback for a fire-and-forget headless Claude session.
+
+        Waits up to CLAUDE_STARTUP_FAILFAST_SEC for `proc` to exit. If it
+        exits within that window AND its log matches a known
+        fatal-startup signature (see FATAL_STARTUP_SIGNATURES), alerts
+        with the cause instead of leaving the earlier "running…" Telegram
+        ping standing as the only (misleading) signal. A session still
+        alive after the window is assumed to have started healthily —
+        real /meeting-actions runs take minutes, so this only catches
+        immediate deaths, never flags a slow-but-working session.
+
+        Runs in a daemon thread so it can never block watcher shutdown.
+        Every step is wrapped: a bug in this monitor must never affect
+        transcription itself.
+        """
+        try:
+            try:
+                proc.wait(timeout=CLAUDE_STARTUP_FAILFAST_SEC)
+            except subprocess.TimeoutExpired:
+                return  # still running after the window — assume healthy
+            try:
+                log_tail = log_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                self.logger.warning(
+                    f"Claude startup monitor: could not read {log_file} "
+                    f"after early exit (PID={proc.pid}): {e}"
+                )
+                return
+            matched = next(
+                (sig for sig in FATAL_STARTUP_SIGNATURES if sig in log_tail),
+                None,
+            )
+            if not matched:
+                # Died early but not on a signature we recognize as a
+                # fatal-startup failure — leave it to the regular logs.
+                return
+            self.logger.error(
+                f"Claude session died within {CLAUDE_STARTUP_FAILFAST_SEC}s "
+                f"of starting (PID={proc.pid}, source_id={source_id}, "
+                f"exit={proc.returncode}): {matched!r} — {log_file}"
+            )
+            self._notify_telegram_claude_startup_failure(source_id, matched, log_file)
+        except Exception as e:
+            # Monitoring must never break transcription.
+            self.logger.warning(f"Claude startup monitor failed: {e}")
+
+    def _notify_telegram_claude_startup_failure(self, source_id: Optional[int],
+                                                 cause: str, log_file: Path) -> None:
+        """Alert that a headless Claude session died at startup.
+
+        Distinct from _notify_telegram_meeting_captured, whose "Claude
+        /meeting-actions running…" ping fires when the trigger STARTS —
+        this fires when the child actually DIES within the fail-fast
+        window, naming the cause (OAuth vs quota vs trust) so the fix is
+        obvious from the phone instead of a silent multi-day extraction
+        gap. Best-effort.
+        """
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            self.logger.warning(
+                "telegram_notify.py not found in any known location; "
+                "skipping Claude startup-failure alert"
+            )
+            return
+        msg = (
+            f"🛑 Claude /meeting-actions died at startup (#{source_id})\n"
+            f"Cause: {cause}\n"
+            f"Log: {log_file}\n"
+            f"Insights NOT extracted — re-trigger after fixing auth/quota."
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.logger.info(
+                f"Telegram Claude-startup-failure alert sent for source_id={source_id}"
+            )
+        except Exception as e:
+            self.logger.warning(f"Telegram Claude-startup-failure alert failed: {e}")
 
 
 def main():

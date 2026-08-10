@@ -225,6 +225,8 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         {
             "decisions": [{"gemini_name", "canonical_name", "rule", "evidence"}],
             "rewrote_speakers": int,
+            "collapsed_labels": int,
+            "participants_backfilled": int,
             "skipped_no_calendar": bool,
         }
     """
@@ -232,6 +234,7 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
         "decisions": [],
         "rewrote_speakers": 0,
         "collapsed_labels": 0,
+        "participants_backfilled": 0,
         "skipped_no_calendar": False,
     }
 
@@ -332,6 +335,40 @@ def reconcile(gemini_dict: dict, calendar_resolution: Optional[dict]) -> dict:
                     "drifted label(s) to %r",
                     collapse_count, sole["full"],
                 )
+
+    # Backfill: Gemini's own participants[] came back empty even though we
+    # just resolved real speaker labels — from Gemini's own guesses, or (in
+    # the empty case) harvested straight from the transcript's [MM:SS]
+    # labels above. This module only ever REWRITES existing entries; an
+    # empty list stays empty all the way to sources.participants and every
+    # downstream consumer unless something seeds it (2026-08-10: a
+    # Stefan-Sieber meeting had "Calendar attendees (3)" resolved and a
+    # rename applied, but the saved JSON's participants[] was still [] —
+    # attendees were logged but never bound). Uses the SAME final names
+    # (post-rename/collapse) and Gemini's own {name, role} convention
+    # (short "Matthias" / role "host" for self) so a later speaker_verify
+    # pass can still match these entries by name.
+    if not gemini_dict.get("participants") and gemini_names:
+        seeded: list[dict] = []
+        seen_names: set[str] = set()
+        for g in gemini_names:
+            final = rename.get(g, g)
+            if _is_self_label(final):
+                name, role = SELF_FIRST, "host"
+            else:
+                name, role = final, "participant"
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            seeded.append({"name": name, "role": role})
+        if seeded:
+            gemini_dict["participants"] = seeded
+            log["participants_backfilled"] = len(seeded)
+            logger.info(
+                "speaker_reconcile: backfilled %d participant(s) from "
+                "transcript labels (Gemini's participants[] was empty)",
+                len(seeded),
+            )
 
     if not rename:
         return log

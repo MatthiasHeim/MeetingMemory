@@ -125,6 +125,37 @@ def _humanize_email_local(local: str) -> str:
     return local
 
 
+def _dedupe_attendees(attendees: list[dict]) -> list[dict]:
+    """Collapse duplicate raw calendar attendee entries.
+
+    Google Calendar can list the same person twice on one event (an
+    organizer/attendee split, a delegated alias, ...). Left unhandled, a
+    duplicate host entry survives into participant_details and is then
+    misread by transcribe_watcher's namesake guard as a REMOTE participant
+    sharing the host's first name — which disables speaker verification
+    entirely (2026-08-10: a Stefan-Sieber meeting's raw attendee list was
+    "Matthias Heim, Matthias Heim, Stefan Sieber"). Dedupe by email
+    (case-insensitive) when present, else by exact displayName match
+    (case-insensitive), keeping the first occurrence.
+    """
+    seen_emails: set[str] = set()
+    seen_names: set[str] = set()
+    deduped: list[dict] = []
+    for att in attendees:
+        email = (att.get("email") or "").strip().lower()
+        name = (att.get("displayName") or "").strip().lower()
+        if email:
+            if email in seen_emails:
+                continue
+            seen_emails.add(email)
+        elif name:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+        deduped.append(att)
+    return deduped
+
+
 # ── Calendar query ────────────────────────────────────────────────────
 
 def _gws_calendar_events(time_min: datetime, time_max: datetime) -> list[dict]:
@@ -279,7 +310,7 @@ def resolve(transcript_path: str | Path) -> dict:
     resolutions: list[dict] = []
     derived_company: Optional[str] = None
 
-    attendees = chosen.get("attendees") or []
+    attendees = _dedupe_attendees(chosen.get("attendees") or [])
     if not attendees:
         # Solo event (no attendees listed); still record self.
         pdetails.append({
@@ -291,6 +322,7 @@ def resolve(transcript_path: str | Path) -> dict:
             "confidence": "high", "evidence": "calendar event with no attendees",
         })
     else:
+        self_seen = False
         for att in attendees:
             email = (att.get("email") or "").lower()
             display = att.get("displayName")
@@ -300,8 +332,29 @@ def resolve(transcript_path: str | Path) -> dict:
                 display = _humanize_email_local(email.split("@", 1)[0])
             if not display:
                 continue
-            is_self = email == SELF_EMAIL or att.get("self") is True
+            # Email-based dedup above can't catch a duplicate host entry
+            # that carries a DIFFERENT (or missing) email — e.g. an
+            # organizer alias. An exact full-name match to the host is
+            # treated as the host himself, not a remote namesake, so it
+            # never reaches participant_details as a second "participant".
+            is_self = (
+                email == SELF_EMAIL
+                or att.get("self") is True
+                or display.strip().lower() == SELF_NAME.lower()
+            )
             if is_self:
+                if self_seen:
+                    resolutions.append({
+                        "name": SELF_NAME, "method": "self_duplicate",
+                        "confidence": "high",
+                        "evidence": (
+                            f"duplicate calendar entry for the host "
+                            f"({email or display!r}) — collapsed, not a "
+                            f"second attendee"
+                        ),
+                    })
+                    continue
+                self_seen = True
                 pdetails.append({
                     "name": SELF_NAME, "email": SELF_EMAIL,
                     "company": "Lailix", "role": "self",
