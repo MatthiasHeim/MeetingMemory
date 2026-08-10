@@ -361,3 +361,101 @@ def test_parse_turns_ignores_sentence_fragments():
          "Romont. [01:23] Und es gibt: einen Plan.\n")
     turns = _parse_turns(t)
     assert [x["speaker"] for x in turns] == ["Matthias"]
+
+
+# ── the source-767 fix: refuse to flip on a bleeding mic (2026-08-07) ─────
+#
+# Two-sided on purpose. A guard that suppresses flips is indistinguishable
+# from a guard that suppresses EVERYTHING unless something also proves the
+# working path still works — so each test below has its clean-oracle mirror.
+
+
+def _bleeding_vad(duration=1200.0):
+    """A mic that hears the loudspeakers: nearly all remote speech reads as
+    'both' (source 767 measured host_bleed_rate 0.71)."""
+    return StubVAD(
+        [(0.0, 100.0, 'remote'),
+         (100.0, 700.0, 'both'),
+         (700.0, duration, 'host')],
+        duration_sec=duration,
+    )
+
+
+def _clean_vad(duration=1200.0):
+    """Headphones: overlap is confined to genuine backchannel."""
+    return StubVAD(
+        [(0.0, 600.0, 'remote'),
+         (600.0, 660.0, 'both'),
+         (660.0, duration, 'host')],
+        duration_sec=duration,
+    )
+
+
+REMOTE_LABEL_OVER_HOST_SPAN = (
+    "[00:00] Speaker 2: Kurzer Einstieg.\n"
+    "[11:40] Speaker 2: Also ich gseh das so, mir sölled da dranblibe und "
+    "d'Lösung für d'Ärzt würklich verfügbar mache.\n"
+    "[15:00] Matthias: Guet.\n"
+)
+
+
+def test_flip_still_fires_when_the_channels_are_separated():
+    """SIDE A — the clean case is untouched by the guard. A turn voiced on
+    the mic channel while the remote is silent still flips to Matthias."""
+    g = _gem(REMOTE_LABEL_OVER_HOST_SPAN)
+    log = verify(g, _clean_vad())
+    assert log["skipped_channel_bleed"] is False
+    assert log["channel_separation"]["admissible"] is True
+    assert len(log["flips"]) == 1
+    assert log["flips"][0]["to"] == "Matthias"
+    assert "[11:40] Matthias:" in g["transcript"]
+
+
+def test_no_flips_when_the_mic_hears_the_remote():
+    """SIDE B — the same transcript and the same apparent host_share, but the
+    oracle is bleeding: nothing may be flipped and the transcript is
+    byte-identical. This is the source-767 defect."""
+    g = _gem(REMOTE_LABEL_OVER_HOST_SPAN)
+    before = g["transcript"]
+    log = verify(g, _bleeding_vad())
+    assert log["skipped_channel_bleed"] is True
+    assert log["channel_separation"]["admissible"] is False
+    assert log["channel_separation"]["reason"] == "mic_hears_remote"
+    assert log["flips"] == []
+    assert g["transcript"] == before
+
+
+def test_bleed_guard_reports_the_measurement_it_refused_on():
+    """The verdict has to be auditable — a silent skip is how the pipeline
+    got here. The measured rate and the threshold both land in the log."""
+    g = _gem(REMOTE_LABEL_OVER_HOST_SPAN)
+    log = verify(g, _bleeding_vad())
+    sep = log["channel_separation"]
+    assert sep["host_bleed_rate"] > sep["max_host_bleed_rate"]
+    assert sep["both_sec"] == 600.0
+    assert sep["remote_only_sec"] == 100.0
+
+
+def test_bleed_guard_does_not_suppress_the_reverse_flip_direction():
+    """A clean oracle must still be able to flip host->remote. If the guard
+    ever made that unreachable it would recreate the one-directional
+    behaviour that caused the damage in the first place."""
+    g = _gem(
+        "[00:00] Matthias: Einleitung.\n"
+        "[00:30] Matthias: Also bi üs im Team mache mir das jede Monet so, "
+        "mir bündled alles i es Release-Päckli.\n"
+        "[10:30] Speaker 2: Danke.\n"
+        "[10:40] Matthias: Guet.\n"
+    )
+    vad = StubVAD(
+        [(0.0, 30.0, 'host'),
+         (30.0, 630.0, 'remote'),      # the [00:30] turn: mic silent
+         (630.0, 700.0, 'both'),
+         (700.0, 1200.0, 'host')],
+        duration_sec=1200.0,
+    )
+    log = verify(g, vad)
+    assert log["channel_separation"]["admissible"] is True
+    assert len(log["flips"]) == 1
+    assert log["flips"][0]["rule"] == "host_label_but_mic_silent"
+    assert log["flips"][0]["to"] == "Speaker 2" or log["flips"][0]["to"]

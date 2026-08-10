@@ -2,11 +2,25 @@
 """channel_vad — channel-based voice activity detection for hybrid recordings.
 
 MeetingRecorder writes 3-channel WAVs: channel 0 is the host's (Matthias's)
-microphone, channels 1+2 are system audio (remote participants). With
-headphones/AEC the channels are cleanly separated (measured sample-level
-correlation ≈ 0.000), so the mic channel is a physical-layer oracle for
-"is the host speaking right now" — far more reliable than Gemini's
-voice-based diarization, which flips speakers on similar voices.
+microphone, channels 1+2 are system audio (remote participants). *When the
+host wears headphones* the channels are acoustically separated and the mic
+channel is a physical-layer oracle for "is the host speaking right now" — far
+more reliable than Gemini's voice-based diarization, which flips speakers on
+similar voices.
+
+**That precondition is not automatic and must be measured (2026-08-07).** The
+original evidence for separation was a sample-level correlation of ≈ 0.000
+between the mic and system channels. That statistic cannot detect acoustic
+bleed: coupling through the room delays and filters the loudspeaker signal, so
+a mic that plainly hears the remote participants still correlates ≈ 0
+sample-wise. Measured across the last 8 recordings, remote speech raises the
+mic channel by +3.3 to +15.9 dB and the mic reads "active" during 36-80 % of
+remote-active speech. On such recordings `host_share` saturates near 1.0 for
+every turn, the oracle carries no information, and anything trusting it
+(the Gemini prompt map, `speaker_verify`) systematically relabels the remote
+participant as the host. Use `host_bleed_rate` / `is_admissible` to gate every
+attribution use of this signal; see
+docs/SPEC-speaker-attribution-2026-08-07.md.
 
 This module computes per-channel voice activity:
 
@@ -60,6 +74,14 @@ MIN_ANCHOR_WINDOWS = 40     # ≥10 s of host-only speech needed to trust anchor
 BRIDGE_GAP_SEC = 1.0        # same-label runs separated by less than this merge
 MIN_MAP_SPAN_SEC = 2.0      # textual map: spans shorter than this get absorbed
 
+# Above this bleed rate the mic channel is NOT a host/remote discriminator and
+# must not be used for attribution — see `host_bleed_rate` and
+# docs/SPEC-speaker-attribution-2026-08-07.md. 0.35 sits well above genuine
+# 1:1 backchannel/crosstalk (~0.10-0.20) and well below every bleeding
+# recording measured on 2026-08-07 (0.36-0.80 across the last 8 recordings).
+MAX_HOST_BLEED_RATE = 0.35
+MIN_BLEED_SAMPLE_SEC = 60.0  # need this much remote-active speech to judge
+
 
 def _fmt_ts(seconds: float) -> str:
     """Format seconds as MM:SS, or HH:MM:SS past the hour."""
@@ -84,6 +106,85 @@ def slice_segments(segments: list[tuple[float, float, str]],
         if e - s > 0:
             out.append((s - start, e - start, label))
     return out
+
+
+def host_bleed_rate(segments: list[tuple[float, float, str]]) -> Optional[float]:
+    """Fraction of remote-active speech time on which the mic ALSO reads active.
+
+    `both / (remote_only + both)`, i.e. P(mic active | remote speaking). This
+    is the self-test the channel oracle never had. The isolation evidence in
+    this module's docstring — sample-level correlation ≈ 0.000 — cannot detect
+    acoustic bleed at all: room coupling delays and filters the speaker signal,
+    so a mic that plainly hears the speakers still correlates ≈ 0 sample-wise.
+    Envelope coupling is what survives, and this ratio measures its
+    consequence directly.
+
+    With headphones the mic only reads active alongside the remote during real
+    crosstalk and backchannel ("mhm", "ja") — roughly 0.10-0.20 in a 1:1 call.
+    With open speakers the mic hears every remote word, the ratio climbs past
+    0.5, and `host_share` saturates near 1.0 for EVERY turn regardless of who
+    actually spoke. At that point the oracle carries no information, yet
+    `speaker_verify`'s thresholds still read it as maximum confidence — so it
+    flips remote turns onto the host and can never flip back (the reverse rule
+    needs host_share < 0.15, which such a recording never produces).
+
+    Returns None when there is too little remote speech to judge (< 60 s):
+    callers should treat that as "unknown", not as "clean".
+    """
+    remote_only = both = 0.0
+    for t0, t1, label in segments or []:
+        dur = max(0.0, t1 - t0)
+        if label == 'remote':
+            remote_only += dur
+        elif label == 'both':
+            both += dur
+    remote_active = remote_only + both
+    if remote_active < MIN_BLEED_SAMPLE_SEC:
+        return None
+    return both / remote_active
+
+
+def channel_separation_report(segments: list[tuple[float, float, str]]) -> dict:
+    """Forensic admissibility verdict for a channel-VAD segment list.
+
+    `admissible` False means: do not use this recording's mic channel for
+    speaker attribution (neither as a Gemini prompt "ground truth" map nor as
+    a `speaker_verify` flip oracle). Recorded into `_meta` so a later audit can
+    tell an attribution that was never channel-verified apart from one that
+    was verified against a working oracle.
+    """
+    rate = host_bleed_rate(segments)
+    host_only = sum(max(0.0, t1 - t0) for t0, t1, l in segments or []
+                    if l == 'host')
+    remote_only = sum(max(0.0, t1 - t0) for t0, t1, l in segments or []
+                      if l == 'remote')
+    both = sum(max(0.0, t1 - t0) for t0, t1, l in segments or []
+               if l == 'both')
+    if rate is None:
+        # Too little remote speech to measure bleed. Do NOT block on this:
+        # the defect we are gating is positively-measured bleed, and a
+        # recording with almost no remote speech has almost no remote speech
+        # to misattribute. The "3-channel file with everyone on ch0" case —
+        # where this reasoning would fail — is already caught upstream by
+        # `classify_source_topology` in compute_channel_vad. Recorded so an
+        # audit can tell a measured-clean oracle from an unmeasured one.
+        reason = "insufficient_remote_speech"
+        admissible = True
+    elif rate > MAX_HOST_BLEED_RATE:
+        reason = "mic_hears_remote"
+        admissible = False
+    else:
+        reason = "ok"
+        admissible = True
+    return {
+        "admissible": admissible,
+        "reason": reason,
+        "host_bleed_rate": None if rate is None else round(rate, 3),
+        "max_host_bleed_rate": MAX_HOST_BLEED_RATE,
+        "host_only_sec": round(host_only, 1),
+        "remote_only_sec": round(remote_only, 1),
+        "both_sec": round(both, 1),
+    }
 
 
 def render_map_text(segments: list[tuple[float, float, str]],
@@ -179,6 +280,22 @@ class ChannelVAD:
     def map_text(self) -> str:
         """Compact textual host-speaking map for prompt injection."""
         return render_map_text(self.segments)
+
+    def host_bleed_rate(self) -> Optional[float]:
+        """P(mic active | remote speaking) — see module-level function."""
+        return host_bleed_rate(self.segments)
+
+    def separation_report(self) -> dict:
+        """Admissibility verdict for using this VAD to attribute speakers."""
+        return channel_separation_report(self.segments)
+
+    def is_admissible(self) -> bool:
+        """True when the mic channel actually discriminates host vs remote.
+
+        False for recordings made on open speakers, where the mic hears the
+        remote participants and every `host_share` saturates near 1.0.
+        """
+        return bool(self.separation_report()["admissible"])
 
 
 def _channel_count(wav_path: Path) -> int:

@@ -131,6 +131,20 @@ except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
     _SPEAKER_VERIFY_IMPORT_ERROR = str(e)
 
+# Semantic speaker-coherence gate: the repair path for the (common) case where
+# the mic channel bleeds and channel attribution is inadmissible. Runs after
+# transcription and BEFORE the JSON write, so no insight is ever extracted
+# from an unaudited attribution.
+try:
+    from speaker_coherence import (
+        check_and_repair as _coherence_repair,
+        claude_cli_runner as _coherence_cli_runner,
+    )
+    SPEAKER_COHERENCE_AVAILABLE = True
+except ImportError as e:
+    SPEAKER_COHERENCE_AVAILABLE = False
+    _SPEAKER_COHERENCE_IMPORT_ERROR = str(e)
+
 # Import transcript_validator for the coverage/completeness gate (see
 # docs/RELIABILITY_PLAN_2026-07.md Phase 1) that runs on every Gemini result
 # before it's written to disk. Unavailable is treated as "cannot validate" —
@@ -1080,6 +1094,16 @@ class TranscribeWatcher:
                 # None for mono/stereo/non-genuine recordings.
                 channel_vad = self._compute_channel_vad_safe(audio_file)
 
+            # One admissibility verdict, applied to every consumer of the mic
+            # channel: the Gemini prompt map, pyannote host-cluster fusion and
+            # speaker_verify. A bleeding mic must not reach any of them.
+            channel_separation = (
+                channel_vad.separation_report() if channel_vad else None
+            )
+            channel_admissible = bool(
+                channel_separation and channel_separation.get("admissible")
+            )
+
             diarization_segments = None
             diarization_cfg = self.config.get("diarization", {}) or {}
             diarization_enabled = diarization_cfg.get("enabled", True)
@@ -1098,6 +1122,7 @@ class TranscribeWatcher:
                     if (
                         diarization_segments
                         and channel_fusion
+                        and channel_admissible
                         and topology
                         and topology.topology == TOPOLOGY_MULTI_SOURCE_GENUINE
                     ):
@@ -1113,7 +1138,10 @@ class TranscribeWatcher:
 
             # Step 3: Process with Gemini (attendees + channel map injected)
             self.logger.info("Sending to Gemini API...")
-            channel_segments = channel_vad.segments if channel_vad else None
+            channel_segments = (
+                channel_vad.segments if (channel_vad and channel_admissible)
+                else None
+            )
             result = self.gemini_processor.process_audio(
                 mp3_path, known_attendees=known_attendees or None,
                 channel_segments=channel_segments,
@@ -1182,6 +1210,21 @@ class TranscribeWatcher:
             # transcript label confidently contradicts the mic-channel
             # ground truth (see speaker_verify module docstring).
             self._verify_speakers_inplace(result, channel_vad, cal_match)
+
+            # Step 4b3: Semantic speaker-coherence gate. The acoustic stages
+            # above can only ask whose microphone was hot — and on a bleeding
+            # recording (the common case, see the separation report) they are
+            # skipped entirely. This asks whether the labels make SENSE: who
+            # answers a question didn't ask it, who says "we" about the client
+            # company works there. Runs BEFORE the JSON write, so the repaired
+            # transcript is what reaches sources.content_text and every
+            # insight, wiki page and prep doc built from it.
+            self._coherence_repair_inplace(
+                result, audio_file, known_attendees or None, cal_match
+            )
+
+            # Provenance: whether attribution was channel-verified at all.
+            result.channel_separation = channel_separation
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
             with open(json_path, 'w', encoding='utf-8') as f:
@@ -1710,10 +1753,28 @@ class TranscribeWatcher:
             self.logger.warning(f"channel_vad failed for {audio_file.name}: {e}")
             return None
         if vad is not None:
+            report = vad.separation_report()
             self.logger.info(
                 f"Channel VAD: {len(vad.segments)} segments over "
-                f"{vad.duration_sec / 60:.1f} min"
+                f"{vad.duration_sec / 60:.1f} min "
+                f"(host_bleed_rate={report.get('host_bleed_rate')}, "
+                f"admissible={report.get('admissible')})"
             )
+            if not report.get("admissible"):
+                # 2026-08-07: the mic hears the loudspeakers on most of our
+                # recordings, so its host/remote spans are noise dressed as
+                # certainty. Everything downstream that would treat them as
+                # ground truth is disabled for this recording; semantic
+                # coherence repair is the attribution path instead.
+                self.logger.warning(
+                    f"Channel attribution DISABLED for {audio_file.name}: "
+                    f"{report.get('reason')} "
+                    f"(host_bleed_rate={report.get('host_bleed_rate')} > "
+                    f"{report.get('max_host_bleed_rate')}). The host mic is "
+                    f"picking up the remote participants — wear headphones to "
+                    f"restore channel separation. "
+                    f"See docs/SPEC-speaker-attribution-2026-08-07.md."
+                )
         return vad
 
     def _verify_speakers_inplace(self, result, channel_vad,
@@ -1770,6 +1831,111 @@ class TranscribeWatcher:
                 )
         except Exception as e:
             self.logger.warning(f"Speaker verification failed: {e}")
+
+    def _notify_telegram_coherence_unverified(self, audio_file: Path,
+                                              reason: str) -> None:
+        """Alert that a transcript was stored with UNVERIFIED speaker labels.
+
+        Not a transcription failure — the meeting is captured — but the
+        attribution behind every downstream insight was never checked, so it
+        must not pass silently (the whole point of this stage).
+        """
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            return
+        msg = (
+            f"⚠️ Speaker attribution UNVERIFIED\n"
+            f"{audio_file.name}\n"
+            f"Coherence audit did not run: {reason}\n"
+            f"Transcript stored; labels may be wrong. Re-run "
+            f"tools/speaker_coherence.py over the JSON to repair."
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            self.logger.warning(f"Telegram coherence alert failed: {e}")
+
+    def _coherence_repair_inplace(self, result, audio_file: Path,
+                                  known_attendees: Optional[list],
+                                  cal_match: Optional[dict]) -> None:
+        """Semantic speaker-attribution audit + repair before anything reads it.
+
+        Mutates the GeminiResult so the JSON write, the InsightBase seed
+        (sources.content_text) and every downstream insight see the repaired
+        labels. Best-effort by construction: a failed audit leaves the
+        transcript exactly as it was and says so in the log — but it says so
+        LOUDLY, because an unaudited transcript on a bleeding recording has no
+        attribution guarantee at all.
+        """
+        cfg = self.config.get("speaker_coherence", {}) or {}
+        if not cfg.get("enabled", True):
+            self.logger.info("speaker_coherence disabled in config; skipping")
+            return
+        if not SPEAKER_COHERENCE_AVAILABLE:
+            self.logger.warning(
+                f"speaker_coherence unavailable; speaker attribution NOT "
+                f"semantically verified ({_SPEAKER_COHERENCE_IMPORT_ERROR})"
+            )
+            return
+        try:
+            claude_cfg = self.config.get("claude_trigger", {}) or {}
+            runner = _coherence_cli_runner(
+                claude_path=cfg.get("claude_path")
+                or claude_cfg.get("claude_path",
+                                  "/Users/Matthias/.local/bin/claude"),
+                config_dir=(str(expand_path(cfg.get("config_dir")))
+                            if cfg.get("config_dir")
+                            else (str(expand_path(claude_cfg["config_dir"]))
+                                  if claude_cfg.get("config_dir") else None)),
+                timeout=int(cfg.get("timeout", 900)),
+                model=cfg.get("model"),
+            )
+            d = result.parsed_response
+            log = _coherence_repair(
+                d, known_attendees=known_attendees, runner=runner,
+                max_parallel=int(cfg.get("max_parallel", 3)),
+            )
+            result.transcript = d.get("transcript") or result.transcript
+            result.participants = d.get("participants") or result.participants
+            result.speaker_coherence_log = log
+            if cal_match is not None:
+                prl = cal_match.setdefault("participant_resolution_log", {})
+                prl["speaker_coherence"] = log
+
+            if not log.get("ok") or log.get("failed_windows"):
+                # Either nothing was audited, or some windows were not — both
+                # leave regions of the transcript with unchecked attribution,
+                # and both must surface rather than read as success.
+                self.logger.error(
+                    f"Speaker coherence incomplete ({log.get('error')}) "
+                    f"— attribution for this meeting is unverified"
+                )
+                self._notify_telegram_coherence_unverified(
+                    audio_file, str(log.get("error"))
+                )
+            elif log.get("refused_runaway"):
+                self.logger.error(
+                    "Speaker coherence REFUSED a runaway relabel set — "
+                    "transcript unchanged, attribution unverified"
+                )
+            elif log.get("changed"):
+                self.logger.info(
+                    "Speaker coherence repaired %d line(s), bound %d "
+                    "identity/identities; %d region(s) left low-confidence",
+                    len(log.get("relabels_applied") or []),
+                    len(log.get("identity_bindings") or []),
+                    len(log.get("uncertain_regions") or []),
+                )
+            else:
+                self.logger.info(
+                    "Speaker coherence: attribution coherent over %d lines",
+                    log.get("lines_total", 0),
+                )
+        except Exception as e:
+            self.logger.warning(f"Speaker coherence repair failed: {e}")
 
     def _persist_calendar(self, source_id: Optional[int],
                             cal_match: Optional[dict]) -> None:

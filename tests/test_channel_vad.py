@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from channel_vad import (  # noqa: E402
     FFMPEG_PATH,
+    channel_separation_report,
     compute_channel_vad,
+    host_bleed_rate,
     render_map_text,
     slice_segments,
 )
@@ -290,3 +292,60 @@ def test_render_map_text_hour_format():
 
 def test_render_map_text_empty():
     assert render_map_text([]) == ""
+
+
+# ── bleed self-test: is the mic channel an oracle at all? (2026-08-07) ────
+
+
+def test_host_bleed_rate_low_when_channels_are_isolated():
+    """Headphones: the mic only overlaps the remote during real backchannel."""
+    segments = [
+        (0.0, 300.0, 'remote'),
+        (300.0, 330.0, 'both'),     # 30 s of "mhm" over 330 s of remote speech
+        (330.0, 600.0, 'host'),
+    ]
+    rate = host_bleed_rate(segments)
+    assert rate is not None and abs(rate - 30.0 / 330.0) < 1e-9
+    report = channel_separation_report(segments)
+    assert report["admissible"] is True
+    assert report["reason"] == "ok"
+
+
+def test_host_bleed_rate_high_when_mic_hears_the_speakers():
+    """Open speakers: the mic reads active through most of the remote's turns.
+
+    This is source 767 (2026-08-07, measured 0.71): `host_share` then sits
+    above the flip threshold for every turn regardless of who spoke.
+    """
+    segments = [
+        (0.0, 100.0, 'remote'),
+        (100.0, 400.0, 'both'),
+        (400.0, 600.0, 'host'),
+    ]
+    rate = host_bleed_rate(segments)
+    assert rate is not None and rate > 0.7
+    report = channel_separation_report(segments)
+    assert report["admissible"] is False
+    assert report["reason"] == "mic_hears_remote"
+    assert report["host_bleed_rate"] == 0.75
+
+
+def test_bleed_rate_unmeasurable_without_enough_remote_speech():
+    """Under a minute of remote speech cannot support the ratio — report it
+    as unmeasured, but do NOT withdraw the oracle: the recordings this
+    describes have almost no remote speech to misattribute, and the
+    everyone-on-ch0 case is caught upstream by the topology probe."""
+    segments = [(0.0, 20.0, 'remote'), (20.0, 600.0, 'host')]
+    assert host_bleed_rate(segments) is None
+    report = channel_separation_report(segments)
+    assert report["reason"] == "insufficient_remote_speech"
+    assert report["admissible"] is True
+
+
+def test_separation_report_accounts_for_all_speech():
+    segments = [(0.0, 100.0, 'host'), (100.0, 300.0, 'remote'),
+                (300.0, 360.0, 'both')]
+    report = channel_separation_report(segments)
+    assert report["host_only_sec"] == 100.0
+    assert report["remote_only_sec"] == 200.0
+    assert report["both_sec"] == 60.0
