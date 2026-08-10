@@ -3,7 +3,8 @@
 neon_insert — programmatic InsightBase source insertion for MeetingMemory.
 
 Creates a 'sources' row in the InsightBase Neon DB (project
-`bitter-waterfall-54453207`, database `neondb`) immediately after
+`solitary-brook-40370942` / insightbase-eu, database `neondb`, configured
+via the INSIGHTBASE_DATABASE_URL env var) immediately after
 transcription completes, BEFORE the Claude-driven `/meeting-actions`
 pipeline runs. This guarantees a persistent record of the meeting even
 if downstream processing fails.
@@ -151,8 +152,8 @@ def _get_conn():
     if not dsn:
         raise RuntimeError(
             'INSIGHTBASE_DATABASE_URL is not set. Add it to '
-            'MeetingMemory/.env (Neon project bitter-waterfall-54453207, '
-            'database neondb).'
+            'MeetingMemory/.env (Neon project solitary-brook-40370942 / '
+            'insightbase-eu, database neondb).'
         )
     return psycopg2.connect(dsn, connect_timeout=CONNECT_TIMEOUT)
 

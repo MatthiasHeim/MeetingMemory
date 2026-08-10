@@ -2108,6 +2108,37 @@ class TranscribeWatcher:
         env = os.environ.copy()
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin"
 
+        # Quota isolation (2026-07-10 incident). Claude Code rate-limit/quota is
+        # keyed by CLAUDE_CONFIG_DIR (Brain memory reference_claude_multiaccount_auth,
+        # Option A: each config dir = its own credential + login + quota pool).
+        # Without isolation these fire-and-forget headless meeting-actions
+        # sessions compete with interactive usage for one shared pool — and on
+        # 2026-07-10 that competition starved every session into a
+        # "You've hit your session limit" death on its first line, silently
+        # dropping all downstream actions (Linear tasks, follow-up emails, …).
+        #
+        # Give the automation its OWN config dir. Resolution order:
+        #   1. claude_trigger.config_dir in config.yaml (preferred)
+        #   2. an inherited CLAUDE_CONFIG_DIR (e.g. set in the watcher's plist)
+        #   3. none → share the default pool (legacy behaviour), with a warning
+        # ONE-TIME setup for the isolated dir (it needs its own login):
+        #   CLAUDE_CONFIG_DIR=<dir> claude    # then run /login in that session
+        # See tools/CLAUDE_QUOTA_ISOLATION.md.
+        config_dir = claude_config.get('config_dir') or env.get('CLAUDE_CONFIG_DIR')
+        if config_dir:
+            config_dir = str(expand_path(config_dir))
+            env["CLAUDE_CONFIG_DIR"] = config_dir
+            self.logger.info(
+                f"Claude session quota-isolated via CLAUDE_CONFIG_DIR={config_dir}"
+            )
+        else:
+            self.logger.warning(
+                "claude_trigger.config_dir not set and no CLAUDE_CONFIG_DIR in env "
+                "— headless session shares the default Claude quota pool (no "
+                "isolation). A burst of interactive usage can starve it into a "
+                "session-limit death. See tools/CLAUDE_QUOTA_ISOLATION.md."
+            )
+
         try:
             with open(log_file, 'w') as lf:
                 proc = subprocess.Popen(

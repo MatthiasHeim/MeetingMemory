@@ -7,8 +7,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/Matthias/Desktop/Repos/MeetingMemory/venv/bin/python</string>
-        <string>/Users/Matthias/Desktop/Repos/MeetingMemory/tools/transcribe_watcher.py</string>
+        <string>/Users/Matthias/Repos/MeetingMemory/venv/bin/python</string>
+        <string>/Users/Matthias/Repos/MeetingMemory/tools/transcribe_watcher.py</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -39,21 +39,34 @@
     <string>/Users/Matthias/Library/Logs/MeetingRecorder/watcher_stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/Matthias/Desktop/Repos/MeetingMemory</string>
+    <string>/Users/Matthias/Repos/MeetingMemory</string>
 
     <!-- Deliberately a background daemon (NO LimitLoadToSessionType=Aqua).
-         The interpreter lives under the TCC-protected ~/Desktop; in an Aqua
-         (GUI-session) agent, Python's startup open() of the venv triggers a
-         blocking TCC consent prompt and the process hangs forever in
-         getpath_readlines. A non-Aqua daemon is granted that access silently
-         and runs fine (verified 2026-05-30). FSEvents + ~/Documents data access
-         work fine from a daemon; only launchd's std-io redirect needed moving
-         out of ~/Documents (see StandardOutPath above). -->
+         Historically the interpreter lived under the TCC-protected ~/Desktop;
+         in an Aqua (GUI-session) agent, Python's startup open() of the venv
+         triggered a blocking TCC consent prompt and the process hung forever
+         in getpath_readlines. A non-Aqua daemon is granted that access silently
+         and runs fine (verified 2026-05-30). The repo/venv now live under
+         ~/Repos/MeetingMemory (paths below), but the non-Aqua daemon choice is
+         kept. FSEvents + ~/Documents data access work fine from a daemon; only
+         launchd's std-io redirect needed moving out of ~/Documents (see
+         StandardOutPath above). -->
 
+    <!-- Quota isolation (2026-07-10 incident): the fire-and-forget headless
+         `claude -p /meeting-actions` sessions this watcher spawns get their OWN
+         Claude quota pool via CLAUDE_CONFIG_DIR, so automation stops competing
+         with interactive usage for one shared pool (which is what starved every
+         session into a "session limit" death, silently dropping all downstream
+         actions). Quota is keyed by CLAUDE_CONFIG_DIR. The watcher forwards this
+         to the child session (see transcribe_watcher._trigger_claude).
+         ONE-TIME: `CLAUDE_CONFIG_DIR=/Users/Matthias/.claude-automation claude`
+         then run /login there. See tools/CLAUDE_QUOTA_ISOLATION.md. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin</string>
+        <key>CLAUDE_CONFIG_DIR</key>
+        <string>/Users/Matthias/.claude-automation</string>
     </dict>
 
     <!-- Minimum seconds between (re)launches. Was 10s, which let a fast-failing

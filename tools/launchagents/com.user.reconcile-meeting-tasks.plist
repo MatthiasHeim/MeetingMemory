@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.reconcile-meeting-tasks</string>
+
+    <!-- DETERMINISTIC job (pure Python, NO `claude -p`): gap-fills missing
+         Linear tasks for meetings whose fire-and-forget /meeting-actions
+         session died (e.g. the 2026-07-10 session-limit incident). Because it
+         never starts a Claude session it can never hit a session limit — that
+         is the whole point. See tools/reconcile_meeting_tasks.py. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Matthias/Repos/MeetingMemory/venv/bin/python</string>
+        <string>/Users/Matthias/Repos/MeetingMemory/tools/reconcile_meeting_tasks.py</string>
+        <string>--window-hours</string>
+        <string>48</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Matthias/Repos/MeetingMemory</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Runs twice a day:
+         18:30 — ~30 min after transcript-sync (18:00), catching same-day meetings.
+         03:00 — nightly safety net for late/failed evenings (48h window covers it). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Logs live in ~/Library/Logs (NOT the TCC-protected ~/Documents) — same
+         lesson as the watcher plist: launchd cannot open std-io files inside
+         ~/Documents, which caused the exit-78 crash loop there. -->
+    <key>StandardOutPath</key>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/reconcile-meeting-tasks.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/reconcile-meeting-tasks.error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin</string>
+    </dict>
+</dict>
+</plist>
