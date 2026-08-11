@@ -70,6 +70,7 @@ try:
         TOPOLOGY_SINGLE_SOURCE,
         classify_source_topology,
         convert_for_gemini,
+        convert_for_gemini_ducked,
         detect_active_channels,
         get_audio_duration,
     )
@@ -1050,33 +1051,16 @@ class TranscribeWatcher:
         start_time = time.time()
 
         try:
-            # Step 1: Convert WAV to MP3 (extracts mic channel)
-            self.logger.info("Converting WAV to MP3...")
-            mp3_path = convert_for_gemini(audio_file, output_dir=self.transcripts_dir)
-            self.logger.info(f"Converted to: {mp3_path.name} ({mp3_path.stat().st_size / 1024 / 1024:.1f} MB)")
+            # Step 1: JSON output path used downstream (and as the source of
+            # truth for calendar timestamp parsing — filename-derived).
+            # Built from audio_file's stem directly rather than from the
+            # eventual mp3_path: conversion (Step 3 below) now runs AFTER
+            # channel VAD because it needs the VAD to pick ducked vs. legacy
+            # pre-mix, but nothing before that point needs the converted
+            # bytes, only this path.
+            json_path = self.transcripts_dir / f"{audio_file.stem}.json"
 
-            # Step 2: Get audio duration
-            audio_duration = get_audio_duration(mp3_path)
-            self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
-
-            # Route long recordings to the reliable model (see __init__).
-            _routed_model = (
-                self._gemini_model_long
-                if audio_duration / 60 > self._gemini_long_min
-                else self._gemini_model_short
-            )
-            if _routed_model != self.gemini_processor.model:
-                self.logger.info(
-                    f"Model routing: {audio_duration / 60:.1f}min -> {_routed_model} "
-                    f"(was {self.gemini_processor.model})"
-                )
-                self.gemini_processor.model = _routed_model
-
-            # Step 2b: JSON output path used downstream (and as the source
-            # of truth for calendar timestamp parsing — filename-derived).
-            json_path = mp3_path.with_suffix('.json')
-
-            # Step 2c: Resolve calendar attendees BEFORE the Gemini call.
+            # Step 1b: Resolve calendar attendees BEFORE the Gemini call.
             # Two reasons:
             #   1. Pass attendees into Gemini so it doesn't guess names —
             #      this prevents the cross-chunk drift that produced bogus
@@ -1097,7 +1081,7 @@ class TranscribeWatcher:
                     f"{', '.join(a.get('name', '?') for a in known_attendees)}"
                 )
 
-            # Step 2d: Classify source topology from the ORIGINAL WAV. Channel
+            # Step 2: Classify source topology from the ORIGINAL WAV. Channel
             # count alone is unsafe: in-room recordings can be 3-channel files
             # with only ch0 active. In that topology, channel_vad MUST stay
             # None for both prompt injection and speaker verification.
@@ -1111,21 +1095,51 @@ class TranscribeWatcher:
                     "disabling channel VAD and speaker verification"
                 )
             else:
-                # Channel VAD from the ORIGINAL 3-channel WAV (the MP3 is
-                # already mixed mono). Gives Gemini a ground-truth host/remote
+                # Channel VAD from the ORIGINAL 3-channel WAV — must run
+                # BEFORE conversion now (Step 3), which needs it to choose
+                # the pre-mix. Also gives Gemini a ground-truth host/remote
                 # speaking map and feeds post-transcription verification.
                 # None for mono/stereo/non-genuine recordings.
                 channel_vad = self._compute_channel_vad_safe(audio_file)
 
             # One admissibility verdict, applied to every consumer of the mic
-            # channel: the Gemini prompt map, pyannote host-cluster fusion and
-            # speaker_verify. A bleeding mic must not reach any of them.
+            # channel: the pre-mix choice below, the Gemini prompt map,
+            # pyannote host-cluster fusion and speaker_verify. A bleeding mic
+            # must not reach any of them at full, undecked weight.
             channel_separation = (
                 channel_vad.separation_report() if channel_vad else None
             )
             channel_admissible = bool(
                 channel_separation and channel_separation.get("admissible")
             )
+
+            # Step 2b: Convert WAV to MP3. Ducked pre-mix (attenuates ch0
+            # while ch1/ch2 are active) when the mic channel is confirmed
+            # bleeding; legacy equal-weight mix otherwise — byte-for-byte
+            # unchanged for clean/headphone recordings and non-hybrid
+            # layouts. See _convert_for_gemini_routed / convert_for_gemini_ducked.
+            self.logger.info("Converting WAV to MP3...")
+            mp3_path = self._convert_for_gemini_routed(
+                audio_file, channel_vad, channel_admissible
+            )
+            self.logger.info(f"Converted to: {mp3_path.name} ({mp3_path.stat().st_size / 1024 / 1024:.1f} MB)")
+
+            # Step 2c: Get audio duration
+            audio_duration = get_audio_duration(mp3_path)
+            self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
+
+            # Route long recordings to the reliable model (see __init__).
+            _routed_model = (
+                self._gemini_model_long
+                if audio_duration / 60 > self._gemini_long_min
+                else self._gemini_model_short
+            )
+            if _routed_model != self.gemini_processor.model:
+                self.logger.info(
+                    f"Model routing: {audio_duration / 60:.1f}min -> {_routed_model} "
+                    f"(was {self.gemini_processor.model})"
+                )
+                self.gemini_processor.model = _routed_model
 
             diarization_segments = None
             diarization_cfg = self.config.get("diarization", {}) or {}
@@ -1799,6 +1813,38 @@ class TranscribeWatcher:
                     f"See docs/SPEC-speaker-attribution-2026-08-07.md."
                 )
         return vad
+
+    def _convert_for_gemini_routed(
+        self, audio_file: Path, channel_vad, channel_admissible: bool
+    ) -> Path:
+        """Pick the ducked or legacy pre-mix for the Gemini upload.
+
+        Ducked pre-mix (`convert_for_gemini_ducked`) only when a channel VAD
+        exists AND it found the mic bleeding (`channel_admissible=False`) —
+        that is the one case where the equal-weight mix sends every remote
+        utterance to Gemini twice (see that function's docstring). Every
+        other case — clean/headphone recordings, mono/stereo fallbacks,
+        channel_vad unavailable — keeps today's `convert_for_gemini`
+        behaviour byte-for-byte.
+        """
+        if channel_vad is not None and not channel_admissible:
+            duck_cfg = self.config.get("audio_ducking", {}) or {}
+            duck_db = float(duck_cfg.get("duck_db", 18.0))
+            self.logger.info(
+                f"Bleeding mic detected (host_bleed_rate="
+                f"{channel_vad.host_bleed_rate()}) — using ducked pre-mix "
+                f"(-{duck_db:.0f}dB on ch0 while remote speaks) instead of "
+                f"the equal-weight mix"
+            )
+            return convert_for_gemini_ducked(
+                audio_file, channel_vad,
+                output_dir=self.transcripts_dir, duck_db=duck_db,
+            )
+        self.logger.debug(
+            "Using legacy equal-weight pre-mix "
+            "(channel admissible or no channel VAD)"
+        )
+        return convert_for_gemini(audio_file, output_dir=self.transcripts_dir)
 
     def _verify_speakers_inplace(self, result, channel_vad,
                                  cal_match: Optional[dict]) -> None:
