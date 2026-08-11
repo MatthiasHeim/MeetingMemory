@@ -219,12 +219,17 @@ RESCAN_STATE_FILENAME = ".rescan_state.json"
 # now watches the child for CLAUDE_STARTUP_FAILFAST_SEC and alerts if its
 # log tail matches one of these known fatal-startup signatures.
 CLAUDE_STARTUP_FAILFAST_SEC = 90
+# Kept in sync by hand with FATAL_SIGNATURES in
+# /Users/Matthias/Repos/Brain/.claude/scripts/meeting_extraction_reconciler.py
+# — same fatal-startup class, two separate repos, deliberately not a shared
+# import. Update both lists together.
 FATAL_STARTUP_SIGNATURES = (
     "OAuth session expired",
     "spend limit",
     "session limit",
     "not been trusted",
     "Failed to authenticate",
+    "Execution error",
 )
 
 

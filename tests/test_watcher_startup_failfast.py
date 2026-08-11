@@ -90,6 +90,10 @@ FATAL_LOG_SAMPLES = {
     "session limit": "You've hit your session limit for this account\n",
     "not been trusted": "this workspace has not been trusted\n",
     "Failed to authenticate": "Failed to authenticate with the API\n",
+    # Real 15-byte body observed overnight 2026-08-11 (three reconciler
+    # re-triggers, no other content in the log at all) — the failure that
+    # motivated adding this signature.
+    "Execution error": "Execution error\n",
 }
 
 
