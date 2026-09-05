@@ -21,6 +21,13 @@ def compress(path: Path) -> dict:
         return {"path": str(path), "skipped": "insufficient_copy_headroom"}
     try:
         subprocess.run(["/usr/bin/ditto", "--hfsCompression", str(path), str(tmp)], check=True, timeout=600)
+        # ditto declines some large files. Force compression on the disposable
+        # COPY only; afsctool verifies by default, and we independently hash the
+        # decoded bytes below before any original is replaced.
+        compressor = Path("/opt/homebrew/bin/afsctool")
+        if compressor.exists() and tmp.stat().st_blocks >= before.st_blocks:
+            subprocess.run([str(compressor), "-c", "-T", "LZFSE", str(tmp)],
+                           check=True, capture_output=True, timeout=600)
         digest = sha256(path)
         if digest != sha256(tmp):
             raise RuntimeError("Compression byte verification failed")
