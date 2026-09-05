@@ -25,6 +25,8 @@ import sounddevice as sd
 import soundfile as sf
 import rumps
 
+from capture_provenance import archive_capture, merge_filter
+
 
 # Default config path
 DEFAULT_CONFIG_PATH = Path.home() / "Documents" / "MeetingRecorder" / "config.yaml"
@@ -113,6 +115,10 @@ class AudioRecorder:
         self._sys_wav: Optional[Path] = None
         self._mic_wav: Optional[Path] = None
         self._sys_active = False
+        self._capture_meta = {}
+        self._mic_frames = 0
+        self._previous_adc_end = None
+        self._next_timing_sample = 0
 
     def _sys_proc_running(self) -> bool:
         return subprocess.run(
@@ -126,6 +132,18 @@ class AudioRecorder:
 
         self.output_file = output_file
         self.audio_data = []
+        self._mic_frames = 0
+        self._previous_adc_end = None
+        self._next_timing_sample = 0
+        self._capture_meta = {"schema_version": 1, "started_wall_time": time.time(),
+                              "started_monotonic": time.monotonic(),
+                              "mic_sample_rate": self.sample_rate,
+                              "mic_timing_samples": [], "discontinuities": []}
+        try:
+            self._capture_meta["mic_device"] = dict(sd.query_devices(kind="input"))
+            self._capture_meta["output_device"] = dict(sd.query_devices(kind="output"))
+        except Exception as e:
+            self._capture_meta["device_query_error"] = str(e)
         stem = output_file.stem
         self._sys_wav = self.tmp_dir / f"{stem}.sys.wav"
         self._mic_wav = self.tmp_dir / f"{stem}.mic.wav"
@@ -204,6 +222,15 @@ class AudioRecorder:
 
         produced = None
         if mic_ok and sys_ok:
+            try:
+                merge_duration = max(sf.info(str(self._mic_wav)).duration,
+                                     sf.info(str(self._sys_wav)).duration)
+            except (OSError, RuntimeError) as e:
+                # A stale/crashed tap can leave an unfinished WAV header.
+                # Keep the mic fallback reachable instead of losing stop().
+                print(f"Cannot read system duration ({e}); falling back to mic.", file=sys.stderr)
+                sys_ok = False
+        if mic_ok and sys_ok:
             # Merge mic (1ch) + system (2ch) into a 3-channel WAV with a FIXED
             # physical channel order: ch0=mic(host), ch1=sysL, ch2=sysR.
             # NOTE: bare `amerge` of a mono+stereo pair reorders by channel
@@ -215,7 +242,7 @@ class AudioRecorder:
                 [self._FFMPEG, "-y",
                  "-i", str(self._mic_wav), "-i", str(self._sys_wav),
                  "-filter_complex",
-                 "[0:a][1:a]amerge=inputs=2,pan=3.0|c0=c2|c1=c0|c2=c1[a]",
+                 merge_filter(merge_duration),
                  "-map", "[a]", "-c:a", "pcm_s16le", str(merged_tmp)],
                 capture_output=True, text=True,
             )
@@ -235,22 +262,57 @@ class AudioRecorder:
             os.replace(str(produced), str(self.output_file))  # atomic move into Recordings/
             result = self.output_file
 
-        # Cleanup intermediates.
-        for p in (self._mic_wav, self._sys_wav):
+        # Original streams are the only way to evaluate offset/drift and
+        # missing reference after capture. A failed archive leaves .tmp files
+        # intact; it must never delete the only unmerged evidence.
+        self._capture_meta.update(stopped_wall_time=time.time(),
+                                  mic_frames=self._mic_frames,
+                                  mic_ok=mic_ok, system_ok=sys_ok,
+                                  output_file=str(result) if result else None)
+        try:
+            archive_capture(expand_path(self.config.get("audio", {}).get(
+                "archive_dir", "~/Documents/MeetingRecorder/CaptureArchive")),
+                self.output_file.stem, [self._mic_wav, self._sys_wav],
+                self._capture_meta)
+        except Exception as e:
+            print(f"Capture archive failed; originals retained in .tmp or CaptureArchive: {e}", file=sys.stderr)
+
+        # Closed older captures can be compressed transparently off the GUI
+        # thread. Keep this after the trial too: raw-track retention must not
+        # depend on a one-week monitor to keep disk usage under control.
+        if self.config.get("audio", {}).get("compress_archives", True):
             try:
-                if p and p.exists():
-                    p.unlink()
-            except OSError:
-                pass
+                log_dir = expand_path(self.config.get("paths", {}).get(
+                    "logs", "~/Documents/MeetingRecorder/logs"))
+                log_dir.mkdir(parents=True, exist_ok=True)
+                with (log_dir / "capture-housekeeping.log").open("a") as log:
+                    subprocess.Popen([sys.executable, str(Path(__file__).with_name("compress_capture.py")),
+                                      "--max-files", "10"], stdout=log, stderr=log,
+                                     start_new_session=True)
+            except Exception as e:
+                print(f"Capture housekeeping could not start: {e}", file=sys.stderr)
 
         return result
 
-    def _audio_callback(self, indata, frames, time, status):
+    def _audio_callback(self, indata, frames, time_info, status):
         """Callback for the microphone input stream."""
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
         if self.recording:
             self.audio_data.append(indata.copy())
+            adc = float(time_info.inputBufferAdcTime)
+            gap = None if self._previous_adc_end is None else adc - self._previous_adc_end
+            if status or (gap is not None and abs(gap) > 0.005):
+                self._capture_meta["discontinuities"].append({
+                    "frame": self._mic_frames, "adc_gap_seconds": gap, "status": str(status)})
+            if self._mic_frames >= self._next_timing_sample:
+                self._capture_meta["mic_timing_samples"].append({
+                    "frame": self._mic_frames, "adc_time": adc,
+                    "current_time": float(time_info.currentTime),
+                    "callback_monotonic": time.monotonic()})
+                self._next_timing_sample = self._mic_frames + self.sample_rate
+            self._previous_adc_end = adc + frames / self.sample_rate
+            self._mic_frames += frames
 
     @property
     def is_recording(self) -> bool:

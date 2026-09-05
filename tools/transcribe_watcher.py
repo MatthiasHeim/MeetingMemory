@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import json
+import copy
 import queue
 import logging
 import argparse
@@ -26,6 +27,9 @@ import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
+
+from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage, trial_input_digest
+from attribution_gate import gate as attribution_gate, safe_enrichment
 
 import yaml
 import requests
@@ -1059,6 +1063,25 @@ class TranscribeWatcher:
             # pre-mix, but nothing before that point needs the converted
             # bytes, only this path.
             json_path = self.transcripts_dir / f"{audio_file.stem}.json"
+            trial_audio_sha256 = trial_input_digest(self.config, audio_file)
+            if digital_silence(audio_file):
+                # No generative model is allowed to invent a meeting from
+                # an all-zero capture. Persist the explicit skipped outcome.
+                empty = GeminiResult(transcript="", language="unknown",
+                                     audio_duration_seconds=get_audio_duration(audio_file))
+                empty.speaker_attribution = {
+                    "status": "no_speech", "identity_basis": "none",
+                    "speaker_dependent_actions": "hold", "missing_stages": [],
+                    "accuracy_measured": False,
+                }
+                data = empty.parsed_response
+                data["_meta"]["speech_gate"] = "digital_silence"
+                atomic_json(json_path, data)
+                save_trial_stage(self.config, audio_file, "candidate", data,
+                                 audio_sha256=trial_audio_sha256,
+                                 elapsed_seconds=time.time() - start_time)
+                self.logger.info("Digital silence: saved no-speech outcome, no extraction")
+                return
 
             # Step 1b: Resolve calendar attendees BEFORE the Gemini call.
             # Two reasons:
@@ -1071,7 +1094,8 @@ class TranscribeWatcher:
             # Filename encodes the timestamp, so resolve() works even though
             # the JSON doesn't exist yet.
             cal_match = self._resolve_calendar(json_path)
-            known_attendees = (cal_match or {}).get("participant_details") or []
+            verified_calendar = copy.deepcopy(cal_match)
+            known_attendees = copy.deepcopy((cal_match or {}).get("participant_details") or [])
             known_attendees = self._merge_configured_diarization_roster(
                 audio_file, known_attendees
             )
@@ -1160,6 +1184,7 @@ class TranscribeWatcher:
                         diarization_segments
                         and channel_fusion
                         and channel_admissible
+                        and not channel_separation.get("reference_uncertain_intervals")
                         and topology
                         and topology.topology == TOPOLOGY_MULTI_SOURCE_GENUINE
                     ):
@@ -1225,6 +1250,10 @@ class TranscribeWatcher:
                 return
             result.validation_report = validation.to_dict()
             result.partial = partial
+            pre_attribution = copy.deepcopy(result.parsed_response)
+            save_trial_stage(self.config, audio_file, "before_attribution",
+                             pre_attribution, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256)
 
             # Log some stats
             if result.input_tokens and result.output_tokens:
@@ -1241,12 +1270,18 @@ class TranscribeWatcher:
             cal_match = self._infer_counterpart_if_unknown(result, cal_match)
 
             self._reconcile_speakers_inplace(result, cal_match)
+            save_trial_stage(self.config, audio_file, "before_channel_verify",
+                             result.parsed_response, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256)
 
             # Step 4b2: Channel-based attribution verification. Runs AFTER
             # reconcile so flips target canonical names. Flips turns whose
             # transcript label confidently contradicts the mic-channel
             # ground truth (see speaker_verify module docstring).
             self._verify_speakers_inplace(result, channel_vad, cal_match)
+            save_trial_stage(self.config, audio_file, "before_coherence",
+                             result.parsed_response, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256)
 
             # Step 4b3: Semantic speaker-coherence gate. The acoustic stages
             # above can only ask whose microphone was hot — and on a bleeding
@@ -1262,6 +1297,11 @@ class TranscribeWatcher:
 
             # Provenance: whether attribution was channel-verified at all.
             result.channel_separation = channel_separation
+            finalize_attribution(result, pre_attribution)
+            save_trial_stage(self.config, audio_file, "candidate",
+                             result.parsed_response, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256,
+                             elapsed_seconds=time.time() - start_time)
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
             with open(json_path, 'w', encoding='utf-8') as f:
@@ -1269,7 +1309,8 @@ class TranscribeWatcher:
             self.logger.info(f"Saved result to: {json_path.name}")
 
             # Step 5: Send webhook if configured (legacy path; disabled by default)
-            if self.config.get('webhook_gemini', {}).get('enabled', False):
+            if (self.config.get('webhook_gemini', {}).get('enabled', False)
+                    and attribution_gate(result.parsed_response)["speaker_dependent_actions"] != "hold"):
                 self._send_gemini_webhook(audio_file, mp3_path, result, audio_duration, processing_time)
 
             # Step 6a: Seed sources row in InsightBase.
@@ -1281,26 +1322,50 @@ class TranscribeWatcher:
             self._enrich_with_gemini(source_id, result, audio_duration)
 
             # Step 6c: Persist the calendar resolution we computed in Step 4a.
-            self._persist_calendar(source_id, cal_match)
+            # Inferred counterparts are useful hypotheses for reconciliation,
+            # but must not escape into attendance/company fields while held.
+            publication_calendar = self._calendar_for_publication(result, cal_match, verified_calendar)
+            self._persist_calendar(source_id, publication_calendar)
 
             # Step 6d: Telegram ping — fires as soon as the row is in the DB
             # and ready for downstream LLM work. The Claude session below
             # finishes minutes later and posts no second notification.
             self._notify_telegram_meeting_captured(
-                source_id=source_id, result=result, cal_match=cal_match,
+                source_id=source_id, result=result, cal_match=publication_calendar,
                 audio_duration=audio_duration,
             )
 
             # Step 7: Trigger Claude for the LLM-only steps (insights, email
             # draft, ClientContext, CRM, wiki). It reads the seeded fields
             # and skips its old Step 1b/Step 2-UPDATE/Step 8.
-            self._trigger_claude(json_path, source_id=source_id)
+            self._trigger_claude_if_attributed(json_path, source_id=source_id)
 
         except Exception as e:
             self.logger.error(f"Gemini processing failed: {e}")
             import traceback
             self.logger.debug(traceback.format_exc())
             self._notify_telegram_failure(audio_file, f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _calendar_for_publication(result, inferred, verified):
+        return verified if attribution_gate(result.parsed_response)["speaker_dependent_actions"] == "hold" else inferred
+
+    def _trigger_claude_if_attributed(self, json_path: Path, source_id=None):
+        """The legacy action workflow cannot enforce per-turn permissions.
+
+        Hold it entirely until attribution evidence is available. Raw capture,
+        source storage and neutral metadata are already durable above. The
+        independent stage queue, not an action-generating retry, owns recovery.
+        """
+        try:
+            decision = attribution_gate(json.loads(json_path.read_text()))
+        except (OSError, ValueError):
+            decision = {"speaker_dependent_actions": "hold"}
+        if decision["speaker_dependent_actions"] == "hold":
+            self.logger.warning("Attribution pending: source retained; insights/actions/drafts held for review")
+            return False
+        self._trigger_claude(json_path, source_id=source_id)
+        return True
 
     def _send_gemini_webhook(self, audio_file: Path, mp3_path: Path,
                              result: 'GeminiResult', audio_duration: float,
@@ -1480,7 +1545,7 @@ class TranscribeWatcher:
         try:
             _insightbase_update_with_gemini(
                 source_id=source_id,
-                gemini_result=result.parsed_response,
+                gemini_result=safe_enrichment(result.parsed_response),
                 duration_seconds=audio_duration,
             )
         except Exception as e:
@@ -1808,8 +1873,7 @@ class TranscribeWatcher:
                     f"{report.get('reason')} "
                     f"(host_bleed_rate={report.get('host_bleed_rate')} > "
                     f"{report.get('max_host_bleed_rate')}). The host mic is "
-                    f"picking up the remote participants — wear headphones to "
-                    f"restore channel separation. "
+                    f"not a reliable identity signal in this recording. "
                     f"See docs/SPEC-speaker-attribution-2026-08-07.md."
                 )
         return vad
@@ -1827,7 +1891,11 @@ class TranscribeWatcher:
         channel_vad unavailable — keeps today's `convert_for_gemini`
         behaviour byte-for-byte.
         """
-        if channel_vad is not None and not channel_admissible:
+        # Unknown isolation is not measured echo. In particular, do not duck
+        # the only usable speech channel after a phone handover.
+        bleed_rate = channel_vad.host_bleed_rate() if channel_vad else None
+        if (channel_vad is not None and not channel_admissible
+                and bleed_rate is not None and bleed_rate > 0.35):
             duck_cfg = self.config.get("audio_ducking", {}) or {}
             duck_db = float(duck_cfg.get("duck_db", 18.0))
             self.logger.info(
@@ -2085,6 +2153,9 @@ class TranscribeWatcher:
             if result else 0
         )
         partial = bool(result and getattr(result, "partial", False))
+        held = attribution_gate(result.parsed_response if result else {})["speaker_dependent_actions"] == "hold"
+        workflow_status = ("Speaker verification pending; insights/actions/drafts held."
+                           if held else "Claude /meeting-actions queued…")
         msg = (
             f"Meeting captured (#{source_id})\n"
             f"{title}\n"
@@ -2093,7 +2164,7 @@ class TranscribeWatcher:
             f"{n_emotions} emotion arc events"
             + (" • chunked" if chunked else "")
             + (" • ⚠️ PARTIAL" if partial else "")
-            + "\nClaude /meeting-actions running…"
+            + "\n" + workflow_status
         )
         try:
             subprocess.run(

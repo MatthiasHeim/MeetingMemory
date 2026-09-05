@@ -17,6 +17,17 @@ class StubVAD:
         self.segments = segments
         self.duration_sec = duration_sec
 
+    def separation_report(self):
+        # Unit fixtures describe an externally established capture route.
+        # Their short excerpts need not contain the full isolation sample.
+        # End-to-end unknown/routing tests use the actual probe separately.
+        from channel_vad import channel_separation_report
+        report = channel_separation_report(self.segments)
+        if report["host_bleed_rate"] is None:
+            report.update(admissible=True, reason="fixture_isolation_established")
+        report["reference_uncertain_intervals"] = []
+        return report
+
     def shares(self, t0, t1):
         out = {"host_only": 0.0, "remote_only": 0.0, "both": 0.0}
         for s, e, label in self.segments:

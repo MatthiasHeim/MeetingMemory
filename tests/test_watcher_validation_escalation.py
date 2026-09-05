@@ -398,7 +398,11 @@ def test_real_fixture_source_463_sanitizes_clean():
     archive isn't present (e.g. CI)."""
     data = json.loads(_fixture_path().read_text(encoding="utf-8"))
     audio_duration = data["_meta"]["audio_duration_seconds"]
-    result = GeminiResult(transcript=data["transcript"], language=data.get("language", "de"))
+    # The live file has since been repaired. Inject the historical repetition
+    # into an in-memory copy so this remains a regression test after backfill.
+    lines = data["transcript"].splitlines()
+    lines[0] += " " + "de, " * 595
+    result = GeminiResult(transcript="\n".join(lines), language=data.get("language", "de"))
     validation = tw._validate_gemini_result(result, audio_duration)
     assert validation.passed is True
     assert validation.sanitized is True

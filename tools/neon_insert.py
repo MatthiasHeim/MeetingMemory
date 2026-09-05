@@ -213,6 +213,15 @@ def insert_source(
         raise FileNotFoundError(f'Transcript not found: {transcript_path}')
 
     content_text = _read_transcript(transcript_path)
+    source_attribution = {}
+    if p.suffix.lower() == '.json':
+        try:
+            parsed = json.loads(p.read_text(encoding='utf-8'))
+        except json.JSONDecodeError:
+            parsed = {}  # Preserve _read_transcript's raw-text fallback.
+        report = (parsed.get('_meta') or {}).get('speaker_attribution') if isinstance(parsed, dict) else None
+        if report is not None:
+            source_attribution['speaker_attribution'] = report
     # TODO (Phase 2): once sources.content_revision_id ships, SELECT by
     #   content_revision_id before INSERT and return the existing id on
     #   match. For now we compute+log it for debugging only.
@@ -284,6 +293,7 @@ def insert_source(
                             'content_revision_id': content_revision_id,
                             'extractor_version': EXTRACTOR_VERSION,
                             'seeded_by': 'transcribe_watcher',
+                            **source_attribution,
                         }),
                     ),
                 )
@@ -323,6 +333,8 @@ def update_source_with_gemini(
         g = g.parsed_response  # type: ignore[attr-defined]
 
     meta = g.get("_meta", {})
+    attribution_metadata = {k: meta[k] for k in ("speaker_attribution", "channel_separation") if k in meta}
+    attribution_metadata.update({k: g[k] for k in ("speaker_verification", "speaker_coherence") if k in g})
 
     language = g.get("language") or DEFAULT_LANGUAGE
     participants = g.get("participants") or []
@@ -349,7 +361,8 @@ def update_source_with_gemini(
                         language = COALESCE(%s, language),
                         participants = %s,
                         participant_details = COALESCE(%s::jsonb, participant_details),
-                        duration_minutes = COALESCE(%s, duration_minutes)
+                        duration_minutes = COALESCE(%s, duration_minutes),
+                        metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
                     WHERE id = %s
                     """,
                     (
@@ -357,6 +370,7 @@ def update_source_with_gemini(
                         participant_names,
                         participant_details_json,
                         duration_minutes,
+                        json.dumps(attribution_metadata),
                         source_id,
                     ),
                 )

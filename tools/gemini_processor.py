@@ -240,7 +240,8 @@ def _build_channel_map_prefix(channel_segments: Optional[list]) -> str:
     try:
         from channel_vad import channel_separation_report, render_map_text
         report = channel_separation_report(channel_segments)
-        if not report.get("admissible", True):
+        if (not report.get("admissible", False)
+                or report.get("reference_uncertain_intervals")):
             logger.warning(
                 f"channel map suppressed: {report.get('reason')} "
                 f"(host_bleed_rate={report.get('host_bleed_rate')} > "
@@ -382,6 +383,7 @@ class GeminiResult:
     # (channel_vad.channel_separation_report). Distinguishes "attribution was
     # channel-verified" from "the channel oracle was unusable and skipped".
     channel_separation: Optional[dict] = None
+    speaker_attribution: Optional[dict] = None
 
     @property
     def parsed_response(self) -> dict:
@@ -417,6 +419,8 @@ class GeminiResult:
             out["speaker_coherence"] = self.speaker_coherence_log
         if self.channel_separation is not None:
             out["_meta"]["channel_separation"] = self.channel_separation
+        if self.speaker_attribution is not None:
+            out["_meta"]["speaker_attribution"] = self.speaker_attribution
         return out
 
 

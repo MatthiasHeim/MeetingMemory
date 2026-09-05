@@ -331,15 +331,13 @@ def test_host_bleed_rate_high_when_mic_hears_the_speakers():
 
 
 def test_bleed_rate_unmeasurable_without_enough_remote_speech():
-    """Under a minute of remote speech cannot support the ratio — report it
-    as unmeasured, but do NOT withdraw the oracle: the recordings this
-    describes have almost no remote speech to misattribute, and the
-    everyone-on-ch0 case is caught upstream by the topology probe."""
+    """Startup sounds cannot establish where subsequent voices originate."""
     segments = [(0.0, 20.0, 'remote'), (20.0, 600.0, 'host')]
     assert host_bleed_rate(segments) is None
     report = channel_separation_report(segments)
     assert report["reason"] == "insufficient_remote_speech"
-    assert report["admissible"] is True
+    assert report["admissible"] is False
+    assert report["state"] == "unknown"
 
 
 def test_separation_report_accounts_for_all_speech():
