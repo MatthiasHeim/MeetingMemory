@@ -323,6 +323,8 @@ def update_source_with_gemini(
         g = g.parsed_response  # type: ignore[attr-defined]
 
     meta = g.get("_meta", {})
+    attribution_metadata = {k: meta[k] for k in ("speaker_attribution", "channel_separation") if k in meta}
+    attribution_metadata.update({k: g[k] for k in ("speaker_verification", "speaker_coherence") if k in g})
 
     language = g.get("language") or DEFAULT_LANGUAGE
     participants = g.get("participants") or []
@@ -349,7 +351,8 @@ def update_source_with_gemini(
                         language = COALESCE(%s, language),
                         participants = %s,
                         participant_details = COALESCE(%s::jsonb, participant_details),
-                        duration_minutes = COALESCE(%s, duration_minutes)
+                        duration_minutes = COALESCE(%s, duration_minutes),
+                        metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
                     WHERE id = %s
                     """,
                     (
@@ -357,6 +360,7 @@ def update_source_with_gemini(
                         participant_names,
                         participant_details_json,
                         duration_minutes,
+                        json.dumps(attribution_metadata),
                         source_id,
                     ),
                 )
