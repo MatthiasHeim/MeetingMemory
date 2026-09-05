@@ -21,8 +21,13 @@ promotion through audio evaluation; the offline tools are experiments only.
 - Label changes invalidate speaker-specific audio statistics. Transcript gap
   durations are not claimed to be speaking time.
 - `_meta.speaker_attribution` separates completed text checks, partial channel
-  checks and unresolved acoustic identity. Content can be extracted while named
-  commitments, identity writebacks and follow-up drafts are held for turn evidence.
+  checks and unresolved acoustic identity. Raw transcripts and neutral metadata
+  are stored immediately. The legacy workflow combines extraction with actions;
+  held meetings therefore wait in the stage queue before insights/actions/drafts
+  run. This deliberate delay must be reported in the trial's usefulness metrics.
+  Held enrichment omits model-inferred people and per-speaker signals; verified
+  calendar attendees remain attendance metadata. The zero-insight reconciler
+  excludes held sources, so it cannot bypass this restriction.
 - Capture pads the shorter stream when merging instead of truncating the longer
   one. Original mic/system streams are moved to CaptureArchive with mic ADC timing,
   device details and discontinuities. This is still independent-clock capture:
@@ -34,7 +39,10 @@ promotion through audio evaluation; the offline tools are experiments only.
 State: `~/.local/share/meeting-pipeline-trial/2026-09-05/` (private, outside Git).
 `manifest.json` freezes baseline commit, original config hash, eight historical
 meetings, dates and decision rules. `config.before.yaml` is private mode 0600.
-The baseline worktree stays detached. Only trial configuration is added to the
+The baseline worktree stays detached; each run checks HEAD, tracked/untracked
+cleanliness and the config hash before import and again before certification.
+Collected baselines must match that certificate and the output hash.
+Only trial configuration is added to the
 live config; original credentials and model settings remain intact.
 
 Each meeting archives immutable revisions before attribution, before channel

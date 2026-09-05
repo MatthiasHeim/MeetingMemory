@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage
+from attribution_gate import gate as attribution_gate, safe_enrichment
 
 import yaml
 import requests
@@ -1301,7 +1302,8 @@ class TranscribeWatcher:
             self.logger.info(f"Saved result to: {json_path.name}")
 
             # Step 5: Send webhook if configured (legacy path; disabled by default)
-            if self.config.get('webhook_gemini', {}).get('enabled', False):
+            if (self.config.get('webhook_gemini', {}).get('enabled', False)
+                    and attribution_gate(result.parsed_response)["speaker_dependent_actions"] != "hold"):
                 self._send_gemini_webhook(audio_file, mp3_path, result, audio_duration, processing_time)
 
             # Step 6a: Seed sources row in InsightBase.
@@ -1326,13 +1328,30 @@ class TranscribeWatcher:
             # Step 7: Trigger Claude for the LLM-only steps (insights, email
             # draft, ClientContext, CRM, wiki). It reads the seeded fields
             # and skips its old Step 1b/Step 2-UPDATE/Step 8.
-            self._trigger_claude(json_path, source_id=source_id)
+            self._trigger_claude_if_attributed(json_path, source_id=source_id)
 
         except Exception as e:
             self.logger.error(f"Gemini processing failed: {e}")
             import traceback
             self.logger.debug(traceback.format_exc())
             self._notify_telegram_failure(audio_file, f"{type(e).__name__}: {e}")
+
+    def _trigger_claude_if_attributed(self, json_path: Path, source_id=None):
+        """The legacy action workflow cannot enforce per-turn permissions.
+
+        Hold it entirely until attribution evidence is available. Raw capture,
+        source storage and neutral metadata are already durable above. The
+        independent stage queue, not an action-generating retry, owns recovery.
+        """
+        try:
+            decision = attribution_gate(json.loads(json_path.read_text()))
+        except (OSError, ValueError):
+            decision = {"speaker_dependent_actions": "hold"}
+        if decision["speaker_dependent_actions"] == "hold":
+            self.logger.warning("Attribution pending: source retained; insights/actions/drafts held for review")
+            return False
+        self._trigger_claude(json_path, source_id=source_id)
+        return True
 
     def _send_gemini_webhook(self, audio_file: Path, mp3_path: Path,
                              result: 'GeminiResult', audio_duration: float,
@@ -1512,7 +1531,7 @@ class TranscribeWatcher:
         try:
             _insightbase_update_with_gemini(
                 source_id=source_id,
-                gemini_result=result.parsed_response,
+                gemini_result=safe_enrichment(result.parsed_response),
                 duration_seconds=audio_duration,
             )
         except Exception as e:

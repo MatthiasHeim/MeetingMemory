@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from speaker_trial import RULES, evaluate, metrics
+from speaker_trial import RULES, evaluate, metrics, verify_baseline, sha256
 
 
 def pair():
@@ -54,3 +54,26 @@ def test_word_loss_and_overlap_loss_are_independent_of_correct_speaker():
                                      candidate_word_errors=3)], RULES)["decision"] == "revert"
     assert evaluate([pair()], [label(overlapping_host_seconds=100,
                baseline_host_recalled_seconds=100, candidate_host_recalled_seconds=94)], RULES)["decision"] == "revert"
+
+
+def test_dirty_or_mismatched_baseline_and_changed_config_are_rejected(tmp_path):
+    import subprocess
+    import pytest
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args], text=True).strip()
+    git("init", "-q"); git("config", "user.email", "test@example.test"); git("config", "user.name", "Test")
+    source = tmp_path / "code.py"; source.write_text("original")
+    config = tmp_path.parent / (tmp_path.name + ".yaml"); config.write_text("original config")
+    git("add", "code.py"); git("commit", "-qm", "fixture")
+    manifest = {"baseline_repo": str(tmp_path), "baseline_commit": git("rev-parse", "HEAD"),
+                "config_backup": str(config), "config_sha256": sha256(config)}
+    assert verify_baseline(manifest) == manifest["baseline_commit"]
+    source.write_text("changed")
+    with pytest.raises(RuntimeError, match="baseline is dirty"):
+        verify_baseline(manifest)
+    git("restore", "code.py")
+    with pytest.raises(RuntimeError, match="different commit"):
+        verify_baseline({**manifest, "baseline_commit": "incorrect"})
+    config.write_text("changed config")
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        verify_baseline(manifest)

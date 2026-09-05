@@ -48,6 +48,18 @@ def sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def verify_baseline(manifest: dict) -> str:
+    """A detached checkout is mutable. Check code and config before import."""
+    repo = str(manifest["baseline_repo"])
+    commit = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+    dirty = subprocess.check_output(["git", "-C", repo, "status", "--porcelain", "--untracked-files=all"], text=True)
+    if commit != manifest["baseline_commit"] or dirty.strip():
+        raise RuntimeError("Frozen baseline is dirty or at a different commit; refusing misleading replay")
+    if sha256(Path(manifest["config_backup"])) != manifest["config_sha256"]:
+        raise RuntimeError("Frozen baseline configuration changed; refusing misleading replay")
+    return commit
+
+
 def metrics(data: dict) -> dict:
     import re
     meta = data.get("_meta") or {}
@@ -99,6 +111,7 @@ def initialize(state: Path, start: str, end: str) -> dict:
         "recordings_dir": str(Path(cfg["paths"]["recordings"]).expanduser()),
         "transcripts_dir": str(transcripts), "review_complete": False,
     }
+    verify_baseline(manifest)
     atomic_json(state / "manifest.json", manifest)
     return manifest
 
@@ -139,11 +152,17 @@ def collect(state: Path) -> dict:
                 row["error"] = str(exc)
         shadow = state / "shadows" / wav.stem / "baseline" / (wav.stem + ".json")
         if shadow.exists():
-            row["baseline"] = metrics(read(shadow))
-            row["baseline_sha256"] = sha256(shadow)
             run = shadow.parent / "run.json"
-            if run.exists():
-                row["baseline"]["pipeline_elapsed_seconds"] = read(run).get("elapsed_seconds")
+            certificate = read(run) if run.exists() else {}
+            digest = sha256(shadow)
+            if (certificate.get("baseline_commit") == manifest["baseline_commit"]
+                    and certificate.get("transcript_sha256") == digest
+                    and certificate.get("config_sha256") == manifest["config_sha256"]):
+                row["baseline"] = metrics(read(shadow))
+                row["baseline_sha256"] = digest
+                row["baseline"]["pipeline_elapsed_seconds"] = certificate.get("elapsed_seconds")
+            else:
+                row["baseline_error"] = "missing or invalid provenance certificate"
         queue = state / "recordings" / wav.stem / "verification_queue.json"
         if queue.exists():
             row["verification_queue"] = read(queue)
@@ -238,6 +257,7 @@ def baseline_worker(state: Path, stem: str) -> None:
     """Import the frozen code in a fresh process and prohibit all publication."""
     manifest = read(state / "manifest.json")
     repo = Path(manifest["baseline_repo"])
+    actual_commit = verify_baseline(manifest)
     from dotenv import load_dotenv
     load_dotenv(PRODUCTION / ".env")
     # speaker_integrity is this harness only; the actual pipeline siblings
@@ -248,6 +268,10 @@ def baseline_worker(state: Path, stem: str) -> None:
     cfg = yaml.safe_load(Path(manifest["config_backup"]).read_text())
     output = state / "shadows" / stem / "baseline"
     output.mkdir(parents=True, exist_ok=True)
+    # A failed retry must not certify an older leftover as its own result.
+    for previous in (output / (stem + ".json"), output / "run.json"):
+        if previous.exists():
+            previous.rename(previous.with_name(f"previous-{time.time_ns()}-{previous.name}"))
     cfg["paths"].update(recordings=str(output / "unused"), transcripts=str(output), logs=str(output))
     cfg["claude_trigger"] = {**cfg.get("claude_trigger", {}), "enabled": False}
     cfg["webhook"] = {"enabled": False}
@@ -265,7 +289,11 @@ def baseline_worker(state: Path, stem: str) -> None:
     begun = time.time()
     watcher._process_with_gemini(Path(manifest["recordings_dir"]) / (stem + ".wav"))
     outcome = output / (stem + ".json")
-    atomic_json(output / "run.json", {"baseline_commit": manifest["baseline_commit"],
+    # A concurrent checkout/edit also invalidates this run's provenance.
+    verify_baseline(manifest)
+    atomic_json(output / "run.json", {"baseline_commit": actual_commit,
+                "config_sha256": manifest["config_sha256"],
+                "transcript_sha256": sha256(outcome) if outcome.exists() else None,
                 "elapsed_seconds": time.time()-begun, "output_exists": outcome.exists(),
                 "calendar_source": "frozen candidate attendee list", "published": False})
     if not outcome.exists():

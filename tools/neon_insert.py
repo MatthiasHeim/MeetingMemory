@@ -213,6 +213,12 @@ def insert_source(
         raise FileNotFoundError(f'Transcript not found: {transcript_path}')
 
     content_text = _read_transcript(transcript_path)
+    source_attribution = {}
+    if p.suffix.lower() == '.json':
+        parsed = json.loads(p.read_text(encoding='utf-8'))
+        report = (parsed.get('_meta') or {}).get('speaker_attribution') if isinstance(parsed, dict) else None
+        if report is not None:
+            source_attribution['speaker_attribution'] = report
     # TODO (Phase 2): once sources.content_revision_id ships, SELECT by
     #   content_revision_id before INSERT and return the existing id on
     #   match. For now we compute+log it for debugging only.
@@ -284,6 +290,7 @@ def insert_source(
                             'content_revision_id': content_revision_id,
                             'extractor_version': EXTRACTOR_VERSION,
                             'seeded_by': 'transcribe_watcher',
+                            **source_attribution,
                         }),
                     ),
                 )
