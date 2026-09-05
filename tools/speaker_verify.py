@@ -298,12 +298,13 @@ def verify(gemini_dict: dict, vad) -> dict:
     # — the one failure mode these thresholds cannot survive.
     separation = _separation_report(vad)
     log["channel_separation"] = separation
-    if separation is not None and not separation.get("admissible", True):
+    if not separation or not separation.get("admissible", False):
+        separation = separation or {"reason": "separation_probe_unavailable"}
         log["skipped_channel_bleed"] = True
         logger.warning(
             "speaker_verify: channel oracle inadmissible (%s, host_bleed_rate=%s "
-            "> %s) — the mic channel is picking up the remote participants, so "
-            "host_share cannot discriminate. No flips applied; Gemini's own "
+            "threshold %s) — channel identity is not established. "
+            "No flips applied; Gemini's own "
             "labels stand and the semantic coherence gate is the repair path.",
             separation.get("reason"),
             separation.get("host_bleed_rate"),
@@ -342,6 +343,10 @@ def verify(gemini_dict: dict, vad) -> dict:
         t0, t1 = turn["t_start"], turn["t_end"]
         if t0 is None or t1 is None:
             log["skipped"]["untimed"] += 1
+            continue
+        if any(max(t0, s) < min(t1, e) for s, e in
+               separation.get("reference_uncertain_intervals", [])):
+            log["skipped"]["reference_unknown"] = log["skipped"].get("reference_unknown", 0) + 1
             continue
         dur = t1 - t0
         # Below the absolute floor, no amount of channel confidence can

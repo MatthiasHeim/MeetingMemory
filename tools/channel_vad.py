@@ -83,6 +83,30 @@ MAX_HOST_BLEED_RATE = 0.35
 MIN_BLEED_SAMPLE_SEC = 60.0  # need this much remote-active speech to judge
 
 
+def missing_reference_intervals(segments: list) -> list[list[float]]:
+    """Find long mic-active spans with no observed system speech.
+
+    A long host monologue is also possible; this is uncertainty, not proof
+    of a phone handover. In either case it cannot justify naming every
+    voice on the mic as the host. Inspect the entire recording, not its
+    startup sounds. Short backchannels do not reset a missing reference.
+    """
+    windows: dict[int, dict[str, float]] = {}
+    for start, end, label in segments or []:
+        if end <= start:
+            continue
+        for i in range(int(start // 120), int(end // 120) + 1):
+            overlap = max(0.0, min(end, (i + 1) * 120) - max(start, i * 120))
+            w = windows.setdefault(i, {"host": 0.0, "remote": 0.0})
+            if label in ("host", "both"):
+                w["host"] += overlap
+            if label in ("remote", "both"):
+                w["remote"] += overlap
+    return [[float(i * 120), float((i + 1) * 120)]
+            for i, w in sorted(windows.items())
+            if w["host"] >= 60.0 and w["remote"] < 5.0]
+
+
 def _fmt_ts(seconds: float) -> str:
     """Format seconds as MM:SS, or HH:MM:SS past the hour."""
     total = int(round(seconds))
@@ -160,16 +184,12 @@ def channel_separation_report(segments: list[tuple[float, float, str]]) -> dict:
                       if l == 'remote')
     both = sum(max(0.0, t1 - t0) for t0, t1, l in segments or []
                if l == 'both')
+    reference_gaps = missing_reference_intervals(segments)
     if rate is None:
-        # Too little remote speech to measure bleed. Do NOT block on this:
-        # the defect we are gating is positively-measured bleed, and a
-        # recording with almost no remote speech has almost no remote speech
-        # to misattribute. The "3-channel file with everyone on ch0" case —
-        # where this reasoning would fail — is already caught upstream by
-        # `classify_source_topology` in compute_channel_vad. Recorded so an
-        # audit can tell a measured-clean oracle from an unmeasured one.
+        # Startup sounds can make a phone/in-room recording look hybrid.
+        # Absence of system speech is not evidence that the mic is isolated.
         reason = "insufficient_remote_speech"
-        admissible = True
+        admissible = False
     elif rate > MAX_HOST_BLEED_RATE:
         reason = "mic_hears_remote"
         admissible = False
@@ -179,6 +199,9 @@ def channel_separation_report(segments: list[tuple[float, float, str]]) -> dict:
     return {
         "admissible": admissible,
         "reason": reason,
+        "state": ("partial" if reference_gaps else "clean") if admissible else (
+            "bleeding" if reason == "mic_hears_remote" else "unknown"),
+        "reference_uncertain_intervals": reference_gaps,
         "host_bleed_rate": None if rate is None else round(rate, 3),
         "max_host_bleed_rate": MAX_HOST_BLEED_RATE,
         "host_only_sec": round(host_only, 1),

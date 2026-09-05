@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import json
+import copy
 import queue
 import logging
 import argparse
@@ -26,6 +27,8 @@ import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
+
+from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage
 
 import yaml
 import requests
@@ -1059,6 +1062,23 @@ class TranscribeWatcher:
             # pre-mix, but nothing before that point needs the converted
             # bytes, only this path.
             json_path = self.transcripts_dir / f"{audio_file.stem}.json"
+            if digital_silence(audio_file):
+                # No generative model is allowed to invent a meeting from
+                # an all-zero capture. Persist the explicit skipped outcome.
+                empty = GeminiResult(transcript="", language="unknown",
+                                     audio_duration_seconds=get_audio_duration(audio_file))
+                empty.speaker_attribution = {
+                    "status": "no_speech", "identity_basis": "none",
+                    "speaker_dependent_actions": "hold", "missing_stages": [],
+                    "accuracy_measured": False,
+                }
+                data = empty.parsed_response
+                data["_meta"]["speech_gate"] = "digital_silence"
+                atomic_json(json_path, data)
+                save_trial_stage(self.config, audio_file, "candidate", data,
+                                 elapsed_seconds=time.time() - start_time)
+                self.logger.info("Digital silence: saved no-speech outcome, no extraction")
+                return
 
             # Step 1b: Resolve calendar attendees BEFORE the Gemini call.
             # Two reasons:
@@ -1160,6 +1180,7 @@ class TranscribeWatcher:
                         diarization_segments
                         and channel_fusion
                         and channel_admissible
+                        and not channel_separation.get("reference_uncertain_intervals")
                         and topology
                         and topology.topology == TOPOLOGY_MULTI_SOURCE_GENUINE
                     ):
@@ -1225,6 +1246,9 @@ class TranscribeWatcher:
                 return
             result.validation_report = validation.to_dict()
             result.partial = partial
+            pre_attribution = copy.deepcopy(result.parsed_response)
+            save_trial_stage(self.config, audio_file, "before_attribution",
+                             pre_attribution, known_attendees=known_attendees)
 
             # Log some stats
             if result.input_tokens and result.output_tokens:
@@ -1241,12 +1265,16 @@ class TranscribeWatcher:
             cal_match = self._infer_counterpart_if_unknown(result, cal_match)
 
             self._reconcile_speakers_inplace(result, cal_match)
+            save_trial_stage(self.config, audio_file, "before_channel_verify",
+                             result.parsed_response, known_attendees=known_attendees)
 
             # Step 4b2: Channel-based attribution verification. Runs AFTER
             # reconcile so flips target canonical names. Flips turns whose
             # transcript label confidently contradicts the mic-channel
             # ground truth (see speaker_verify module docstring).
             self._verify_speakers_inplace(result, channel_vad, cal_match)
+            save_trial_stage(self.config, audio_file, "before_coherence",
+                             result.parsed_response, known_attendees=known_attendees)
 
             # Step 4b3: Semantic speaker-coherence gate. The acoustic stages
             # above can only ask whose microphone was hot — and on a bleeding
@@ -1262,6 +1290,10 @@ class TranscribeWatcher:
 
             # Provenance: whether attribution was channel-verified at all.
             result.channel_separation = channel_separation
+            finalize_attribution(result, pre_attribution)
+            save_trial_stage(self.config, audio_file, "candidate",
+                             result.parsed_response, known_attendees=known_attendees,
+                             elapsed_seconds=time.time() - start_time)
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
             with open(json_path, 'w', encoding='utf-8') as f:
@@ -1808,8 +1840,7 @@ class TranscribeWatcher:
                     f"{report.get('reason')} "
                     f"(host_bleed_rate={report.get('host_bleed_rate')} > "
                     f"{report.get('max_host_bleed_rate')}). The host mic is "
-                    f"picking up the remote participants — wear headphones to "
-                    f"restore channel separation. "
+                    f"not a reliable identity signal in this recording. "
                     f"See docs/SPEC-speaker-attribution-2026-08-07.md."
                 )
         return vad
@@ -1827,7 +1858,11 @@ class TranscribeWatcher:
         channel_vad unavailable — keeps today's `convert_for_gemini`
         behaviour byte-for-byte.
         """
-        if channel_vad is not None and not channel_admissible:
+        # Unknown isolation is not measured echo. In particular, do not duck
+        # the only usable speech channel after a phone handover.
+        bleed_rate = channel_vad.host_bleed_rate() if channel_vad else None
+        if (channel_vad is not None and not channel_admissible
+                and bleed_rate is not None and bleed_rate > 0.35):
             duck_cfg = self.config.get("audio_ducking", {}) or {}
             duck_db = float(duck_cfg.get("duck_db", 18.0))
             self.logger.info(
