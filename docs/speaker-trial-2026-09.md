@@ -128,6 +128,9 @@ Publish through a MeetingMemory feature branch and PR; never push that repo's ma
 directly. Deploy by fast-forwarding the clean main checkout and restarting its
 watcher/recorder LaunchAgents only when idle. Record commit, PR, PIDs and runtime
 config in the manifest. Do not stop an active capture or processing job.
+`python tools/recorder_status.py` queries the recorder's own CoreAudio process:
+exit 0 means idle, 1 active, 2 unknown. Do not treat another application's mic
+usage as recorder activity, or a missing system tap as proof that its mic is idle.
 
 The daily Codex heartbeat collects evidence, runs bounded shadows/advisory retries,
 checks storage and missing stages, and stays quiet unless action is required. The
