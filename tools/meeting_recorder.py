@@ -277,6 +277,21 @@ class AudioRecorder:
         except Exception as e:
             print(f"Capture archive failed; originals retained in .tmp or CaptureArchive: {e}", file=sys.stderr)
 
+        # Closed older captures can be compressed transparently off the GUI
+        # thread. Keep this after the trial too: raw-track retention must not
+        # depend on a one-week monitor to keep disk usage under control.
+        if self.config.get("audio", {}).get("compress_archives", True):
+            try:
+                log_dir = expand_path(self.config.get("paths", {}).get(
+                    "logs", "~/Documents/MeetingRecorder/logs"))
+                log_dir.mkdir(parents=True, exist_ok=True)
+                with (log_dir / "capture-housekeeping.log").open("a") as log:
+                    subprocess.Popen([sys.executable, str(Path(__file__).with_name("compress_capture.py")),
+                                      "--max-files", "10"], stdout=log, stderr=log,
+                                     start_new_session=True)
+            except Exception as e:
+                print(f"Capture housekeeping could not start: {e}", file=sys.stderr)
+
         return result
 
     def _audio_callback(self, indata, frames, time_info, status):

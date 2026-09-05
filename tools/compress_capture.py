@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verified transparent APFS compression; file bytes and paths stay unchanged."""
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -51,6 +52,13 @@ def main():
     parser.add_argument("--max-files", type=int, default=100)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     args = parser.parse_args()
+    args.state.mkdir(parents=True, exist_ok=True)
+    lock = (args.state / "compression.lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({"state": "already_running"}))
+        return
     root = Path.home() / "Documents/MeetingRecorder"
     files = list((root/"Recordings").glob("*.wav")) + list((root/"CaptureArchive").rglob("*.wav")) + list((root/".tmp").glob("*.wav"))
     eligible = [p for p in files if time.time()-p.stat().st_mtime > 3600
