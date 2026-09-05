@@ -28,7 +28,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
-from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage
+from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage, trial_input_digest
 from attribution_gate import gate as attribution_gate, safe_enrichment
 
 import yaml
@@ -1063,6 +1063,7 @@ class TranscribeWatcher:
             # pre-mix, but nothing before that point needs the converted
             # bytes, only this path.
             json_path = self.transcripts_dir / f"{audio_file.stem}.json"
+            trial_audio_sha256 = trial_input_digest(self.config, audio_file)
             if digital_silence(audio_file):
                 # No generative model is allowed to invent a meeting from
                 # an all-zero capture. Persist the explicit skipped outcome.
@@ -1077,6 +1078,7 @@ class TranscribeWatcher:
                 data["_meta"]["speech_gate"] = "digital_silence"
                 atomic_json(json_path, data)
                 save_trial_stage(self.config, audio_file, "candidate", data,
+                                 audio_sha256=trial_audio_sha256,
                                  elapsed_seconds=time.time() - start_time)
                 self.logger.info("Digital silence: saved no-speech outcome, no extraction")
                 return
@@ -1092,7 +1094,8 @@ class TranscribeWatcher:
             # Filename encodes the timestamp, so resolve() works even though
             # the JSON doesn't exist yet.
             cal_match = self._resolve_calendar(json_path)
-            known_attendees = (cal_match or {}).get("participant_details") or []
+            verified_calendar = copy.deepcopy(cal_match)
+            known_attendees = copy.deepcopy((cal_match or {}).get("participant_details") or [])
             known_attendees = self._merge_configured_diarization_roster(
                 audio_file, known_attendees
             )
@@ -1249,7 +1252,8 @@ class TranscribeWatcher:
             result.partial = partial
             pre_attribution = copy.deepcopy(result.parsed_response)
             save_trial_stage(self.config, audio_file, "before_attribution",
-                             pre_attribution, known_attendees=known_attendees)
+                             pre_attribution, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256)
 
             # Log some stats
             if result.input_tokens and result.output_tokens:
@@ -1267,7 +1271,8 @@ class TranscribeWatcher:
 
             self._reconcile_speakers_inplace(result, cal_match)
             save_trial_stage(self.config, audio_file, "before_channel_verify",
-                             result.parsed_response, known_attendees=known_attendees)
+                             result.parsed_response, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256)
 
             # Step 4b2: Channel-based attribution verification. Runs AFTER
             # reconcile so flips target canonical names. Flips turns whose
@@ -1275,7 +1280,8 @@ class TranscribeWatcher:
             # ground truth (see speaker_verify module docstring).
             self._verify_speakers_inplace(result, channel_vad, cal_match)
             save_trial_stage(self.config, audio_file, "before_coherence",
-                             result.parsed_response, known_attendees=known_attendees)
+                             result.parsed_response, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256)
 
             # Step 4b3: Semantic speaker-coherence gate. The acoustic stages
             # above can only ask whose microphone was hot — and on a bleeding
@@ -1294,6 +1300,7 @@ class TranscribeWatcher:
             finalize_attribution(result, pre_attribution)
             save_trial_stage(self.config, audio_file, "candidate",
                              result.parsed_response, known_attendees=known_attendees,
+                             audio_sha256=trial_audio_sha256,
                              elapsed_seconds=time.time() - start_time)
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
@@ -1315,13 +1322,16 @@ class TranscribeWatcher:
             self._enrich_with_gemini(source_id, result, audio_duration)
 
             # Step 6c: Persist the calendar resolution we computed in Step 4a.
-            self._persist_calendar(source_id, cal_match)
+            # Inferred counterparts are useful hypotheses for reconciliation,
+            # but must not escape into attendance/company fields while held.
+            publication_calendar = self._calendar_for_publication(result, cal_match, verified_calendar)
+            self._persist_calendar(source_id, publication_calendar)
 
             # Step 6d: Telegram ping — fires as soon as the row is in the DB
             # and ready for downstream LLM work. The Claude session below
             # finishes minutes later and posts no second notification.
             self._notify_telegram_meeting_captured(
-                source_id=source_id, result=result, cal_match=cal_match,
+                source_id=source_id, result=result, cal_match=publication_calendar,
                 audio_duration=audio_duration,
             )
 
@@ -1335,6 +1345,10 @@ class TranscribeWatcher:
             import traceback
             self.logger.debug(traceback.format_exc())
             self._notify_telegram_failure(audio_file, f"{type(e).__name__}: {e}")
+
+    @staticmethod
+    def _calendar_for_publication(result, inferred, verified):
+        return verified if attribution_gate(result.parsed_response)["speaker_dependent_actions"] == "hold" else inferred
 
     def _trigger_claude_if_attributed(self, json_path: Path, source_id=None):
         """The legacy action workflow cannot enforce per-turn permissions.
@@ -2139,6 +2153,9 @@ class TranscribeWatcher:
             if result else 0
         )
         partial = bool(result and getattr(result, "partial", False))
+        held = attribution_gate(result.parsed_response if result else {})["speaker_dependent_actions"] == "hold"
+        workflow_status = ("Speaker verification pending; insights/actions/drafts held."
+                           if held else "Claude /meeting-actions queued…")
         msg = (
             f"Meeting captured (#{source_id})\n"
             f"{title}\n"
@@ -2147,7 +2164,7 @@ class TranscribeWatcher:
             f"{n_emotions} emotion arc events"
             + (" • chunked" if chunked else "")
             + (" • ⚠️ PARTIAL" if partial else "")
-            + "\nClaude /meeting-actions running…"
+            + "\n" + workflow_status
         )
         try:
             subprocess.run(

@@ -28,6 +28,9 @@ promotion through audio evaluation; the offline tools are experiments only.
   Held enrichment omits model-inferred people and per-speaker signals; verified
   calendar attendees remain attendance metadata. The zero-insight reconciler
   excludes held sources, so it cannot bypass this restriction.
+  Capture notifications explicitly report the hold rather than claiming the
+  action workflow is running. Transcript-derived counterpart hints cannot
+  populate held attendance/company updates.
 - Capture pads the shorter stream when merging instead of truncating the longer
   one. Original mic/system streams are moved to CaptureArchive with mic ADC timing,
   device details and discontinuities. This is still independent-clock capture:
@@ -41,7 +44,10 @@ State: `~/.local/share/meeting-pipeline-trial/2026-09-05/` (private, outside Git
 meetings, dates and decision rules. `config.before.yaml` is private mode 0600.
 The baseline worktree stays detached; each run checks HEAD, tracked/untracked
 cleanliness and the config hash before import and again before certification.
-Collected baselines must match that certificate and the output hash.
+Candidates fingerprint the original WAV before processing and verify it again
+before archiving. Baseline replays require that candidate fingerprint before and
+after processing; collection rejects certificates for a different audio hash.
+Collected baselines must also match the code/config certificate and output hash.
 Only trial configuration is added to the
 live config; original credentials and model settings remain intact.
 

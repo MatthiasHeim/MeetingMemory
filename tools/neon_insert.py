@@ -215,7 +215,10 @@ def insert_source(
     content_text = _read_transcript(transcript_path)
     source_attribution = {}
     if p.suffix.lower() == '.json':
-        parsed = json.loads(p.read_text(encoding='utf-8'))
+        try:
+            parsed = json.loads(p.read_text(encoding='utf-8'))
+        except json.JSONDecodeError:
+            parsed = {}  # Preserve _read_transcript's raw-text fallback.
         report = (parsed.get('_meta') or {}).get('speaker_attribution') if isinstance(parsed, dict) else None
         if report is not None:
             source_attribution['speaker_attribution'] = report

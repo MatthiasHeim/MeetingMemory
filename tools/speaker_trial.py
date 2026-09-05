@@ -60,6 +60,12 @@ def verify_baseline(manifest: dict) -> str:
     return commit
 
 
+def verify_audio(path: Path, expected: str | None) -> str:
+    if not expected or sha256(path) != expected:
+        raise RuntimeError("Trial audio changed or lacks a candidate fingerprint; refusing unpaired replay")
+    return expected
+
+
 def metrics(data: dict) -> dict:
     import re
     meta = data.get("_meta") or {}
@@ -147,7 +153,8 @@ def collect(state: Path) -> dict:
                 row["candidate_revision"] = str(revisions[-1]) if revisions else str(path)
                 if revision:
                     row["candidate"]["pipeline_elapsed_seconds"] = revision.get("context", {}).get("elapsed_seconds")
-                row["eligible_for_quality_sample"] = row["candidate"]["duration_seconds"] >= 600 and not row["candidate"]["no_speech"]
+                    row["audio_sha256"] = revision.get("audio_sha256") if revision.get("audio_input_verified") else None
+                row["eligible_for_quality_sample"] = bool(row.get("audio_sha256")) and row["candidate"]["duration_seconds"] >= 600 and not row["candidate"]["no_speech"]
             except (ValueError, OSError) as exc:
                 row["error"] = str(exc)
         shadow = state / "shadows" / wav.stem / "baseline" / (wav.stem + ".json")
@@ -157,6 +164,8 @@ def collect(state: Path) -> dict:
             digest = sha256(shadow)
             if (certificate.get("baseline_commit") == manifest["baseline_commit"]
                     and certificate.get("transcript_sha256") == digest
+                    and row.get("audio_sha256")
+                    and certificate.get("audio_sha256") == row["audio_sha256"]
                     and certificate.get("config_sha256") == manifest["config_sha256"]):
                 row["baseline"] = metrics(read(shadow))
                 row["baseline_sha256"] = digest
@@ -278,8 +287,11 @@ def baseline_worker(state: Path, stem: str) -> None:
     cfg["webhook_gemini"] = {"enabled": False}
     cfg["attribution_trial"] = {"enabled": False}
     watcher = tw.TranscribeWatcher(cfg, logging.getLogger("baseline-shadow"))
-    evidence = sorted((state / "recordings" / stem).glob("before_attribution-*.json"), key=lambda p:p.stat().st_mtime)
-    attendees = read(evidence[-1]).get("context", {}).get("known_attendees", []) if evidence else []
+    evidence = sorted((state / "recordings" / stem).glob("candidate-*.json"), key=lambda p:p.stat().st_mtime)
+    revision = read(evidence[-1]) if evidence else {}
+    audio_path = Path(manifest["recordings_dir"]) / (stem + ".wav")
+    audio_digest = verify_audio(audio_path, revision.get("audio_sha256") if revision.get("audio_input_verified") else None)
+    attendees = revision.get("context", {}).get("known_attendees", [])
     watcher._resolve_calendar = lambda _: {"participant_details": attendees}
     # Forbid DB writes, downstream extraction and all outbound notifications.
     for name in ("_seed_insightbase_source", "_enrich_with_gemini", "_persist_calendar", "_trigger_claude",
@@ -287,11 +299,13 @@ def baseline_worker(state: Path, stem: str) -> None:
                  "_notify_telegram_giveup", "_notify_telegram_coherence_unverified"):
         setattr(watcher, name, lambda *a, **k: None)
     begun = time.time()
-    watcher._process_with_gemini(Path(manifest["recordings_dir"]) / (stem + ".wav"))
+    watcher._process_with_gemini(audio_path)
     outcome = output / (stem + ".json")
     # A concurrent checkout/edit also invalidates this run's provenance.
     verify_baseline(manifest)
+    verify_audio(audio_path, audio_digest)
     atomic_json(output / "run.json", {"baseline_commit": actual_commit,
+                "audio_sha256": audio_digest,
                 "config_sha256": manifest["config_sha256"],
                 "transcript_sha256": sha256(outcome) if outcome.exists() else None,
                 "elapsed_seconds": time.time()-begun, "output_exists": outcome.exists(),

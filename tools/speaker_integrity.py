@@ -22,6 +22,17 @@ def coherence_complete(log: dict | None) -> bool:
                 and not log.get("error") and not log.get("refused_runaway"))
 
 
+def trial_input_digest(config: dict, path: Path) -> str | None:
+    if not (config.get("attribution_trial") or {}).get("enabled"):
+        return None
+    try:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError:
+        logging.getLogger(__name__).exception("Could not fingerprint trial audio")
+        return None
+
+
 def digital_silence(path: Path) -> bool:
     """Only exact digital zero is a hard no-speech verdict; quiet is unknown."""
     import numpy as np
@@ -101,11 +112,15 @@ def save_trial_stage(config: dict, audio_file: Path, stage: str,
     try:
         root = Path(cfg["state_dir"]).expanduser() / "recordings" / audio_file.stem
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        dest = root / f"{stage}-{digest[:16]}.json"
+        audio_digest = context.get("audio_sha256")
+        verified = bool(audio_digest and (stage != "candidate" or
+                        trial_input_digest(config, audio_file) == audio_digest))
+        dest = root / f"{stage}-{digest[:16]}-{(audio_digest or 'unknown')[:16]}.json"
         if not dest.exists():
             atomic_json(dest, {"stage": stage, "audio_path": str(audio_file),
                               "recorded_at": datetime.now(timezone.utc).isoformat(),
                               "payload_sha256": digest, "payload": payload,
+                              "audio_sha256": audio_digest, "audio_input_verified": verified,
                               "context": context})
         if stage == "candidate":
             status = payload.get("_meta", {}).get("speaker_attribution") or {}

@@ -12,6 +12,7 @@ from capture_provenance import archive_capture, merge_filter
 from channel_vad import channel_separation_report
 from gemini_processor import GeminiResult, _build_channel_map_prefix
 from speaker_integrity import coherence_complete, digital_silence, finalize_attribution, save_trial_stage
+from speaker_integrity import trial_input_digest
 from speaker_verify import verify
 
 
@@ -89,6 +90,19 @@ def test_exact_silence_blocks_but_quiet_audio_does_not(tmp_path):
     signal = np.zeros((8000, 3)); signal[200, 0] = 1/32768
     sf.write(path, signal, 8000, subtype="PCM_16")
     assert not digital_silence(path)
+
+
+def test_candidate_certifies_original_audio_and_rejects_midrun_replacement(tmp_path):
+    cfg = {"attribution_trial": {"enabled": True, "state_dir": str(tmp_path)}}
+    path = tmp_path / "meeting.wav"; path.write_bytes(b"original audio")
+    digest = trial_input_digest(cfg, path)
+    save_trial_stage(cfg, path, "candidate", {"transcript": "original"}, audio_sha256=digest)
+    revision = json.loads(next((tmp_path / "recordings/meeting").glob("candidate-*.json")).read_text())
+    assert revision["audio_input_verified"] and revision["audio_sha256"] == digest
+    path.write_bytes(b"replacement audio")
+    save_trial_stage(cfg, path, "candidate", {"transcript": "replacement"}, audio_sha256=digest)
+    revisions = [json.loads(p.read_text()) for p in (tmp_path / "recordings/meeting").glob("candidate-*.json")]
+    assert not next(r for r in revisions if r["payload"]["transcript"] == "replacement")["audio_input_verified"]
 
 
 def test_merge_keeps_longer_tail_and_physical_channel_order(tmp_path):

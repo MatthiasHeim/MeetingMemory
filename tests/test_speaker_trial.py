@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from speaker_trial import RULES, evaluate, metrics, verify_baseline, sha256
+from speaker_trial import RULES, evaluate, metrics, verify_baseline, verify_audio, sha256, collect
 
 
 def pair():
@@ -77,3 +77,38 @@ def test_dirty_or_mismatched_baseline_and_changed_config_are_rejected(tmp_path):
     config.write_text("changed config")
     with pytest.raises(RuntimeError, match="configuration changed"):
         verify_baseline(manifest)
+
+
+def test_replay_rejects_missing_or_changed_audio_digest(tmp_path):
+    import pytest
+    path = tmp_path / "audio.wav"; path.write_bytes(b"original")
+    expected = sha256(path)
+    assert verify_audio(path, expected) == expected
+    path.write_bytes(b"changed")
+    for digest in (None, expected):
+        with pytest.raises(RuntimeError, match="audio changed"):
+            verify_audio(path, digest)
+
+
+def test_collection_rejects_baseline_from_different_audio(tmp_path):
+    from speaker_integrity import atomic_json, save_trial_stage, trial_input_digest
+    stem = "2026-09-06_10-00-00"
+    recordings = tmp_path / "audio"; recordings.mkdir()
+    transcripts = tmp_path / "transcripts"; transcripts.mkdir()
+    audio = recordings / (stem + ".wav"); audio.write_bytes(b"candidate audio")
+    data = {"transcript": "[00:00] A: Hello", "_meta": {"audio_duration_seconds": 600}}
+    atomic_json(transcripts / (stem + ".json"), data)
+    cfg = {"attribution_trial": {"enabled": True, "state_dir": str(tmp_path)}}
+    save_trial_stage(cfg, audio, "candidate", data, audio_sha256=trial_input_digest(cfg, audio))
+    atomic_json(tmp_path / "manifest.json", {"start": "2026-09-05T00:00:00+08:00", "end": "2026-09-12T09:00:00+08:00",
+        "timezone": "Asia/Hong_Kong", "recordings_dir": str(recordings), "transcripts_dir": str(transcripts),
+        "baseline_commit": "baseline", "config_sha256": "config"})
+    shadow = tmp_path / "shadows" / stem / "baseline" / (stem + ".json")
+    atomic_json(shadow, data)
+    certificate = {"baseline_commit": "baseline", "config_sha256": "config", "transcript_sha256": sha256(shadow),
+                   "audio_sha256": "different audio"}
+    atomic_json(shadow.parent / "run.json", certificate)
+    assert collect(tmp_path)["paired_baselines"] == 0
+    certificate["audio_sha256"] = sha256(audio)
+    atomic_json(shadow.parent / "run.json", certificate)
+    assert collect(tmp_path)["paired_baselines"] == 1

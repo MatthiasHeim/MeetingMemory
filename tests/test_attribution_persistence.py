@@ -53,3 +53,39 @@ def test_hold_is_seeded_atomically_even_if_later_enrichment_fails(tmp_path, monk
     neon_insert.insert_source(transcript_path=str(path), title="Meeting")
     metadata = json.loads(cursor.execute.call_args.args[1][-1])
     assert metadata["speaker_attribution"]["speaker_dependent_actions"] == "hold"
+
+
+def test_malformed_json_retains_raw_text_insert_fallback(tmp_path, monkeypatch):
+    path = tmp_path / "meeting.json"; path.write_text('{"transcript": "incomplete')
+    conn = MagicMock(); cursor = conn.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (123,)
+    monkeypatch.setattr(neon_insert, "_get_conn", lambda: conn)
+    assert neon_insert.insert_source(transcript_path=str(path), title="Meeting") == 123
+    params = cursor.execute.call_args.args[1]
+    assert path.read_text() in params
+    assert "speaker_attribution" not in json.loads(params[-1])
+
+
+def test_held_counterpart_stays_out_of_calendar_and_notification(monkeypatch):
+    import copy
+    import transcribe_watcher as tw
+    from gemini_processor import GeminiResult
+    watcher = tw.TranscribeWatcher.__new__(tw.TranscribeWatcher)
+    watcher.logger = MagicMock()
+    result = GeminiResult("[00:00] Speaker B: Hello", "en")
+    result.speaker_attribution = {"speaker_dependent_actions": "hold"}
+    verified = {"participant_details": [{"name": "Matthias Heim", "role": "self"}], "company": None}
+    monkeypatch.setattr(tw, "SPEAKER_HINTS_AVAILABLE", True)
+    monkeypatch.setattr(tw, "_detect_counterpart", lambda _: {
+        "name": "Unverified Person", "company": "Unverified Company", "method": "text", "evidence": "guess"})
+    inferred = watcher._infer_counterpart_if_unknown(result, copy.deepcopy(verified))
+    assert inferred["company"] == "Unverified Company"
+    published = watcher._calendar_for_publication(result, inferred, verified)
+    assert published == verified
+    monkeypatch.setattr(watcher, "_telegram_notify_script", lambda: "stub")
+    run = MagicMock(); monkeypatch.setattr(tw.subprocess, "run", run)
+    watcher._notify_telegram_meeting_captured(123, result, published, 600)
+    msg = run.call_args.args[0][-1]
+    assert "held" in msg and "running" not in msg and "Unverified" not in msg
+    result.speaker_attribution = {"speaker_dependent_actions": "require_turn_evidence"}
+    assert watcher._calendar_for_publication(result, inferred, verified) == inferred
