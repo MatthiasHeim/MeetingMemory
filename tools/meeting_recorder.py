@@ -289,6 +289,13 @@ class AudioRecorder:
                     subprocess.Popen([sys.executable, str(Path(__file__).with_name("compress_capture.py")),
                                       "--max-files", "10"], stdout=log, stderr=log,
                                      start_new_session=True)
+                    # Raw WAVs whose MP3 + transcript already exist are pruned
+                    # after audio.wav_retention_days (default 7). The daily
+                    # launchd job com.user.prunerecordings runs the same script.
+                    retention_days = self.config.get("audio", {}).get("wav_retention_days", 7)
+                    subprocess.Popen([sys.executable, str(Path(__file__).with_name("prune_recordings.py")),
+                                      "--days", str(retention_days)], stdout=log, stderr=log,
+                                     start_new_session=True)
             except Exception as e:
                 print(f"Capture housekeeping could not start: {e}", file=sys.stderr)
 
