@@ -137,6 +137,18 @@ Telegram ping sent for source_id=…
 Claude trigger fired: PID=…
 ```
 
+## Disk retention
+
+Raw WAV captures (~1 GB/hour) are only needed until the pipeline has produced
+`Transcripts/<stem>.mp3` (loudness-normalised, kept long-term) and
+`Transcripts/<stem>.json`. `tools/prune_recordings.py` deletes
+`Recordings/<stem>.wav` and the raw tracks in `CaptureArchive/<stem>/` once both
+exist and the WAV is older than `audio.wav_retention_days` (default 7). A
+`Recordings/<stem>.wav.hold` marker keeps a file indefinitely; `.tmp/` is never
+touched. It runs after every recording (from `meeting_recorder.py`) and daily at
+06:30 via `launchd/com.user.prunerecordings.plist`, logging JSON lines to
+`logs/capture-housekeeping.log`. Preview with `--dry-run`.
+
 ## Tests
 
 ```bash
