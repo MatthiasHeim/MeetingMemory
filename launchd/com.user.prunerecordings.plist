@@ -12,7 +12,7 @@
     <key>WorkingDirectory</key><string>/Users/Matthias/Repos/MeetingMemory</string>
     <key>StartCalendarInterval</key>
     <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
-    <key>StandardOutPath</key><string>/Users/Matthias/Documents/MeetingRecorder/logs/capture-housekeeping.log</string>
-    <key>StandardErrorPath</key><string>/Users/Matthias/Documents/MeetingRecorder/logs/capture-housekeeping.log</string>
+    <key>StandardOutPath</key><string>/Users/Matthias/Library/Logs/MeetingRecorder/prune_recordings.log</string>
+    <key>StandardErrorPath</key><string>/Users/Matthias/Library/Logs/MeetingRecorder/prune_recordings.log</string>
 </dict>
 </plist>

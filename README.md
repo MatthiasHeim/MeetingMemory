@@ -147,7 +147,9 @@ exist and the WAV is older than `audio.wav_retention_days` (default 7). A
 `Recordings/<stem>.wav.hold` marker keeps a file indefinitely; `.tmp/` is never
 touched. It runs after every recording (from `meeting_recorder.py`) and daily at
 06:30 via `launchd/com.user.prunerecordings.plist`, logging JSON lines to
-`logs/capture-housekeeping.log`. Preview with `--dry-run`.
+`logs/capture-housekeeping.log` (recorder-triggered) and
+`~/Library/Logs/MeetingRecorder/prune_recordings.log` (launchd; a log path under
+`~/Documents` makes launchd fail with EX_CONFIG 78). Preview with `--dry-run`.
 
 ## Tests
 
