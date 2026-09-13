@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import neon_insert
+from attribution_gate import RESOLVE_THEN_EXTRACT
 from attribution_gate import apply_calendar_bind_to_attribution
 from attribution_gate import calendar_bind_ambiguous
 from attribution_gate import gate
@@ -95,26 +96,48 @@ def test_held_counterpart_stays_out_of_calendar_and_notification(monkeypatch):
 
 
 def _calendar_match(match_count, counterpart="Tanja Example", company="itesys"):
+    search = {
+        "match_count": match_count,
+        "identity_authoritative": match_count == 1,
+        "ambiguous": match_count > 1,
+        "chosen_event_title": f"{counterpart} / Matthias",
+        "candidates": [],
+    }
+    if match_count > 0:
+        search["candidates"] = [{
+            "event_id": "evt-chosen",
+            "title": f"{counterpart} / Matthias",
+            "start": "2026-09-04T08:00:00Z",
+            "company": company,
+            "attendees": [
+                {"name": "Matthias Heim", "role": "self", "company": "Lailix"},
+                {"name": counterpart, "role": "participant", "company": company},
+            ],
+        }]
+    if match_count > 1:
+        search["candidates"].append({
+            "event_id": "evt-sarah",
+            "title": "Sarah / Matthias",
+            "start": "2026-09-04T08:05:00Z",
+            "company": None,
+            "attendees": [
+                {"name": "Matthias Heim", "role": "self", "company": "Lailix"},
+                {"name": "Sarah Stauffer", "role": "participant"},
+            ],
+        })
+    details = [{"name": "Matthias Heim", "role": "self", "company": "Lailix"}]
+    if match_count == 1:
+        details.append({"name": counterpart, "role": "participant", "company": company})
     return {
-        "participant_details": [
-            {"name": "Matthias Heim", "role": "self", "company": "Lailix"},
-            {"name": counterpart, "role": "participant", "company": company},
-        ],
-        "company": company,
-        "calendar_event_id": "evt-chosen",
-        "participant_resolution_log": {
-            "calendar_search": {
-                "match_count": match_count,
-                "identity_authoritative": match_count == 1,
-                "ambiguous": match_count > 1,
-                "chosen_event_title": f"{counterpart} / Matthias",
-            }
-        },
+        "participant_details": details,
+        "company": company if match_count == 1 else None,
+        "calendar_event_id": "evt-chosen" if match_count == 1 else None,
+        "participant_resolution_log": {"calendar_search": search},
     }
 
 
-def test_ambiguous_calendar_bind_holds_named_extraction_and_hides_counterpart(tmp_path):
-    """match_count > 1 is a candidate roster, not identity (2026-09-04 Tanja↔Sarah)."""
+def test_ambiguous_calendar_bind_queues_resolve_then_extract_without_publishing_identity(tmp_path):
+    """match_count > 1 is a roster: Claude may resolve, identity is not published."""
     collision = _calendar_match(2)
     data = {
         "participants": [{"name": "Tanja Example"}],
@@ -123,17 +146,21 @@ def test_ambiguous_calendar_bind_holds_named_extraction_and_hides_counterpart(tm
         "participant_resolution_log": collision["participant_resolution_log"],
     }
     decision = gate(data)
-    assert decision["speaker_dependent_actions"] == "hold"
+    assert decision["speaker_dependent_actions"] == RESOLVE_THEN_EXTRACT
+    assert decision["trigger_claude"] is True
     assert "calendar_identity_review" in decision["missing_stages"]
     assert not decision["allow_named_commitments"]
+    safe = safe_enrichment(data)
+    assert safe["participants"] == [] and safe["speaker_pacing"] == {}
 
     report = apply_calendar_bind_to_attribution(
         {"speaker_dependent_actions": "require_turn_evidence", "status": "partially_checked"},
         collision["participant_resolution_log"]["calendar_search"],
     )
-    assert report["speaker_dependent_actions"] == "hold"
+    assert report["speaker_dependent_actions"] == RESOLVE_THEN_EXTRACT
     assert report["status"] == "needs_review"
     assert report["calendar_search"]["identity_authoritative"] is False
+    assert len(report["calendar_search"]["candidates"]) == 2
 
     path = tmp_path / "collision.json"
     path.write_text(json.dumps({
@@ -144,8 +171,9 @@ def test_ambiguous_calendar_bind_holds_named_extraction_and_hides_counterpart(tm
     watcher = tw.TranscribeWatcher.__new__(tw.TranscribeWatcher)
     watcher.logger = MagicMock()
     watcher._trigger_claude = MagicMock()
-    assert watcher._trigger_claude_if_attributed(path, 940) is False
-    watcher._trigger_claude.assert_not_called()
+    assert watcher._trigger_claude_if_attributed(path, 940) is True
+    watcher._trigger_claude.assert_called_once()
+    assert watcher._trigger_claude.call_args.kwargs["resolve_calendar"] is True
 
     from gemini_processor import GeminiResult
     result = GeminiResult("[00:00] Speaker B: Hello", "de")
@@ -156,6 +184,25 @@ def test_ambiguous_calendar_bind_holds_named_extraction_and_hides_counterpart(tm
     assert [p["name"] for p in published["participant_details"]] == ["Matthias Heim"]
     search = published["participant_resolution_log"]["calendar_search"]
     assert search["match_count"] == 2 and search["ambiguous"] is True
+    assert {c["event_id"] for c in search["candidates"]} == {"evt-chosen", "evt-sarah"}
+
+
+def test_unknown_calendar_decision_stays_held_for_review():
+    from apply_calendar_candidate import apply_unknown_to_transcript
+    data = {
+        "transcript": "[00:00] Speaker B: Hello",
+        "_meta": {"speaker_attribution": {
+            "speaker_dependent_actions": RESOLVE_THEN_EXTRACT,
+            "missing_stages": ["calendar_identity_review"],
+            "calendar_search": _calendar_match(2)["participant_resolution_log"]["calendar_search"],
+        }},
+    }
+    apply_unknown_to_transcript(data, "roster names never spoken", "low")
+    decision = gate(data)
+    assert decision["speaker_dependent_actions"] == "hold"
+    assert decision["trigger_claude"] is False
+    assert not decision["allow_named_commitments"]
+    assert data["_meta"]["speaker_attribution"]["calendar_search"]["resolution"]["decision"] == "unknown"
 
 
 def test_unique_calendar_bind_does_not_hold_on_calendar_alone(tmp_path):

@@ -120,3 +120,22 @@ def test_source_id_passed_in_prompt(tmp_path, monkeypatch):
     captured = _run_trigger(w, monkeypatch, tmp_path)
     prompt = captured["args"][2]  # [claude_path, "-p", prompt, ...]
     assert "--source-id 466" in prompt
+    assert "CALENDAR IDENTITY IS AMBIGUOUS" not in prompt
+
+
+def test_resolve_calendar_appends_step0_roster_instructions(tmp_path, monkeypatch):
+    w = _watcher(tmp_path, {"enabled": True, "config_dir": str(tmp_path / "c")})
+    captured = {}
+
+    def fake_popen(args, cwd=None, env=None, stdout=None, stderr=None):
+        captured["args"] = args
+        return _FakeProc()
+
+    monkeypatch.setattr(tw.subprocess, "Popen", fake_popen)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    w._trigger_claude(tmp_path / "x.json", source_id=940, resolve_calendar=True)
+    prompt = captured["args"][2]
+    assert "--source-id 940" in prompt
+    assert "CALENDAR IDENTITY IS AMBIGUOUS" in prompt
+    assert "apply_calendar_candidate.py" in prompt
+    assert "--unknown" in prompt

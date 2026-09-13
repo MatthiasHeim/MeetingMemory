@@ -242,13 +242,107 @@ def _annotate_calendar_search(search: dict, match_count: int) -> dict:
     """Record whether the nearest event is identity or only a candidate roster.
 
     match_count == 1 is the only authoritative calendar bind. A collision
-    (match_count > 1) still picks a nearest event for Gemini hints, but that
-    name must not be treated as who was in the room.
+    (match_count > 1) keeps every event as a roster for later review and
+    does not treat the nearest title as who was in the room.
     """
     search["match_count"] = match_count
     search["ambiguous"] = match_count > 1
     search["identity_authoritative"] = match_count == 1
     return search
+
+
+def _self_detail() -> dict:
+    return {
+        "name": SELF_NAME, "email": SELF_EMAIL,
+        "company": "Lailix", "role": "self",
+    }
+
+
+def _event_start_raw(ev: dict) -> Optional[str]:
+    return ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+
+
+def _details_from_event(ev: dict, client_names: list[str]) -> tuple[list[dict], list[dict], Optional[str]]:
+    """Attendees of one event as participant_details + forensic resolutions."""
+    pdetails: list[dict] = []
+    resolutions: list[dict] = []
+    derived_company: Optional[str] = None
+    attendees = _dedupe_attendees(ev.get("attendees") or [])
+    if not attendees:
+        pdetails.append(_self_detail())
+        resolutions.append({
+            "name": SELF_NAME, "method": "self",
+            "confidence": "high", "evidence": "calendar event with no attendees",
+        })
+        return pdetails, resolutions, None
+
+    self_seen = False
+    for att in attendees:
+        email = (att.get("email") or "").lower()
+        display = att.get("displayName")
+        if not display and email:
+            display = _humanize_email_local(email.split("@", 1)[0])
+        if not display:
+            continue
+        is_self = (
+            email == SELF_EMAIL
+            or att.get("self") is True
+            or display.strip().lower() == SELF_NAME.lower()
+        )
+        if is_self:
+            if self_seen:
+                resolutions.append({
+                    "name": SELF_NAME, "method": "self_duplicate",
+                    "confidence": "high",
+                    "evidence": (
+                        f"duplicate calendar entry for the host "
+                        f"({email or display!r}) — collapsed, not a "
+                        f"second attendee"
+                    ),
+                })
+                continue
+            self_seen = True
+            pdetails.append(_self_detail())
+            resolutions.append({
+                "name": SELF_NAME, "method": "self",
+                "confidence": "high",
+                "evidence": "calendar attendee email match (self)",
+            })
+            continue
+        company = _company_from_email(email, client_names)
+        if company and not derived_company:
+            derived_company = company
+        pdetails.append({
+            "name": display, "email": email,
+            "company": company, "role": "participant",
+        })
+        resolutions.append({
+            "name": display,
+            "method": "calendar" if not company else "domain_lookup",
+            "confidence": "high" if company else "medium",
+            "evidence": (
+                f"calendar attendee + domain match against client index"
+                if company else "calendar attendee email"
+            ),
+        })
+    if not any((p.get("role") or "").lower() == "self" for p in pdetails):
+        pdetails.insert(0, _self_detail())
+        resolutions.insert(0, {
+            "name": SELF_NAME, "method": "self",
+            "confidence": "high", "evidence": "host not listed on event",
+        })
+    return pdetails, resolutions, derived_company
+
+
+def _candidate_from_event(ev: dict, client_names: list[str]) -> dict:
+    details, _, company = _details_from_event(ev, client_names)
+    return {
+        "event_id": ev.get("id"),
+        "title": ev.get("summary"),
+        "start": _event_start_raw(ev),
+        "attendees": details,
+        "company": company,
+    }
 
 
 # ── Resolution ────────────────────────────────────────────────────────
@@ -301,14 +395,15 @@ def resolve(transcript_path: str | Path) -> dict:
 
     events = _gws_calendar_events(time_min, time_max)
     _annotate_calendar_search(log["calendar_search"], len(events))
+    client_names = _load_client_names()
+    log["calendar_search"]["candidates"] = [
+        _candidate_from_event(ev, client_names) for ev in events
+    ]
 
     chosen = _pick_best_event(events, started)
     if chosen is None:
         logger.info(f"No calendar match for {p.name}")
-        out["participant_details"] = [{
-            "name": SELF_NAME, "email": SELF_EMAIL,
-            "company": "Lailix", "role": "self",
-        }]
+        out["participant_details"] = [_self_detail()]
         log["resolutions"] = [{
             "name": SELF_NAME, "method": "self",
             "confidence": "high",
@@ -318,85 +413,27 @@ def resolve(transcript_path: str | Path) -> dict:
 
     log["calendar_search"]["chosen_event_id"] = chosen.get("id")
     log["calendar_search"]["chosen_event_title"] = chosen.get("summary")
-    out["calendar_event_id"] = chosen.get("id")
 
-    client_names = _load_client_names()
-    pdetails: list[dict] = []
-    resolutions: list[dict] = []
-    derived_company: Optional[str] = None
-
-    attendees = _dedupe_attendees(chosen.get("attendees") or [])
-    if not attendees:
-        # Solo event (no attendees listed); still record self.
-        pdetails.append({
-            "name": SELF_NAME, "email": SELF_EMAIL,
-            "company": "Lailix", "role": "self",
-        })
-        resolutions.append({
+    if log["calendar_search"]["ambiguous"]:
+        # Roster only — nearest title is forensic, not identity. Downstream
+        # seeds generic labels and lets Claude pick event_id or unknown.
+        out["participant_details"] = [_self_detail()]
+        out["calendar_event_id"] = None
+        out["company"] = None
+        log["resolutions"] = [{
             "name": SELF_NAME, "method": "self",
-            "confidence": "high", "evidence": "calendar event with no attendees",
-        })
-    else:
-        self_seen = False
-        for att in attendees:
-            email = (att.get("email") or "").lower()
-            display = att.get("displayName")
-            if not display and email:
-                # No displayName (common for external attendees) → derive a
-                # human name from the email local-part instead of leaking it.
-                display = _humanize_email_local(email.split("@", 1)[0])
-            if not display:
-                continue
-            # Email-based dedup above can't catch a duplicate host entry
-            # that carries a DIFFERENT (or missing) email — e.g. an
-            # organizer alias. An exact full-name match to the host is
-            # treated as the host himself, not a remote namesake, so it
-            # never reaches participant_details as a second "participant".
-            is_self = (
-                email == SELF_EMAIL
-                or att.get("self") is True
-                or display.strip().lower() == SELF_NAME.lower()
-            )
-            if is_self:
-                if self_seen:
-                    resolutions.append({
-                        "name": SELF_NAME, "method": "self_duplicate",
-                        "confidence": "high",
-                        "evidence": (
-                            f"duplicate calendar entry for the host "
-                            f"({email or display!r}) — collapsed, not a "
-                            f"second attendee"
-                        ),
-                    })
-                    continue
-                self_seen = True
-                pdetails.append({
-                    "name": SELF_NAME, "email": SELF_EMAIL,
-                    "company": "Lailix", "role": "self",
-                })
-                resolutions.append({
-                    "name": SELF_NAME, "method": "self",
-                    "confidence": "high",
-                    "evidence": "calendar attendee email match (self)",
-                })
-                continue
-            company = _company_from_email(email, client_names)
-            if company and not derived_company:
-                derived_company = company
-            pdetails.append({
-                "name": display, "email": email,
-                "company": company, "role": "participant",
-            })
-            resolutions.append({
-                "name": display,
-                "method": "calendar" if not company else "domain_lookup",
-                "confidence": "high" if company else "medium",
-                "evidence": (
-                    f"calendar attendee + domain match against client index"
-                    if company else "calendar attendee email"
-                ),
-            })
+            "confidence": "high",
+            "evidence": (
+                f"calendar collision ({len(events)} events) — host only; "
+                f"candidates are a non-authoritative roster"
+            ),
+        }]
+        return out
 
+    pdetails, resolutions, derived_company = _details_from_event(
+        chosen, client_names
+    )
+    out["calendar_event_id"] = chosen.get("id")
     out["participant_details"] = pdetails
     out["participant_resolution_log"] = {
         "calendar_search": log["calendar_search"],

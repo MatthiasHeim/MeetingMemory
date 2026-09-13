@@ -157,10 +157,13 @@ def test_resolve_marks_unique_bind_authoritative(monkeypatch):
     monkeypatch.setattr(cr, "_gws_calendar_events", lambda *a, **k: [event])
     monkeypatch.setattr(cr, "_load_client_names", lambda: [])
 
-    search = cr.resolve("2026-08-10_15-59-30.json")["participant_resolution_log"]["calendar_search"]
+    result = cr.resolve("2026-08-10_15-59-30.json")
+    search = result["participant_resolution_log"]["calendar_search"]
     assert search["match_count"] == 1
     assert search["identity_authoritative"] is True
     assert search["ambiguous"] is False
+    assert len(search.get("candidates") or []) == 1
+    assert any(p.get("name") == "Tanja Example" for p in result["participant_details"])
 
 
 def test_resolve_marks_collision_as_non_authoritative_roster(monkeypatch):
@@ -187,12 +190,16 @@ def test_resolve_marks_collision_as_non_authoritative_roster(monkeypatch):
     assert search["match_count"] == 2
     assert search["identity_authoritative"] is False
     assert search["ambiguous"] is True
-    # Nearest event is still a candidate roster for Gemini, not withheld here.
-    counterparts = [
-        p.get("name") for p in result["participant_details"]
-        if p.get("role") != "self"
-    ]
-    assert counterparts and counterparts[0] in {"Tanja Example", "Sarah Stauffer"}
+    assert [p["name"] for p in result["participant_details"]] == ["Matthias Heim"]
+    assert result["company"] is None and result["calendar_event_id"] is None
+    roster_names = {
+        person.get("name")
+        for cand in search["candidates"]
+        for person in cand.get("attendees") or []
+        if person.get("role") != "self"
+    }
+    assert roster_names == {"Tanja Example", "Sarah Stauffer"}
+    assert {c["event_id"] for c in search["candidates"]} == {"evt-tanja", "evt-sarah"}
 
 
 def test_resolve_empty_window_is_not_a_collision(monkeypatch):

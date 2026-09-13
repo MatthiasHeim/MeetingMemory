@@ -30,8 +30,11 @@ from typing import Optional
 
 from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage, trial_input_digest
 from attribution_gate import (
+    RESOLVE_THEN_EXTRACT,
     apply_calendar_bind_to_attribution,
+    allows_claude_trigger,
     calendar_bind_ambiguous,
+    claude_prompt_suffix,
     gate as attribution_gate,
     safe_calendar_publication,
     safe_enrichment,
@@ -1273,7 +1276,15 @@ class TranscribeWatcher:
             # Step 4a2: Counterpart hint when calendar gave no externals.
             # Mutates cal_match (or creates one) so the reconcile below has
             # a canonical name to rewrite "Speaker B" to.
-            cal_match = self._infer_counterpart_if_unknown(result, cal_match)
+            if calendar_bind_ambiguous(cal_match or {}):
+                # Collision: do not invent a counterpart. Roster stays in
+                # calendar_search.candidates for Claude Step 0.
+                self.logger.info(
+                    "Calendar collision: skipping counterpart inference; "
+                    "generic labels + roster only"
+                )
+            else:
+                cal_match = self._infer_counterpart_if_unknown(result, cal_match)
 
             self._reconcile_speakers_inplace(result, cal_match)
             save_trial_stage(self.config, audio_file, "before_channel_verify",
@@ -1322,7 +1333,7 @@ class TranscribeWatcher:
 
             # Step 5: Send webhook if configured (legacy path; disabled by default)
             if (self.config.get('webhook_gemini', {}).get('enabled', False)
-                    and attribution_gate(result.parsed_response)["speaker_dependent_actions"] != "hold"):
+                    and attribution_gate(result.parsed_response)["speaker_dependent_actions"] == "require_turn_evidence"):
                 self._send_gemini_webhook(audio_file, mp3_path, result, audio_duration, processing_time)
 
             # Step 6a: Seed sources row in InsightBase.
@@ -1370,20 +1381,29 @@ class TranscribeWatcher:
         return verified if attribution_gate(payload)["speaker_dependent_actions"] == "hold" else inferred
 
     def _trigger_claude_if_attributed(self, json_path: Path, source_id=None):
-        """The legacy action workflow cannot enforce per-turn permissions.
+        """Start /meeting-actions only when the gate allows a Claude pass.
 
-        Hold it entirely until attribution evidence is available. Raw capture,
-        source storage and neutral metadata are already durable above. The
-        independent stage queue, not an action-generating retry, owns recovery.
+        Incomplete acoustic/semantic attribution still holds entirely.
+        A calendar collision is resolve_then_extract: Claude may pick
+        event_id or unknown from the persisted roster, then extract only
+        after a high-confidence bind. Named commitments stay blocked.
         """
         try:
             decision = attribution_gate(json.loads(json_path.read_text()))
         except (OSError, ValueError):
             decision = {"speaker_dependent_actions": "hold"}
-        if decision["speaker_dependent_actions"] == "hold":
+        if not allows_claude_trigger(decision):
             self.logger.warning("Attribution pending: source retained; insights/actions/drafts held for review")
             return False
-        self._trigger_claude(json_path, source_id=source_id)
+        resolve_calendar = decision["speaker_dependent_actions"] == RESOLVE_THEN_EXTRACT
+        if resolve_calendar:
+            self.logger.info(
+                "Calendar collision: queuing Claude resolve-then-extract "
+                "(named commitments still blocked)"
+            )
+        self._trigger_claude(
+            json_path, source_id=source_id, resolve_calendar=resolve_calendar
+        )
         return True
 
     def _send_gemini_webhook(self, audio_file: Path, mp3_path: Path,
@@ -2172,9 +2192,13 @@ class TranscribeWatcher:
             if result else 0
         )
         partial = bool(result and getattr(result, "partial", False))
-        held = attribution_gate(result.parsed_response if result else {})["speaker_dependent_actions"] == "hold"
-        workflow_status = ("Speaker verification pending; insights/actions/drafts held."
-                           if held else "Claude /meeting-actions queued…")
+        policy = attribution_gate(result.parsed_response if result else {})["speaker_dependent_actions"]
+        if policy == "hold":
+            workflow_status = "Speaker verification pending; insights/actions/drafts held."
+        elif policy == RESOLVE_THEN_EXTRACT:
+            workflow_status = "Claude resolving calendar collision, then /meeting-actions…"
+        else:
+            workflow_status = "Claude /meeting-actions queued…"
         msg = (
             f"Meeting captured (#{source_id})\n"
             f"{title}\n"
@@ -2411,7 +2435,8 @@ class TranscribeWatcher:
         except Exception as e:
             self.logger.warning(f"Telegram give-up alert failed: {e}")
 
-    def _trigger_claude(self, transcript_path: Path, source_id: Optional[int] = None):
+    def _trigger_claude(self, transcript_path: Path, source_id: Optional[int] = None,
+                       resolve_calendar: bool = False):
         """Fire-and-forget headless Claude session to process transcript.
 
         If source_id is provided, it is passed to /meeting-actions as a
@@ -2419,6 +2444,9 @@ class TranscribeWatcher:
         a fresh one. The watcher seeds the row (see
         _seed_insightbase_source) so a record persists even if this
         Claude session never runs.
+
+        resolve_calendar appends Step 0 instructions so the same pass
+        disambiguates an ambiguous calendar roster before extraction.
         """
         claude_config = self.config.get('claude_trigger', {})
         if not claude_config.get('enabled', False):
@@ -2434,6 +2462,9 @@ class TranscribeWatcher:
             f"Read .claude/commands/{command}.md and process transcript: "
             f"{transcript_path}{source_id_arg}"
         )
+        if resolve_calendar:
+            apply_cli = str(Path(__file__).resolve().parent / "apply_calendar_candidate.py")
+            prompt += "\n" + claude_prompt_suffix(source_id, apply_cli)
 
         # Log file for this Claude session
         log_dir = expand_path(self.config['paths']['logs'])
