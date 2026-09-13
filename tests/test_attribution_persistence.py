@@ -4,7 +4,10 @@ from pathlib import Path
 from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import neon_insert
+from attribution_gate import apply_calendar_bind_to_attribution
+from attribution_gate import calendar_bind_ambiguous
 from attribution_gate import gate
+from attribution_gate import safe_calendar_publication
 from attribution_gate import safe_enrichment
 
 
@@ -89,3 +92,128 @@ def test_held_counterpart_stays_out_of_calendar_and_notification(monkeypatch):
     assert "held" in msg and "running" not in msg and "Unverified" not in msg
     result.speaker_attribution = {"speaker_dependent_actions": "require_turn_evidence"}
     assert watcher._calendar_for_publication(result, inferred, verified) == inferred
+
+
+def _calendar_match(match_count, counterpart="Tanja Example", company="itesys"):
+    return {
+        "participant_details": [
+            {"name": "Matthias Heim", "role": "self", "company": "Lailix"},
+            {"name": counterpart, "role": "participant", "company": company},
+        ],
+        "company": company,
+        "calendar_event_id": "evt-chosen",
+        "participant_resolution_log": {
+            "calendar_search": {
+                "match_count": match_count,
+                "identity_authoritative": match_count == 1,
+                "ambiguous": match_count > 1,
+                "chosen_event_title": f"{counterpart} / Matthias",
+            }
+        },
+    }
+
+
+def test_ambiguous_calendar_bind_holds_named_extraction_and_hides_counterpart(tmp_path):
+    """match_count > 1 is a candidate roster, not identity (2026-09-04 Tanja↔Sarah)."""
+    collision = _calendar_match(2)
+    data = {
+        "participants": [{"name": "Tanja Example"}],
+        "speaker_pacing": {"Tanja Example": {}},
+        "_meta": {"speaker_attribution": {"speaker_dependent_actions": "require_turn_evidence"}},
+        "participant_resolution_log": collision["participant_resolution_log"],
+    }
+    decision = gate(data)
+    assert decision["speaker_dependent_actions"] == "hold"
+    assert "calendar_identity_review" in decision["missing_stages"]
+    assert not decision["allow_named_commitments"]
+
+    report = apply_calendar_bind_to_attribution(
+        {"speaker_dependent_actions": "require_turn_evidence", "status": "partially_checked"},
+        collision["participant_resolution_log"]["calendar_search"],
+    )
+    assert report["speaker_dependent_actions"] == "hold"
+    assert report["status"] == "needs_review"
+    assert report["calendar_search"]["identity_authoritative"] is False
+
+    path = tmp_path / "collision.json"
+    path.write_text(json.dumps({
+        **data,
+        "_meta": {"speaker_attribution": report},
+    }))
+    import transcribe_watcher as tw
+    watcher = tw.TranscribeWatcher.__new__(tw.TranscribeWatcher)
+    watcher.logger = MagicMock()
+    watcher._trigger_claude = MagicMock()
+    assert watcher._trigger_claude_if_attributed(path, 940) is False
+    watcher._trigger_claude.assert_not_called()
+
+    from gemini_processor import GeminiResult
+    result = GeminiResult("[00:00] Speaker B: Hello", "de")
+    result.speaker_attribution = report
+    published = watcher._calendar_for_publication(result, collision, collision)
+    assert published["company"] is None
+    assert published["calendar_event_id"] is None
+    assert [p["name"] for p in published["participant_details"]] == ["Matthias Heim"]
+    search = published["participant_resolution_log"]["calendar_search"]
+    assert search["match_count"] == 2 and search["ambiguous"] is True
+
+
+def test_unique_calendar_bind_does_not_hold_on_calendar_alone(tmp_path):
+    unique = _calendar_match(1)
+    data = {
+        "_meta": {"speaker_attribution": {"speaker_dependent_actions": "require_turn_evidence"}},
+        "participant_resolution_log": unique["participant_resolution_log"],
+    }
+    assert gate(data)["speaker_dependent_actions"] == "require_turn_evidence"
+    assert "calendar_identity_review" not in gate(data)["missing_stages"]
+    assert calendar_bind_ambiguous(unique) is False
+    assert safe_calendar_publication(unique) == unique
+
+    path = tmp_path / "unique.json"
+    path.write_text(json.dumps(data))
+    import transcribe_watcher as tw
+    watcher = tw.TranscribeWatcher.__new__(tw.TranscribeWatcher)
+    watcher.logger = MagicMock()
+    watcher._trigger_claude = MagicMock()
+    assert watcher._trigger_claude_if_attributed(path, 939) is True
+    watcher._trigger_claude.assert_called_once()
+
+    from gemini_processor import GeminiResult
+    result = GeminiResult("[00:00] Speaker B: Hello", "de")
+    result.speaker_attribution = {"speaker_dependent_actions": "require_turn_evidence"}
+    assert watcher._calendar_for_publication(result, unique, unique) == unique
+
+
+def test_empty_calendar_bind_does_not_hold_on_calendar_alone(tmp_path):
+    empty = {
+        "participant_details": [{"name": "Matthias Heim", "role": "self", "company": "Lailix"}],
+        "company": None,
+        "calendar_event_id": None,
+        "participant_resolution_log": {
+            "calendar_search": {
+                "match_count": 0,
+                "identity_authoritative": False,
+                "ambiguous": False,
+            }
+        },
+    }
+    data = {
+        "_meta": {"speaker_attribution": {"speaker_dependent_actions": "require_turn_evidence"}},
+        "participant_resolution_log": empty["participant_resolution_log"],
+    }
+    assert gate(data)["speaker_dependent_actions"] == "require_turn_evidence"
+    assert calendar_bind_ambiguous(empty) is False
+    assert safe_calendar_publication(empty) == empty
+
+    path = tmp_path / "empty.json"
+    path.write_text(json.dumps(data))
+    import transcribe_watcher as tw
+    watcher = tw.TranscribeWatcher.__new__(tw.TranscribeWatcher)
+    watcher.logger = MagicMock()
+    watcher._trigger_claude = MagicMock()
+    assert watcher._trigger_claude_if_attributed(path, 100) is True
+
+    from gemini_processor import GeminiResult
+    result = GeminiResult("[00:00] Speaker B: Hello", "de")
+    result.speaker_attribution = {"speaker_dependent_actions": "require_turn_evidence"}
+    assert watcher._calendar_for_publication(result, empty, empty) == empty

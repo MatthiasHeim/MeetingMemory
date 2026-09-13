@@ -29,7 +29,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from speaker_integrity import atomic_json, digital_silence, finalize_attribution, save_trial_stage, trial_input_digest
-from attribution_gate import gate as attribution_gate, safe_enrichment
+from attribution_gate import (
+    apply_calendar_bind_to_attribution,
+    calendar_bind_ambiguous,
+    gate as attribution_gate,
+    safe_calendar_publication,
+    safe_enrichment,
+)
 
 import yaml
 import requests
@@ -1298,6 +1304,12 @@ class TranscribeWatcher:
             # Provenance: whether attribution was channel-verified at all.
             result.channel_separation = channel_separation
             finalize_attribution(result, pre_attribution)
+            cal_search = (
+                (verified_calendar or {}).get("participant_resolution_log") or {}
+            ).get("calendar_search")
+            result.speaker_attribution = apply_calendar_bind_to_attribution(
+                result.speaker_attribution, cal_search
+            )
             save_trial_stage(self.config, audio_file, "candidate",
                              result.parsed_response, known_attendees=known_attendees,
                              audio_sha256=trial_audio_sha256,
@@ -1348,7 +1360,14 @@ class TranscribeWatcher:
 
     @staticmethod
     def _calendar_for_publication(result, inferred, verified):
-        return verified if attribution_gate(result.parsed_response)["speaker_dependent_actions"] == "hold" else inferred
+        payload = result.parsed_response if result else {}
+        if (calendar_bind_ambiguous(inferred)
+                or calendar_bind_ambiguous(verified)
+                or calendar_bind_ambiguous(payload)):
+            # Collision: keep the forensic log, but do not publish the
+            # nearest event's counterpart as identity (2026-09-04 Tanja↔Sarah).
+            return safe_calendar_publication(inferred or verified)
+        return verified if attribution_gate(payload)["speaker_dependent_actions"] == "hold" else inferred
 
     def _trigger_claude_if_attributed(self, json_path: Path, source_id=None):
         """The legacy action workflow cannot enforce per-turn permissions.

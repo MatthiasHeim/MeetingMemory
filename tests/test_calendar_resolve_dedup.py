@@ -147,3 +147,61 @@ def test_resolve_dedupes_identical_raw_attendee_entries(monkeypatch):
     result = cr.resolve("2026-08-10_15-59-30.json")
     names = [p["name"] for p in result["participant_details"]]
     assert names == ["Matthias Heim", "Stefan Sieber"]
+
+
+def test_resolve_marks_unique_bind_authoritative(monkeypatch):
+    event = _event([
+        {"email": "matthias@lailix.com", "displayName": "Matthias Heim", "self": True},
+        {"email": "tanja@example.com", "displayName": "Tanja Example"},
+    ])
+    monkeypatch.setattr(cr, "_gws_calendar_events", lambda *a, **k: [event])
+    monkeypatch.setattr(cr, "_load_client_names", lambda: [])
+
+    search = cr.resolve("2026-08-10_15-59-30.json")["participant_resolution_log"]["calendar_search"]
+    assert search["match_count"] == 1
+    assert search["identity_authoritative"] is True
+    assert search["ambiguous"] is False
+
+
+def test_resolve_marks_collision_as_non_authoritative_roster(monkeypatch):
+    tanja = _event([
+        {"email": "matthias@lailix.com", "displayName": "Matthias Heim", "self": True},
+        {"email": "tanja@example.com", "displayName": "Tanja Example"},
+    ])
+    tanja["id"] = "evt-tanja"
+    tanja["summary"] = "Tanja / Matthias"
+    sarah = {
+        "id": "evt-sarah",
+        "summary": "Sarah / Matthias",
+        "start": {"dateTime": "2026-08-10T14:05:00Z"},
+        "attendees": [
+            {"email": "matthias@lailix.com", "displayName": "Matthias Heim", "self": True},
+            {"email": "sarah@example.com", "displayName": "Sarah Stauffer"},
+        ],
+    }
+    monkeypatch.setattr(cr, "_gws_calendar_events", lambda *a, **k: [tanja, sarah])
+    monkeypatch.setattr(cr, "_load_client_names", lambda: [])
+
+    result = cr.resolve("2026-08-10_15-59-30.json")
+    search = result["participant_resolution_log"]["calendar_search"]
+    assert search["match_count"] == 2
+    assert search["identity_authoritative"] is False
+    assert search["ambiguous"] is True
+    # Nearest event is still a candidate roster for Gemini, not withheld here.
+    counterparts = [
+        p.get("name") for p in result["participant_details"]
+        if p.get("role") != "self"
+    ]
+    assert counterparts and counterparts[0] in {"Tanja Example", "Sarah Stauffer"}
+
+
+def test_resolve_empty_window_is_not_a_collision(monkeypatch):
+    monkeypatch.setattr(cr, "_gws_calendar_events", lambda *a, **k: [])
+    monkeypatch.setattr(cr, "_load_client_names", lambda: [])
+
+    result = cr.resolve("2026-08-10_15-59-30.json")
+    search = result["participant_resolution_log"]["calendar_search"]
+    assert search["match_count"] == 0
+    assert search["identity_authoritative"] is False
+    assert search["ambiguous"] is False
+    assert [p["name"] for p in result["participant_details"]] == ["Matthias Heim"]

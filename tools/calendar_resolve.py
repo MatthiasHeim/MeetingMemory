@@ -238,6 +238,19 @@ def _pick_best_event(events: list[dict], target: datetime) -> Optional[dict]:
     return scored[0][2]
 
 
+def _annotate_calendar_search(search: dict, match_count: int) -> dict:
+    """Record whether the nearest event is identity or only a candidate roster.
+
+    match_count == 1 is the only authoritative calendar bind. A collision
+    (match_count > 1) still picks a nearest event for Gemini hints, but that
+    name must not be treated as who was in the room.
+    """
+    search["match_count"] = match_count
+    search["ambiguous"] = match_count > 1
+    search["identity_authoritative"] = match_count == 1
+    return search
+
+
 # ── Resolution ────────────────────────────────────────────────────────
 
 def resolve(transcript_path: str | Path) -> dict:
@@ -255,6 +268,8 @@ def resolve(transcript_path: str | Path) -> dict:
             "match_count": 0,
             "chosen_event_id": None,
             "chosen_event_title": None,
+            "identity_authoritative": False,
+            "ambiguous": False,
         },
         "resolutions": [],
     }
@@ -285,7 +300,7 @@ def resolve(transcript_path: str | Path) -> dict:
     )
 
     events = _gws_calendar_events(time_min, time_max)
-    log["calendar_search"]["match_count"] = len(events)
+    _annotate_calendar_search(log["calendar_search"], len(events))
 
     chosen = _pick_best_event(events, started)
     if chosen is None:
