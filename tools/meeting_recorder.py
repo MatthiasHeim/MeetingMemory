@@ -347,11 +347,39 @@ class MeetingRecorderApp(rumps.App):
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize recorder
-        self.recorder = AudioRecorder(config)
+        backend = config.get('audio', {}).get('capture_backend', 'legacy')
+        if backend == 'screencapturekit':
+            from native_recording import NativeAudioRecorder
+            self.recorder = NativeAudioRecorder(config)
+        elif backend == 'legacy':
+            self.recorder = AudioRecorder(config)
+        else:
+            raise ValueError(f'Unknown capture backend: {backend}')
         self.recording_start_time: Optional[datetime] = None
+        self._native_health_warning = None
+        self._health_timer = rumps.Timer(self._check_capture_health, 2)
+        self._health_timer.start()
 
         # Build menu
         self._build_menu()
+
+    def _check_capture_health(self, _):
+        if not self.recorder.is_recording or not hasattr(self.recorder, 'status'):
+            return
+        try:
+            status = self.recorder.status()
+            state = status.get('status', 'unknown')
+        except Exception as exc:
+            state, status = 'unknown', {'errors': [str(exc)]}
+        if state in ('starting', 'degraded', 'failed', 'unknown'):
+            self.title = "⚠ Recording"
+            if state != self._native_health_warning:
+                self._native_health_warning = state
+                rumps.notification(title="MeetingRecorder", subtitle="Capture needs attention",
+                                   message="One or more audio sources may be missing. Stop to preserve captured segments.")
+        elif state == 'recording':
+            self.title = TITLE_RECORDING
+            self._native_health_warning = None
 
     def _build_menu(self):
         """Build the menu bar menu."""
@@ -381,20 +409,28 @@ class MeetingRecorderApp(rumps.App):
         output_file = self.recordings_dir / f"{timestamp}.wav"
 
         try:
+            self.title = "Starting…"
+            sender.title = "Starting recording…"
             self.recorder.start(output_file)
             self.recording_start_time = datetime.now()
+            self._native_health_warning = None
 
             # Update UI
-            self.title = TITLE_RECORDING
+            native_state = (getattr(self.recorder, 'last_status', None) or {}).get('status')
+            needs_attention = native_state in ('starting', 'degraded')
+            self.title = "⚠ Recording" if needs_attention else TITLE_RECORDING
             sender.title = "Stop Recording"
 
             rumps.notification(
                 title="MeetingRecorder",
-                subtitle="Recording started",
-                message=f"Saving to: {output_file.name}"
+                subtitle="Capture needs attention" if needs_attention else "Recording started",
+                message=("Some audio sources are not ready. You can stop the capture at any time."
+                         if needs_attention else f"Saving to: {output_file.name}")
             )
 
         except Exception as e:
+            self.title = TITLE_IDLE
+            sender.title = "Start Recording"
             rumps.notification(
                 title="MeetingRecorder",
                 subtitle="Error",
@@ -403,7 +439,19 @@ class MeetingRecorderApp(rumps.App):
 
     def _stop_recording(self, sender):
         """Stop the current recording."""
-        output_file = self.recorder.stop()
+        try:
+            output_file = self.recorder.stop()
+        except Exception as exc:
+            if self.recorder.is_recording:
+                self.title = "⚠ Recording"
+                sender.title = "Retry Stop Recording"
+            else:
+                self.title = TITLE_IDLE
+                sender.title = "Start Recording"
+                self.recording_start_time = None
+            rumps.notification(title="MeetingRecorder", subtitle="Capture needs recovery",
+                               message=f"Original segments retained. {exc}")
+            return
 
         # Calculate duration
         duration = ""

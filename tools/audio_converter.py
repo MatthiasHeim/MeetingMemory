@@ -2,12 +2,13 @@
 """
 Audio Converter - WAV to MP3 conversion for Gemini audio processing.
 
-Extracts the microphone channel (channel 3) from multi-channel recordings
-and converts to high-quality MP3 for efficient upload to Gemini API.
+Creates legacy Gemini MP3 derivatives and lossless source-track exports for
+multi-channel recordings.
 """
 
-import subprocess
 import logging
+import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
@@ -137,15 +138,17 @@ def get_channel_count(audio_path: Path) -> int:
     return int(result.stdout.strip())
 
 
-def probe_channel_activity(audio_path: Path, probe_seconds: int = 60,
+def probe_channel_activity(audio_path: Path, probe_seconds: Optional[int] = None,
                            silence_db: float = SILENCE_THRESHOLD_DB
                            ) -> SourceTopologyInfo:
-    """Probe per-channel mean volume and classify source topology.
+    """Classify activity from the complete recording without loading it in RAM.
 
-    Some macOS capture pipelines (e.g. BlackHole with unusual routing) put
-    audio on only one of the 3 channels, with the other two at digital silence.
-    Equal-weight pre-mixing attenuates the real signal; extracting only the
-    active channel(s) preserves Swiss German ASR accuracy.
+    ``probe_seconds`` remains accepted for callers written before the source
+    preservation change, but it is deliberately ignored.  A first-minute
+    decision can erase a system source that begins after a participant joins
+    late.  Each ffmpeg invocation streams one channel through ``volumedetect``
+    and retains only aggregate statistics, so complete-file classification has
+    bounded Python memory use.
 
     Topology is intentionally conservative:
       - single_source: zero/one active channel, including 3-channel files with
@@ -155,13 +158,20 @@ def probe_channel_activity(audio_path: Path, probe_seconds: int = 60,
       - unknown: multiple active channels, but not the host+system shape.
     """
     import re
+    if probe_seconds is not None:
+        logger.debug(
+            "Ignoring deprecated probe_seconds=%s; channel activity is always "
+            "measured across the complete recording",
+            probe_seconds,
+        )
     channels = get_channel_count(audio_path)
     active = []
     channel_mean_db: dict[int, float] = {}
     for i in range(channels):
         p = subprocess.run(
-            [FFMPEG_PATH, '-i', str(audio_path), '-t', str(probe_seconds),
-             '-af', f'pan=mono|c0=c{i},volumedetect', '-f', 'null', '-'],
+            [FFMPEG_PATH, '-nostdin', '-nostats', '-i', str(audio_path),
+             '-map', '0:a:0', '-af', f'pan=mono|c0=c{i},volumedetect',
+             '-f', 'null', '-'],
             capture_output=True, text=True,
         )
         m = re.search(r'mean_volume:\s*(-?[0-9.]+)\s*dB', p.stderr)
@@ -186,19 +196,114 @@ def probe_channel_activity(audio_path: Path, probe_seconds: int = 60,
     )
 
 
-def classify_source_topology(audio_path: Path, probe_seconds: int = 60,
+def classify_source_topology(audio_path: Path, probe_seconds: Optional[int] = None,
                              silence_db: float = SILENCE_THRESHOLD_DB
                              ) -> SourceTopologyInfo:
     """Return active-channel info and source topology for a recording."""
     return probe_channel_activity(audio_path, probe_seconds, silence_db)
 
 
-def detect_active_channels(audio_path: Path, probe_seconds: int = 60,
+def detect_active_channels(audio_path: Path, probe_seconds: Optional[int] = None,
                             silence_db: float = SILENCE_THRESHOLD_DB) -> list:
-    """Detect which channels contain audio above the silence threshold."""
+    """Detect channels active anywhere in the complete recording.
+
+    ``probe_seconds`` is a compatibility-only argument; see
+    :func:`probe_channel_activity`.
+    """
     info = probe_channel_activity(audio_path, probe_seconds, silence_db)
     active = info.active_channels
     return active
+
+
+def _export_lossless_flac(
+    input_path: Path,
+    output_path: Path,
+    audio_filter: Optional[str] = None,
+) -> Path:
+    """Export one complete source track as FLAC with an atomic final rename.
+
+    The optional filters below are pure channel routing (no downmixing,
+    resampling, trimming, or loudness normalization).  They therefore keep
+    the original samples for the selected channel(s); FLAC then keeps those
+    routed samples losslessly.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError("Refusing to overwrite the source audio with a derived track")
+
+    temporary = output_path.with_name(
+        f"{output_path.stem}.partial{output_path.suffix}"
+    )
+    temporary.unlink(missing_ok=True)
+    cmd = [
+        FFMPEG_PATH, '-nostdin', '-y', '-i', str(input_path),
+        '-map', '0:a:0',
+    ]
+    if audio_filter:
+        cmd.extend(['-af', audio_filter])
+    cmd.extend([
+        '-c:a', 'flac', '-compression_level', '8', str(temporary),
+    ])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not temporary.is_file():
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"ffmpeg lossless source export failed for {input_path}: "
+            f"{result.stderr[-500:]}"
+        )
+    os.replace(temporary, output_path)
+    return output_path
+
+
+def extract_source_tracks(input_path: Path, output_dir: Path) -> list[dict]:
+    """Preserve full-duration capture sources as lossless FLAC artifacts.
+
+    Legacy MeetingRecorder hybrid WAVs have a known physical layout:
+
+    * channel 0: microphone;
+    * channels 1 and 2: one stereo system-audio source.
+
+    Those files produce exactly two artifacts, ``mic`` (mono) and ``system``
+    (stereo).  The system channels are retained together rather than averaged
+    or split into invented remote participants.  Mono and stereo files are
+    deliberately opaque: both produce one ``audio`` artifact with their
+    original channel count.  Unknown layouts with more than three channels
+    also produce one opaque multichannel ``audio`` artifact.
+
+    Legacy captures have no certified common first-sample timestamp.  Every
+    returned source therefore explicitly carries the unverified sample-zero
+    timing basis; callers must not treat it as an alignment claim.
+    """
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    channels = get_channel_count(input_path)
+    if channels < 1:
+        raise RuntimeError(f"No audio channels found in {input_path}")
+
+    if channels == 3:
+        specifications = [
+            ('mic', 'pan=mono|c0=c0'),
+            ('system', 'pan=stereo|c0=c1|c1=c2'),
+        ]
+    else:
+        # A stereo file can be a room recording, a platform mix, or any other
+        # opaque source.  It is not evidence of a host/remote split.
+        specifications = [('audio', None)]
+
+    sources: list[dict] = []
+    for source_id, audio_filter in specifications:
+        target = output_dir / f"{input_path.stem}.{source_id}.flac"
+        path = _export_lossless_flac(input_path, target, audio_filter)
+        sources.append({
+            'source_id': source_id,
+            'path': str(path.resolve()),
+            'start_seconds': 0.0,
+            'timing_basis': 'unverified_sample_zero',
+        })
+    return sources
 
 
 def _run_loudnorm_mp3(
@@ -249,16 +354,18 @@ def convert_to_mp3(
 ) -> Path:
     """Convert audio file to high-quality MP3 optimized for speech recognition.
 
-    For MeetingRecorder 3-channel audio:
-    - Channel 0-1: System audio (stereo)
-    - Channel 2: Microphone (mono) <- This is what we want
+    Legacy MeetingRecorder 3-channel audio uses channel 0 for the microphone
+    and channels 1-2 for one stereo system source. This legacy MP3 helper may
+    produce a mono mix for Gemini; callers needing source evidence should use
+    :func:`extract_source_tracks` first.
 
     Args:
         input_path: Path to input audio file (WAV, etc.)
         output_path: Path for output MP3 (default: same name with .mp3)
         extract_channel: Channel index to extract (0-based).
-                        If None, auto-detects: extracts channel 2 for 3-channel,
-                        or mixes all channels for stereo.
+                        If None, classifies activity over the *full* file and
+                        mixes the selected channels. Explicit extraction keeps
+                        its legacy behavior.
         quality: LAME quality setting (0=best, 9=worst). Default 2 (~190kbps VBR)
 
     Returns:
@@ -290,8 +397,9 @@ def convert_to_mp3(
         active_channels = None
         logger.info("Input is mono, no channel extraction needed")
     elif num_channels >= 3:
-        # Detect active channels — BlackHole routing sometimes puts audio on
-        # only one of 3 channels; averaging silent channels attenuates signal.
+        # Detect activity across the complete file. Never make a permanent
+        # source-selection decision from a quiet first minute: a later joining
+        # remote participant is still audio evidence.
         active_channels = detect_active_channels(input_path)
         if not active_channels:
             logger.warning(f"No active channels detected, falling back to equal-weight mix")
@@ -341,8 +449,8 @@ def convert_for_gemini(
     """Convert audio file optimized for Gemini API upload.
 
     This is the main entry point for the Gemini audio pipeline.
-    It extracts the mic channel from MeetingRecorder recordings
-    and converts to high-quality MP3.
+    It makes a legacy mono derivative for Gemini. It does not replace the
+    lossless source tracks produced by :func:`extract_source_tracks`.
 
     Args:
         input_path: Path to input WAV file

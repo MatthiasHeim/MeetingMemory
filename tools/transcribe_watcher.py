@@ -562,11 +562,16 @@ class TranscribeWatcher:
     def __init__(self, config: dict, logger: logging.Logger):
         self.config = config
         self.logger = logger
+        pipeline_name = (config.get('processing') or {}).get('transcription_pipeline', 'legacy')
+        if pipeline_name not in ('legacy', 'durable_sources'):
+            raise ValueError(f'Unknown transcription pipeline: {pipeline_name}')
+        if self._uses_durable_sources() and (config.get('processing') or {}).get('mode') != 'gemini':
+            raise ValueError('durable_sources requires processing.mode=gemini')
 
         # Expand paths
         self.recordings_dir = expand_path(config['paths']['recordings'])
         self.transcripts_dir = expand_path(config['paths']['transcripts'])
-        self.noscribe_path = Path(config['noscribe']['path'])
+        self.noscribe_path = Path('') if self._uses_durable_sources() else Path(config['noscribe']['path'])
 
         # Ensure directories exist
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
@@ -577,7 +582,7 @@ class TranscribeWatcher:
         self.logger.info(f"Processing mode: {self.processing_mode}")
 
         # Validate Gemini availability if needed
-        if self.processing_mode in ('gemini', 'both') and not GEMINI_AVAILABLE:
+        if self.processing_mode in ('gemini', 'both') and not GEMINI_AVAILABLE and not self._uses_durable_sources():
             self.logger.warning(
                 "Gemini processing requested but modules not available. "
                 "Falling back to whisper mode. Install: pip install google-genai"
@@ -586,7 +591,7 @@ class TranscribeWatcher:
 
         # Initialize Gemini processor if needed
         self.gemini_processor = None
-        if self.processing_mode in ('gemini', 'both') and GEMINI_AVAILABLE:
+        if self.processing_mode in ('gemini', 'both') and GEMINI_AVAILABLE and not self._uses_durable_sources():
             gemini_config = config.get('gemini', {})
             api_key = os.environ.get(gemini_config.get('api_key_env', 'GEMINI_API_KEY'))
             if api_key:
@@ -692,8 +697,18 @@ class TranscribeWatcher:
             if not (self.transcripts_dir / f"{wav_file.stem}.html").exists():
                 return True
         if self.processing_mode in ('gemini', 'both'):
-            if not (self.transcripts_dir / f"{wav_file.stem}.json").exists():
+            result_path = self.transcripts_dir / f"{wav_file.stem}.json"
+            if not result_path.exists():
                 return True
+            if self._uses_durable_sources():
+                try:
+                    metadata = json.loads(result_path.read_text()).get('_meta', {})
+                except (OSError, ValueError, AttributeError):
+                    return True
+                # Resume only this pipeline's failed work. Never silently backfill
+                # the whole historical archive or retry human review indefinitely.
+                if metadata.get('transcription_pipeline') == 'durable_sources':
+                    return bool(metadata.get('retryable_ranges') or metadata.get('publication_pending'))
         return False
 
     def _process_existing_files(self):
@@ -1053,8 +1068,78 @@ class TranscribeWatcher:
         except Exception as e:
             self.logger.error(f"❌ Error preparing webhook: {e}")
 
+    def _uses_durable_sources(self):
+        return (getattr(self, 'config', {}).get('processing', {}) or {}).get(
+            'transcription_pipeline', 'legacy') == 'durable_sources'
+
+    def _process_with_durable_sources(self, audio_file: Path):
+        """Persist source-separated words before optional downstream processing.
+
+        Identity is deliberately anonymous here. Calendar/semantic guesses must
+        not rewrite these transcripts or release speaker-dependent automation.
+        """
+        import hashlib
+        from source_inputs import prepare_recording_sources
+        from transcription_jobs import SourceTranscriptionPipeline
+        options = self.config.get('durable_transcription', {}) or {}
+        state_root = Path(options.get('state_dir', self.transcripts_dir / '.source-jobs')).expanduser()
+        sources, capture = prepare_recording_sources(audio_file, state_root / audio_file.stem / 'sources')
+        model = self.config.get('gemini', {}).get('model', 'gemini-2.5-pro')
+        pipeline = SourceTranscriptionPipeline(
+            state_dir=state_root, model=model,
+            request_timeout_seconds=float(options.get('request_timeout_seconds', 120)),
+            job_timeout_seconds=float(options.get('job_timeout_seconds', 600)),
+            chunk_seconds=float(options.get('chunk_seconds', 180)),
+        )
+        payload = pipeline.run(sources, session_id=audio_file.stem, retry_failed=True,
+                               capture_gaps=capture.get('capture_gaps'))
+        meta = payload.setdefault('_meta', {})
+        meta.update(transcription_pipeline='durable_sources', capture_provenance=capture,
+                    model=model, accuracy_measured=False, publication_pending=True)
+        content_identity = capture.get('source_audio_sha256') or capture.get('native_manifest_sha256')
+        meta['durable_session_id'] = hashlib.sha256(
+            (str(audio_file.resolve()) + ':' + str(content_identity)).encode()).hexdigest()
+        partial = bool(meta.get('retryable_ranges') or meta.get('missing_ranges') or
+                       capture.get('capture_gaps') or capture.get('capture_errors'))
+        # Structural success never certifies words or names. Preserve source-local
+        # anonymous labels even after calendar resolution or downstream failures.
+        meta['partial'] = partial
+        meta['speaker_attribution'] = {
+            **(meta.get('speaker_attribution') or {}),
+            'status': 'needs_review', 'identity_basis': 'anonymous_source_local',
+            'speaker_dependent_actions': 'hold', 'accuracy_measured': False,
+            'missing_stages': ['acoustic_identity_review'] + (['coverage_recovery'] if partial else []),
+        }
+        payload.setdefault('participants', [])
+        payload.setdefault('language', 'unknown')
+        json_path = self.transcripts_dir / f'{audio_file.stem}.json'
+        if json_path.exists():
+            old = json_path.read_bytes()
+            revision = state_root / audio_file.stem / 'published-revisions' / (hashlib.sha256(old).hexdigest() + '.json')
+            revision.parent.mkdir(parents=True, exist_ok=True)
+            if not revision.exists():
+                revision.write_bytes(old)
+        atomic_json(json_path, payload)
+        self.logger.info(f"Saved durable transcript: {json_path.name}; named-speaker review pending")
+        # Existing source seeding is useful with anonymous voices; semantic repair
+        # and person-specific enrichment are intentionally absent from this path.
+        source_id = self._seed_insightbase_source(json_path)
+        if source_id is not None:
+            meta['publication_pending'] = False
+            meta['source_id'] = source_id
+            atomic_json(json_path, payload)
+        self._trigger_claude_if_attributed(json_path, source_id=source_id)
+        return payload
+
     def _process_with_gemini(self, audio_file: Path):
-        """Process audio file using Gemini 2.5 Flash for transcription + analysis."""
+        """Dispatch to the selected transcription pipeline."""
+        if self._uses_durable_sources():
+            try:
+                return self._process_with_durable_sources(audio_file)
+            except Exception as exc:
+                self.logger.exception(f"Durable transcription failed: {audio_file.name}: {exc}")
+                self._notify_telegram_failure(audio_file, f"{type(exc).__name__}: {exc}")
+                return None
         if not self.gemini_processor:
             self.logger.error("Gemini processor not initialized, skipping Gemini processing")
             return

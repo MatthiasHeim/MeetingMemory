@@ -1,5 +1,7 @@
 # MeetingMemory
 
+> **Source-preserving rebuild:** The opt-in native capture and durable transcription path is documented in [docs/pipeline-rebuild.md](docs/pipeline-rebuild.md). It preserves source timing and resumable anonymous transcripts. Existing installation defaults stay on the legacy path until native permissions and capture acceptance tests pass; older setup guidance below describes that legacy installation.
+
 > Capture audio from any meeting on macOS, transcribe and analyse it with Gemini, and feed the result into a Brain-driven LLM pipeline that extracts insights, drafts follow-ups, updates client context, and writes to the CRM.
 
 MeetingMemory is the personal recording-to-knowledge stack used at [Lailix](https://lailix.com). It started as a fork of [noScribe](https://github.com/kaixxx/noScribe) by Kai Dröge, but the local-transcription path is no longer used — audio goes straight to Gemini 2.5 Flash, and the watcher hands off to a headless Claude session in a separate `Brain` repo that owns all downstream automation.

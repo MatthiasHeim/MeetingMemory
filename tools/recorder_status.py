@@ -10,10 +10,54 @@ import json
 import os
 import re
 import subprocess
+from pathlib import Path
 
 
 class Address(c.Structure):
     _fields_ = [("selector", c.c_uint32), ("scope", c.c_uint32), ("element", c.c_uint32)]
+
+
+def _native_manifest_process_alive(manifest):
+    from native_capture_bridge import _process_command
+    process = manifest.get('process') or {}
+    pid = int(process.get('pid', 0))
+    executable = process.get('executable')
+    token = manifest.get('session_token')
+    if pid <= 0 or not executable or not token:
+        return False
+    command = _process_command(pid) or ''
+    return command.startswith(executable + ' ') and ('--session-token ' + token) in command
+
+
+def native_activity_status(activity_file, recorder_pid):
+    """A native child owns audio; querying only the Python PID would lie idle."""
+    activity_file = Path(activity_file)
+    if not activity_file.exists():
+        return None
+    try:
+        activity = json.loads(activity_file.read_text())
+        manifest = json.loads(Path(activity['native_manifest_path']).read_text())
+        state = manifest.get('status')
+        if state in ('starting', 'recording', 'degraded') and not manifest.get('finalized'):
+            if not _native_manifest_process_alive(manifest):
+                return {'pid': recorder_pid, 'state': 'unknown',
+                        'reason': 'unfinalized native capture has no matching live process; recover retained segments'}
+            return {'pid': recorder_pid, 'state': 'active', 'capture_backend': 'screencapturekit',
+                    'reason': 'native capture has not finalized'}
+        if activity.get('status') == 'stopped' and manifest.get('finalized'):
+            return None  # Native is finalized; still inspect current mic activity.
+        if manifest.get('finalized'):
+            native_pid = int((manifest.get('process') or {}).get('pid', 0))
+            if native_pid > 0:
+                try:
+                    os.kill(native_pid, 0)
+                except ProcessLookupError:
+                    return None  # Owner died, native finalized and exited.
+                except PermissionError:
+                    pass  # An inaccessible process is not proof of inactivity.
+        return {'pid': recorder_pid, 'state': 'unknown', 'reason': 'native capture state is unresolved'}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {'pid': recorder_pid, 'state': 'unknown', 'reason': 'native activity evidence is incomplete'}
 
 
 def recorder_status():
@@ -22,6 +66,9 @@ def recorder_status():
     if not match:
         return {"state": "unknown", "reason": "recorder process not running"}
     pid = int(match.group(1))
+    native = native_activity_status(Path.home() / 'Documents/MeetingRecorder/active-native-capture.json', pid)
+    if native is not None:
+        return native
     library = c.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
     def get(obj, selector, many=False):
         four = lambda s: int.from_bytes(s.encode(), "big")

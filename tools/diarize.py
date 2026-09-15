@@ -8,6 +8,7 @@ torch, torchaudio, MPS, ffmpeg, or the worker process is unavailable.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import multiprocessing as mp
 import queue as pyqueue
@@ -21,6 +22,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 FFMPEG_PATH = "/opt/homebrew/bin/ffmpeg"
+_PYANNOTE_WORKER_PATH = Path(__file__).resolve().parent.parent / "pyannote_mp_worker.py"
 
 
 def _deps_available() -> tuple[bool, Optional[str]]:
@@ -34,6 +36,39 @@ def _deps_available() -> tuple[bool, Optional[str]]:
 
 
 PYANNOTE_AVAILABLE, PYANNOTE_IMPORT_ERROR = _deps_available()
+
+
+def pyannote_worker_path() -> Path:
+    """Return the checked-in worker path without relying on ``sys.path``.
+
+    launchd starts the watcher from ``tools/``.  The legacy worker lives one
+    directory above it, so ``from pyannote_mp_worker import ...`` depended on
+    the caller's working directory and failed in that launch context.
+    """
+    return _PYANNOTE_WORKER_PATH
+
+
+def _load_pyannote_worker_entrypoint():
+    """Load our adjacent worker under a private name without changing sys.path."""
+    worker_path = pyannote_worker_path()
+    if not worker_path.is_file():
+        raise ImportError(f"pyannote worker is missing: {worker_path}")
+    spec = importlib.util.spec_from_file_location(
+        "_meetingmemory_private_pyannote_worker", worker_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"pyannote worker cannot be loaded: {worker_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    entrypoint = getattr(module, "pyannote_proc_entrypoint", None)
+    if not callable(entrypoint):
+        raise ImportError(f"pyannote worker has no callable entrypoint: {worker_path}")
+    return entrypoint
+
+
+def _run_pyannote_worker(args: dict, q) -> None:
+    """Spawn-safe wrapper that resolves the worker inside the child process."""
+    _load_pyannote_worker_entrypoint()(args, q)
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -134,14 +169,17 @@ def run_pyannote_diarization(
         wav_path = _decode_to_mono_wav(audio_path, work_dir)
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
-        from pyannote_mp_worker import pyannote_proc_entrypoint
 
         args = {
             "audio_path": str(wav_path),
             "num_speakers": int(num_speakers) if num_speakers else None,
             "device": device,
         }
-        proc = ctx.Process(target=pyannote_proc_entrypoint, args=(args, q))
+        # The wrapper is defined in this tools module, which spawn can import
+        # under launchd. It resolves the legacy root-level worker inside the
+        # child with an exact file path, avoiding a global sys.path mutation
+        # that could shadow installed pyannote dependencies.
+        proc = ctx.Process(target=_run_pyannote_worker, args=(args, q))
         proc.start()
 
         deadline = time.time() + timeout_seconds

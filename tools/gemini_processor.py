@@ -462,9 +462,16 @@ class GeminiAudioProcessor:
             from google.genai import types
             self.genai = genai
             self.types = types
-            # Use standard client - custom httpx clients cause issues
-            # The Files API handles large uploads reliably
-            self.client = genai.Client(api_key=self.api_key)
+            # google-genai HttpOptions.timeout is milliseconds (not seconds).
+            # Supplying it on the Client is essential: keeping the configured
+            # value only on this object left upload/generation requests free
+            # to hang beyond the watcher budget.
+            self.client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(
+                    timeout=max(1, int(round(self.timeout_seconds * 1000)))
+                ),
+            )
         except ImportError:
             raise ImportError(
                 "google-genai package not installed. "

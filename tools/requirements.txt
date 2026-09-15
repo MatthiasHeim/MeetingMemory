@@ -20,3 +20,7 @@ python-dotenv>=1.0.0
 
 # InsightBase (Neon Postgres) — used by neon_insert.py
 psycopg2-binary>=2.9.0
+
+# Durable source transcription and independent speech detection
+google-genai>=1.60.0
+webrtcvad-wheels>=2.0.14

@@ -214,6 +214,7 @@ def insert_source(
 
     content_text = _read_transcript(transcript_path)
     source_attribution = {}
+    durable_session_id = None
     if p.suffix.lower() == '.json':
         try:
             parsed = json.loads(p.read_text(encoding='utf-8'))
@@ -222,6 +223,15 @@ def insert_source(
         report = (parsed.get('_meta') or {}).get('speaker_attribution') if isinstance(parsed, dict) else None
         if report is not None:
             source_attribution['speaker_attribution'] = report
+        meta = parsed.get('_meta', {}) if isinstance(parsed, dict) else {}
+        if meta.get('transcription_pipeline') == 'durable_sources':
+            durable_session_id = meta.get('durable_session_id')
+            if not isinstance(durable_session_id, str) or not re.fullmatch(r'[0-9a-f]{64}', durable_session_id):
+                raise ValueError('Durable publication requires a stable session identifier')
+            source_attribution.update(durable_session_id=durable_session_id,
+                                      transcription_pipeline='durable_sources',
+                                      transcript_status=meta.get('durable_job_status'),
+                                      partial=bool(meta.get('partial')))
     # TODO (Phase 2): once sources.content_revision_id ships, SELECT by
     #   content_revision_id before INSERT and return the existing id on
     #   match. For now we compute+log it for debugging only.
@@ -255,6 +265,25 @@ def insert_source(
     try:
         with conn:
             with conn.cursor() as cur:
+                if durable_session_id:
+                    # Serialize cooperating publishers for this capture. The key
+                    # stays constant while failed chunks are recovered; content
+                    # hashes are revisions, not meeting identity.
+                    lock_key = int.from_bytes(bytes.fromhex(durable_session_id)[:8], 'big', signed=True)
+                    cur.execute('SELECT pg_advisory_xact_lock(%s)', (lock_key,))
+                    cur.execute("SELECT id FROM sources WHERE metadata->>'durable_session_id' = %s ORDER BY id FOR UPDATE", (durable_session_id,))
+                    existing = cur.fetchall()
+                    if len(existing) > 1:
+                        raise RuntimeError('Duplicate durable source IDs require reconciliation')
+                    if existing:
+                        source_id = existing[0][0]
+                        updated_metadata = {'transcript_path': str(p),
+                                            'content_revision_id': content_revision_id,
+                                            **source_attribution}
+                        cur.execute("UPDATE sources SET content_text=%s, language=%s, metadata=COALESCE(metadata, '{}'::jsonb) || %s::jsonb WHERE id=%s",
+                                    (content_text, language or DEFAULT_LANGUAGE,
+                                     json.dumps(updated_metadata), source_id))
+                        return source_id
                 cur.execute(
                     """
                     INSERT INTO sources (
