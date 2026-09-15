@@ -103,12 +103,29 @@ output.write_text(json.dumps({
 }, sort_keys=True, indent=2) + '\n')
 PY
 
+# Hardened runtime requires the audio-input entitlement in addition to the
+# microphone usage string; without it macOS denies input without a prompt.
+entitlements="${stage_root}/capture.entitlements.plist"
+/usr/bin/plutil -create xml1 "${entitlements}"
+/usr/libexec/PlistBuddy -c "Add :com.apple.security.device.audio-input bool true" "${entitlements}"
+
 # An ad-hoc signature is enough for local development. Set
 # NATIVE_CAPTURE_SIGN_IDENTITY to a Developer ID identity for distributable
-# builds. The runtime option preserves the bundle identity used by macOS TCC.
+# builds. Ad-hoc TCC grants are tied to the code hash: rebuilding can invalidate
+# permission even when the bundle identifier stays the same. Freeze the build
+# before asking the user to grant access; never silently reset TCC in this script.
 sign_identity="${NATIVE_CAPTURE_SIGN_IDENTITY:--}"
-/usr/bin/codesign --force --sign "${sign_identity}" --options runtime --timestamp=none "${stage_bundle}"
+/usr/bin/codesign --force --sign "${sign_identity}" --options runtime --entitlements "${entitlements}" --timestamp=none "${stage_bundle}"
 /usr/bin/codesign --verify --strict --verbose=2 "${stage_bundle}"
+/usr/bin/python3 - "${stage_bundle}" <<'PY'
+import plistlib
+import subprocess
+import sys
+result = subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', '--xml', sys.argv[1]],
+                        check=True, capture_output=True)
+if plistlib.loads(result.stdout).get('com.apple.security.device.audio-input') is not True:
+    raise SystemExit('Built app is missing its hardened-runtime audio-input entitlement')
+PY
 
 mkdir -p "${output_bundle:h}"
 if [[ -e "${output_bundle}" ]]; then
