@@ -114,3 +114,28 @@ def test_timing_sidecar_corruption_is_not_certified(tmp_path):
     timing.unlink()
     with pytest.raises(ValueError, match='Missing native segment'):
         prepare_native_sources(p, tmp_path / 'out')
+
+
+def test_uninitialized_epoch_cannot_allocate_hours_of_false_silence(tmp_path):
+    p = make_manifest(tmp_path, offset=220792)
+    data = json.loads(p.read_text())
+    data.update(started_wall_time='2026-09-15T03:00:00Z', ended_wall_time='2026-09-15T03:01:30Z')
+    p.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='shared epoch'):
+        prepare_native_sources(p, tmp_path / 'out')
+    assert not list((tmp_path / 'out').glob('*.wav'))
+
+
+def test_crashed_zero_epoch_uses_checkpoint_wall_bound(tmp_path, monkeypatch):
+    p = make_manifest(tmp_path, offset=220792)
+    data = json.loads(p.read_text())
+    data.update(status='recording', finalized=False, process={'pid': 123456},
+                started_wall_time='2026-09-15T03:00:00Z', ended_wall_time=None,
+                updated_wall_time='2026-09-15T03:01:30Z')
+    p.write_text(json.dumps(data))
+    def dead_process(*args):
+        raise ProcessLookupError
+    monkeypatch.setattr('source_inputs.os.kill', dead_process)
+    with pytest.raises(ValueError, match='shared epoch'):
+        prepare_native_sources(p, tmp_path / 'out', recover_stopped=True)
+    assert not list((tmp_path / 'out').glob('*.wav'))

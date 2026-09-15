@@ -142,6 +142,32 @@ private func seconds(_ time: CMTime) -> Double? {
     return value.isFinite ? value : nil
 }
 
+/// The stream-to-host mapping is evidence about clock conversion, but its
+/// anchors are not a session-start boundary: ScreenCaptureKit can legitimately
+/// report zero-valued anchors while sample PTS values are already host-clock
+/// times. Use the host clock captured when this controller was created as the
+/// one shared timeline epoch, and reject a zero/invalid value rather than
+/// silently producing a multi-day offset.
+private func usableHostClockEpoch(_ hostClockStarted: CMTime) -> CMTime? {
+    guard let value = seconds(hostClockStarted), value > 0 else { return nil }
+    return hostClockStarted
+}
+
+private func hostRelativeSeconds(_ hostPTS: CMTime, epoch: CMTime) -> Double? {
+    guard let usableEpoch = usableHostClockEpoch(epoch),
+          let epochSeconds = seconds(usableEpoch),
+          let packetSeconds = seconds(hostPTS) else {
+        return nil
+    }
+    let relative = packetSeconds - epochSeconds
+    return relative.isFinite ? relative : nil
+}
+
+private func mappingAnchorState(_ anchor: CMTime) -> String {
+    guard let value = seconds(anchor) else { return "unusable" }
+    return value > 0 ? "usable" : "zero_or_nonpositive"
+}
+
 private func relativePath(_ url: URL, from root: URL) -> String {
     let rootPath = root.standardizedFileURL.path
     let path = url.standardizedFileURL.path
@@ -871,15 +897,22 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
                   seconds(hostAnchor) != nil else {
                 throw NativeCaptureError.writer("cannot establish ScreenCaptureKit-to-host-clock mapping (OSStatus \(mappingStatus))")
             }
+            guard let sharedHostEpoch = usableHostClockEpoch(hostClockStarted) else {
+                throw NativeCaptureError.writer("native host-clock startup epoch is zero or invalid; refusing to create ambiguous source offsets")
+            }
             writerQueue.async { [weak self] in
                 self?.didStartStream(
                     clock: synchronizationClock,
                     streamEpoch: streamAnchor,
-                    hostEpoch: hostAnchor,
+                    hostEpoch: sharedHostEpoch,
                     mapping: [
                         "relative_rate": relativeRate,
                         "stream_anchor_raw_pts": rawTime(streamAnchor),
                         "host_anchor_raw_pts": rawTime(hostAnchor),
+                        "stream_anchor_state": mappingAnchorState(streamAnchor),
+                        "host_anchor_state": mappingAnchorState(hostAnchor),
+                        "shared_host_epoch_source": "controller_host_clock_started",
+                        "shared_host_epoch_raw": rawTime(sharedHostEpoch),
                     ]
                 )
             }
@@ -929,6 +962,14 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
         self.hostEpoch = hostEpoch
         streamClockMapping = mapping
         streamStarted = true
+        if mapping["stream_anchor_state"] as? String != "usable" ||
+            mapping["host_anchor_state"] as? String != "usable" {
+            recordLifecycle(
+                event: "stream_mapping_anchor_not_used_as_epoch",
+                message: "ScreenCaptureKit mapping anchor was zero or unusable; retaining it as raw mapping evidence while using the explicit host-clock startup epoch",
+                sourceID: nil
+            )
+        }
         scheduleReadinessDeadline()
         scheduleDurationDeadline()
         scheduleRoutePolling()
@@ -1080,11 +1121,10 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
             return
         }
         let hostPTS = CMSyncConvertTime(packet.pts, from: clock, to: CMClockGetHostTimeClock())
-        guard let epochSeconds = seconds(hostEpoch), let packetSeconds = seconds(hostPTS) else {
+        guard let relativePTS = hostRelativeSeconds(hostPTS, epoch: hostEpoch) else {
             failAndRequestStop(code: "timeline_epoch_invalid", message: "received audio with an invalid host-clock epoch or presentation timestamp", sourceID: packet.sourceID)
             return
         }
-        let relativePTS = packetSeconds - epochSeconds
         let sourceDuration: CMTime
         if seconds(packet.sampleDuration) != nil {
             sourceDuration = packet.sampleDuration
@@ -1096,7 +1136,7 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
         }
         let sourceEndPTS = CMTimeAdd(packet.pts, sourceDuration)
         let hostEndPTS = CMSyncConvertTime(sourceEndPTS, from: clock, to: CMClockGetHostTimeClock())
-        guard let relativeEnd = seconds(hostEndPTS).map({ $0 - epochSeconds }) else {
+        guard let relativeEnd = hostRelativeSeconds(hostEndPTS, epoch: hostEpoch) else {
             failAndRequestStop(code: "timeline_end_invalid", message: "could not convert an audio packet end time onto the host clock", sourceID: packet.sourceID)
             return
         }
@@ -1437,6 +1477,8 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
                 "epoch_raw_pts": (streamEpoch.map(rawTime) as Any?) ?? NSNull(),
                 "host_clock_epoch_raw": (hostEpoch.map(rawTime) as Any?) ?? NSNull(),
                 "epoch_clock": "SCStream.synchronizationClock",
+                "host_clock_epoch_source": "controller_host_clock_started",
+                "mapping_anchor_policy": "retained as stream-to-host conversion evidence; never selected as the shared host-clock epoch",
                 "stream_to_host_clock": (streamClockMapping as Any?) ?? NSNull(),
                 "start_seconds_definition": "CMSampleBuffer.presentationTimeStamp converted from SCStream.synchronizationClock to host clock, minus the one shared host_clock_epoch_raw; individual tracks are never independently zeroed",
             ],
@@ -1534,36 +1576,81 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
         try manager.createDirectory(at: segmentsURL, withIntermediateDirectories: true)
 
         let timescale: CMTimeScale = 1_000_000_000
-        let origin = CMTime(value: 2_000_000_000, timescale: timescale)
-        func time(at relativeSeconds: Double) -> CMTime {
-            CMTimeAdd(origin, CMTime(seconds: relativeSeconds, preferredTimescale: timescale))
+        // Reproduce the live ScreenCaptureKit behavior where the mapping
+        // anchors are both zero even though converted sample PTS values are
+        // host-clock times around 220,000 seconds after boot. The shared epoch
+        // must be the explicit native host-clock start, never either anchor.
+        let zeroMappingAnchor = CMTime.zero
+        let origin = CMTime(value: 220_792_444_913_416, timescale: timescale)
+        guard usableHostClockEpoch(zeroMappingAnchor) == nil,
+              let selectedHostEpoch = usableHostClockEpoch(origin),
+              mappingAnchorState(zeroMappingAnchor) == "zero_or_nonpositive" else {
+            throw NativeCaptureError.writer("synthetic zero mapping anchor did not require an explicit host-clock epoch")
         }
-        let packetDuration = 480.0 / 48_000.0
+        func time(at relativeSeconds: Double) -> CMTime {
+            CMTimeAdd(selectedHostEpoch, CMTime(seconds: relativeSeconds, preferredTimescale: timescale))
+        }
+        func approximatelyEqual(_ value: Double?, _ expected: Double) -> Bool {
+            guard let value else { return false }
+            return abs(value - expected) < 0.000_001
+        }
+        let observedSystemPTS = CMTime(value: 220_792_624_044_458, timescale: timescale)
+        let observedMicPTS = CMTime(value: 10_598_049_999, timescale: 48_000)
+        guard approximatelyEqual(hostRelativeSeconds(observedSystemPTS, epoch: selectedHostEpoch), 0.179_131_042),
+              approximatelyEqual(hostRelativeSeconds(observedMicPTS, epoch: selectedHostEpoch), 0.263_399_084) else {
+            throw NativeCaptureError.writer("synthetic zero mapping anchor produced an implausible host-clock offset")
+        }
+        func ingest(_ packet: CapturedPacket) throws {
+            guard let relativePTS = hostRelativeSeconds(packet.pts, epoch: selectedHostEpoch),
+                  let relativeEnd = hostRelativeSeconds(
+                      CMTimeAdd(packet.pts, packet.sampleDuration),
+                      epoch: selectedHostEpoch
+                  ) else {
+                throw NativeCaptureError.writer("synthetic packet could not be projected onto the explicit host-clock epoch")
+            }
+            consumeResolved(packet, hostPTS: packet.pts, relativePTS: relativePTS, relativeEnd: relativeEnd)
+        }
 
         // This is intentionally a shared origin with a pre-epoch microphone
         // packet and a late system source. The third system packet introduces
         // a timestamp gap after a real CAF has already been opened.
-        streamEpoch = origin
-        hostEpoch = origin
+        streamEpoch = zeroMappingAnchor
+        hostEpoch = selectedHostEpoch
         streamClockMapping = [
             "synthetic": true,
             "relative_rate": 1.0,
-            "stream_anchor_raw_pts": rawTime(origin),
-            "host_anchor_raw_pts": rawTime(origin),
+            "stream_anchor_raw_pts": rawTime(zeroMappingAnchor),
+            "host_anchor_raw_pts": rawTime(zeroMappingAnchor),
+            "stream_anchor_state": mappingAnchorState(zeroMappingAnchor),
+            "host_anchor_state": mappingAnchorState(zeroMappingAnchor),
+            "shared_host_epoch_source": "controller_host_clock_started",
+            "shared_host_epoch_raw": rawTime(selectedHostEpoch),
         ]
         micCaptureEnabled = true
+        func rawTimeValue(_ value: Any?) -> Int64? {
+            guard let raw = value as? [String: Any] else { return nil }
+            if let value = raw["value"] as? Int64 { return value }
+            if let value = raw["value"] as? NSNumber { return value.int64Value }
+            return nil
+        }
+        let syntheticTimeline = manifestDocument()["timeline_metadata"] as? [String: Any]
+        guard syntheticTimeline?["host_clock_epoch_source"] as? String == "controller_host_clock_started",
+              rawTimeValue(syntheticTimeline?["host_clock_epoch_raw"]) == selectedHostEpoch.value,
+              rawTimeValue(syntheticTimeline?["epoch_raw_pts"]) == 0 else {
+            throw NativeCaptureError.writer("synthetic zero mapping anchor was not represented with the explicit host-clock epoch")
+        }
 
         let micFirst = try syntheticPacket(sourceID: "mic", pts: time(at: -0.10), frequency: 440)
-        consumeResolved(micFirst, hostPTS: micFirst.pts, relativePTS: -0.10, relativeEnd: -0.10 + packetDuration)
+        try ingest(micFirst)
         let micSecond = try syntheticPacket(sourceID: "mic", pts: time(at: -0.09), frequency: 440)
-        consumeResolved(micSecond, hostPTS: micSecond.pts, relativePTS: -0.09, relativeEnd: -0.09 + packetDuration)
+        try ingest(micSecond)
 
         let systemFirst = try syntheticPacket(sourceID: "system", pts: time(at: 3.25), frequency: 880)
-        consumeResolved(systemFirst, hostPTS: systemFirst.pts, relativePTS: 3.25, relativeEnd: 3.25 + packetDuration)
+        try ingest(systemFirst)
         let systemSecond = try syntheticPacket(sourceID: "system", pts: time(at: 3.26), frequency: 880)
-        consumeResolved(systemSecond, hostPTS: systemSecond.pts, relativePTS: 3.26, relativeEnd: 3.26 + packetDuration)
+        try ingest(systemSecond)
         let systemAfterGap = try syntheticPacket(sourceID: "system", pts: time(at: 4.00), frequency: 880)
-        consumeResolved(systemAfterGap, hostPTS: systemAfterGap.pts, relativePTS: 4.00, relativeEnd: 4.00 + packetDuration)
+        try ingest(systemAfterGap)
 
         guard !terminalFailure else {
             throw NativeCaptureError.writer("synthetic production packet path reported a terminal failure")
@@ -1574,11 +1661,6 @@ private final class NativeCaptureController: NSObject, SCStreamOutput, SCStreamD
             throw NativeCaptureError.writer("synthetic production packet path could not finalize its CAF segments")
         }
         writeManifest(force: true)
-        func approximatelyEqual(_ value: Double?, _ expected: Double) -> Bool {
-            guard let value else { return false }
-            return abs(value - expected) < 0.000_001
-        }
-
         guard system.segments.count == 2,
               let first = system.segments.first,
               let second = system.segments.last,

@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -156,6 +157,16 @@ def prepare_native_sources(manifest_path: Path, output_dir: Path, *, recover_sto
         prepared.append((source_id, rate, channels, items, prior_end))
     if not prepared:
         raise ValueError('No captured audio can be recovered')
+    wall_end = manifest.get('ended_wall_time') or manifest.get('updated_wall_time')
+    if manifest.get('started_wall_time') and wall_end:
+        started = datetime.fromisoformat(manifest['started_wall_time'].replace('Z', '+00:00'))
+        ended = datetime.fromisoformat(wall_end.replace('Z', '+00:00'))
+        wall_duration = (ended - started).total_seconds()
+        # A zero/uninitialized stream epoch once turned a 90-second recording
+        # into 61 hours of apparent leading silence. Reject it before allocating
+        # derived WAVs; retain raw segments for an explicit common-origin repair.
+        if wall_duration < 0 or max_end > wall_duration - epoch_offset + 2:
+            raise ValueError('Native audio timeline exceeds the recorded wall-clock session; check its shared epoch before recovery')
     for gap in all_gaps:
         if gap.get('reason') == 'source_missing':
             gap['end_seconds'] = max_end
