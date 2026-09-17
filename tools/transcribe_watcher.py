@@ -86,6 +86,7 @@ try:
         convert_for_gemini_ducked,
         detect_active_channels,
         get_audio_duration,
+        get_channel_count,
     )
     from gemini_processor import GeminiAudioProcessor, GeminiResult
     GEMINI_AVAILABLE = True
@@ -1120,6 +1121,16 @@ class TranscribeWatcher:
             # None for both prompt injection and speaker verification.
             topology = self._classify_source_topology_safe(audio_file)
 
+            # Step 2a-pre: correct a constant mic/system capture offset BEFORE
+            # anything reads the channels. The Aggregate Device does not
+            # guarantee its sub-devices start together — on 2026-09-17 the mic
+            # ran 15.46s behind system audio, so every bled-through remote
+            # utterance was transcribed twice and channel attribution was
+            # (correctly but uselessly) disabled. Everything downstream — VAD,
+            # admissibility, the ducked pre-mix, the Gemini speaking map — reads
+            # the aligned file from here on. See tools/channel_align.py.
+            audio_file = self._align_channels_safe(audio_file, topology)
+
             channel_vad = None
             if topology and topology.topology == TOPOLOGY_SINGLE_SOURCE:
                 self.logger.info(
@@ -1874,6 +1885,58 @@ class TranscribeWatcher:
             topo == TOPOLOGY_SINGLE_SOURCE
             or (channel_fusion and topo == TOPOLOGY_MULTI_SOURCE_GENUINE)
         )
+
+    def _align_channels_safe(self, audio_file: Path, topology):
+        """Return an offset-corrected copy of `audio_file`, or the original.
+
+        Never raises: alignment is a quality improvement, not a precondition.
+        Any failure logs and falls through to the unaligned file, which is
+        exactly the behaviour that existed before this step.
+
+        Skipped for single-source recordings (no system channel to align to)
+        and for anything that is not the 3-channel hybrid layout.
+        """
+        if topology is not None and getattr(topology, "topology", None) == TOPOLOGY_SINGLE_SOURCE:
+            return audio_file
+        import tempfile  # module-level import is not available here
+
+        try:
+            from channel_align import estimate_channel_offset, write_aligned_wav
+        except Exception as e:  # pragma: no cover - import guard
+            self.logger.warning(f"channel_align unavailable ({e}); skipping alignment")
+            return audio_file
+        try:
+            if get_channel_count(audio_file) < 3:
+                return audio_file
+            offset = estimate_channel_offset(audio_file)
+            if not offset.correctable:
+                self.logger.info(f"Channel alignment not needed: {offset.reason}")
+                return audio_file
+            self.logger.warning(
+                f"Channel offset detected in {audio_file.name}: {offset.reason}. "
+                "Aligning before VAD/pre-mix — an uncorrected offset duplicates "
+                "every bled-through remote utterance in the transcript."
+            )
+            # Must land OUTSIDE recordings_dir and keep the original
+            # filename. The watcher rescans `recordings_dir.glob("*.wav")`, so
+            # an aligned copy left there would be queued as a brand-new
+            # recording; and every derived name (the MP3, the transcript JSON,
+            # the calendar lookup) is built from the stem, so renaming it to
+            # `<stem>.aligned` would silently split the meeting in two.
+            aligned_dir = Path(tempfile.gettempdir()) / "meetingmemory-aligned"
+            aligned_dir.mkdir(parents=True, exist_ok=True)
+            aligned = write_aligned_wav(
+                audio_file, offset.lag_seconds,
+                output_path=aligned_dir / audio_file.name,
+            )
+            self.logger.info(f"Aligned copy: {aligned}")
+            return aligned
+        except Exception as e:
+            self.logger.warning(
+                f"Channel alignment failed ({e}); continuing with the "
+                "unaligned recording"
+            )
+            return audio_file
 
     def _compute_channel_vad_safe(self, audio_file: Path):
         """Compute channel VAD from the original WAV. Never raises.
