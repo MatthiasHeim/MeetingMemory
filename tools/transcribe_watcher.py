@@ -1129,7 +1129,13 @@ class TranscribeWatcher:
             # (correctly but uselessly) disabled. Everything downstream — VAD,
             # admissibility, the ducked pre-mix, the Gemini speaking map — reads
             # the aligned file from here on. See tools/channel_align.py.
-            audio_file = self._align_channels_safe(audio_file, topology)
+            # `audio_file` stays the ORIGINAL raw recording for the whole
+            # method: it is the evidence path (`source_audio_path`) and what
+            # `trial_input_digest` hashes. Only acoustic work reads the aligned
+            # copy, via `analysis_file`, which is deleted in the `finally`
+            # below. Reassigning `audio_file` here would record the hash and
+            # path of a temp file that no longer exists.
+            analysis_file = self._align_channels_safe(audio_file, topology)
 
             channel_vad = None
             if topology and topology.topology == TOPOLOGY_SINGLE_SOURCE:
@@ -1144,7 +1150,7 @@ class TranscribeWatcher:
                 # the pre-mix. Also gives Gemini a ground-truth host/remote
                 # speaking map and feeds post-transcription verification.
                 # None for mono/stereo/non-genuine recordings.
-                channel_vad = self._compute_channel_vad_safe(audio_file)
+                channel_vad = self._compute_channel_vad_safe(analysis_file)
 
             # One admissibility verdict, applied to every consumer of the mic
             # channel: the pre-mix choice below, the Gemini prompt map,
@@ -1164,7 +1170,7 @@ class TranscribeWatcher:
             # layouts. See _convert_for_gemini_routed / convert_for_gemini_ducked.
             self.logger.info("Converting WAV to MP3...")
             mp3_path = self._convert_for_gemini_routed(
-                audio_file, channel_vad, channel_admissible
+                analysis_file, channel_vad, channel_admissible
             )
             self.logger.info(f"Converted to: {mp3_path.name} ({mp3_path.stat().st_size / 1024 / 1024:.1f} MB)")
 
@@ -1195,7 +1201,7 @@ class TranscribeWatcher:
                 )
                 if should_run_diarization:
                     num_speakers = self._diarization_num_speakers(
-                        audio_file, known_attendees
+                        analysis_file, known_attendees
                     )
                     diarization_segments = self._run_diarization_safe(
                         mp3_path, num_speakers=num_speakers
@@ -1256,7 +1262,7 @@ class TranscribeWatcher:
             # fix for the silent-truncation and undeduped-overlap failure
             # modes, neither of which raises `result.error` above.
             result, validation, partial = self._validate_and_escalate(
-                audio_file, mp3_path, audio_duration, result,
+                analysis_file, mp3_path, audio_duration, result,
                 known_attendees=known_attendees or None,
                 channel_segments=channel_segments,
                 diarization_segments=diarization_segments,
@@ -1379,6 +1385,12 @@ class TranscribeWatcher:
             import traceback
             self.logger.debug(traceback.format_exc())
             self._notify_telegram_failure(audio_file, f"{type(e).__name__}: {e}")
+        finally:
+            # The aligned copy is a derived working file, not evidence: the raw
+            # recording it came from is untouched and retained. Left behind it
+            # is ~550MB per offset recording in a temp dir nothing prunes, so
+            # delete it on every exit path including failure.
+            self._discard_aligned_copy(locals().get("analysis_file"), audio_file)
 
     @staticmethod
     def _calendar_for_publication(result, inferred, verified):
@@ -1885,6 +1897,35 @@ class TranscribeWatcher:
             topo == TOPOLOGY_SINGLE_SOURCE
             or (channel_fusion and topo == TOPOLOGY_MULTI_SOURCE_GENUINE)
         )
+
+    def _discard_aligned_copy(self, analysis_file, audio_file: Path) -> None:
+        """Delete a derived aligned copy. Never raises, never touches the raw file.
+
+        Guarded three ways because this deletes from disk: it must be a real
+        path, it must differ from the original recording, and it must live
+        outside the recordings directory. Any of those failing means we are
+        looking at the raw capture, which is evidence and is never deleted here.
+        """
+        if not analysis_file or analysis_file == audio_file:
+            return
+        try:
+            analysis_file = Path(analysis_file)
+            if analysis_file.resolve() == Path(audio_file).resolve():
+                return
+            if self.recordings_dir.resolve() in analysis_file.resolve().parents:
+                self.logger.warning(
+                    f"Refusing to delete {analysis_file} — it sits inside the "
+                    "recordings directory and may be a raw capture"
+                )
+                return
+            if analysis_file.exists():
+                freed = analysis_file.stat().st_size
+                analysis_file.unlink()
+                self.logger.info(
+                    f"Discarded aligned working copy ({freed / 1024 / 1024:.0f} MB)"
+                )
+        except Exception as e:
+            self.logger.warning(f"Could not discard aligned copy: {e}")
 
     def _align_channels_safe(self, audio_file: Path, topology):
         """Return an offset-corrected copy of `audio_file`, or the original.
