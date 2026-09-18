@@ -317,3 +317,91 @@ class _NullLogger:
 
     def error(self, *a, **k):
         pass
+
+
+# ------------------------------------------------ aligned-copy lifecycle
+
+def _watcher(recordings: Path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import transcribe_watcher as tw
+    w = tw.TranscribeWatcher.__new__(tw.TranscribeWatcher)
+    w.logger = _NullLogger()
+    w.recordings_dir = recordings
+    return w
+
+
+def test_aligned_copy_is_deleted(tmp_path):
+    """The derived copy must not survive the run — it is ~550MB per recording
+    in a temp dir nothing prunes.
+    """
+    recordings = tmp_path / "Recordings"
+    recordings.mkdir()
+    raw = recordings / "2026-09-17_14-43-50.wav"
+    raw.write_bytes(b"raw")
+    aligned = tmp_path / "tmp" / "2026-09-17_14-43-50.wav"
+    aligned.parent.mkdir()
+    aligned.write_bytes(b"derived")
+
+    _watcher(recordings)._discard_aligned_copy(aligned, raw)
+
+    assert not aligned.exists(), "aligned working copy was left on disk"
+    assert raw.exists(), "raw recording was deleted"
+
+
+def test_raw_recording_is_never_deleted(tmp_path):
+    """NEGATIVE SIDE: when no alignment happened, analysis_file IS the raw file.
+
+    Passing it must be a no-op. Without this guard, a recording with no offset
+    would have its only copy deleted.
+    """
+    recordings = tmp_path / "Recordings"
+    recordings.mkdir()
+    raw = recordings / "2026-09-17_14-43-50.wav"
+    raw.write_bytes(b"raw")
+
+    w = _watcher(recordings)
+    w._discard_aligned_copy(raw, raw)          # same object
+    assert raw.exists()
+    w._discard_aligned_copy(Path(str(raw)), raw)  # equal path, different object
+    assert raw.exists(), "raw recording deleted via an equal-but-distinct path"
+    w._discard_aligned_copy(None, raw)
+    assert raw.exists()
+
+
+def test_refuses_to_delete_anything_in_recordings_dir(tmp_path):
+    """Defence in depth: never unlink inside recordings_dir, whatever the name.
+
+    If a future change ever writes the aligned copy next to the raw captures,
+    this stops it deleting real recordings.
+    """
+    recordings = tmp_path / "Recordings"
+    recordings.mkdir()
+    raw = recordings / "2026-09-17_14-43-50.wav"
+    raw.write_bytes(b"raw")
+    sibling = recordings / "2026-09-17_14-43-50.aligned.wav"
+    sibling.write_bytes(b"derived-but-misplaced")
+
+    _watcher(recordings)._discard_aligned_copy(sibling, raw)
+    assert sibling.exists(), "deleted a file inside the recordings directory"
+
+
+def test_provenance_keeps_the_original_path(tmp_path):
+    """`audio_file` must remain the raw recording through the whole method.
+
+    The webhook records it as `source_audio_path` and `trial_input_digest`
+    hashes it. Pointing either at the aligned temp copy records evidence for a
+    file that is then deleted.
+    """
+    src = (Path(__file__).resolve().parents[1] / "tools" / "transcribe_watcher.py").read_text()
+    body = src.split("analysis_file = self._align_channels_safe", 1)[1]
+    body = body.split("    def _calendar_for_publication", 1)[0]
+    assert "self._convert_for_gemini_routed(\n                analysis_file" in body
+    assert "_compute_channel_vad_safe(analysis_file)" in body
+    assert "_validate_and_escalate(\n                analysis_file" in body
+    # provenance + evidence stay on the original
+    assert "self._send_gemini_webhook(audio_file" in body
+    assert 'save_trial_stage(self.config, audio_file' in body
+    assert "audio_file = self._align_channels_safe" not in src, (
+        "audio_file is being reassigned to the aligned copy — provenance and "
+        "trial digests would point at a deleted temp file"
+    )
