@@ -133,6 +133,10 @@ time `m`, searches from `m - 5 s`, and stops at `m + 3 min` or the
 line-level prompt end. A sentence-level yes/no judge removes complete lead-in
 sentences only; it never rewrites prompt text.
 
+Prompt lines merge only when consecutive transcript timestamps are at most
+12 seconds apart. A marked card is clipped to that exact `m - 5 s` through
+`m + 3 min` window, even when the detected prompt run is longer.
+
 Lead-in filtering splits a timestamped transcript turn into deterministic,
 verbatim sentence substrings before asking its yes/no question. It can therefore
 remove a lead-in while retaining a prompt in the same turn; it never asks a

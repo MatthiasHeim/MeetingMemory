@@ -155,6 +155,47 @@ def test_mark_suppresses_only_its_selected_run_not_a_nearby_suggested_prompt():
     ]
 
 
+def test_positive_prompt_lines_far_apart_produce_separate_suggestions():
+    class _GapJudge:
+        backend = "fake"
+        model = "fake"
+
+        def judge(self, lines, questions, *, context=6):
+            question = next(iter(questions))
+            return {question: [0.95] * len(lines)}
+
+    lines = [
+        _line(0, 10, "First dictated prompt."),
+        _line(1, 500, "Second dictated prompt."),
+    ]
+    results = prompts_from_marks(lines, [], judge=_GapJudge())
+
+    assert [result.text for result in results] == ["First dictated prompt.", "Second dictated prompt."]
+
+
+def test_marked_card_intersects_the_run_with_its_bounded_window():
+    class _BoundedJudge:
+        backend = "fake"
+        model = "fake"
+
+        def judge(self, lines, questions, *, context=6):
+            question = next(iter(questions))
+            return {question: [0.95] * len(lines)}
+
+    lines = [_line(index, seconds, f"Prompt sentence at {seconds}.") for index, seconds in enumerate(range(0, 200, 5))]
+    results = prompts_from_marks(lines, [10.0], judge=_BoundedJudge())
+
+    # The marked card must not leak the detected run's text outside the
+    # documented [mark - 5s, mark + 3min] window.  Its global run is consumed
+    # by the mark, so this test deliberately checks the bounded card itself
+    # rather than creating duplicate residual suggestion fragments.
+    assert len(results) == 1
+    marked = results[0]
+    assert marked.source == "mark"
+    assert [line.seconds for line in marked.lines][0] == 5
+    assert [line.seconds for line in marked.lines][-1] == 190
+
+
 def test_prompt_threshold_prefers_a_passing_recall_false_positive_envelope():
     labels = [True, True, True, True, True, True, False, False, False]
     probabilities = [0.91, 0.82, 0.72, 0.61, 0.51, 0.46, 0.45, 0.20, 0.10]

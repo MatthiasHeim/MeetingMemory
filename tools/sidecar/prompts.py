@@ -133,30 +133,47 @@ def _prompt_runs(
     """Merge consecutive prompt lines, allowing one low-confidence bridge."""
     runs: list[tuple[int, int]] = []
     start: int | None = None
-    low_gap = 0
+    last_positive: int | None = None
+    pending_low = False
     for index, probability in enumerate(probabilities):
-        if probability >= threshold:
-            if start is None:
+        is_positive = probability >= threshold
+        is_consecutive = (
+            index > 0
+            and 0 <= lines[index].seconds - lines[index - 1].seconds <= PROMPT_CONSECUTIVE_GAP_SECONDS
+        )
+        if start is None:
+            if is_positive:
                 start = index
-            low_gap = 0
+                last_positive = index
+                pending_low = False
             continue
-        if (
-            start is not None
-            and low_gap == 0
-            and index > start
-            and lines[index].seconds - lines[index - 1].seconds <= PROMPT_CONSECUTIVE_GAP_SECONDS
-        ):
+
+        if not is_consecutive:
+            # A distant positive is a new dictated prompt, not a continuation.
+            assert last_positive is not None
+            runs.append((start, last_positive))
+            start = index if is_positive else None
+            last_positive = index if is_positive else None
+            pending_low = False
+            continue
+
+        if is_positive:
+            last_positive = index
+            pending_low = False
+        elif not pending_low:
             # A short acknowledgement can appear between dictation sentences.
-            low_gap = 1
-            continue
-        if start is not None:
-            end = index - low_gap - 1
-            runs.append((start, end))
+            pending_low = True
+        else:
+            # A second low line ends the run before the first low bridge.
+            assert last_positive is not None
+            runs.append((start, last_positive))
             start = None
-            low_gap = 0
+            last_positive = None
+            pending_low = False
     if start is not None:
-        runs.append((start, len(probabilities) - low_gap - 1))
-    return [(start, end) for start, end in runs if end >= start]
+        assert last_positive is not None
+        runs.append((start, last_positive))
+    return runs
 
 
 def _closest_run(
@@ -164,15 +181,17 @@ def _closest_run(
     lines: Sequence[TranscriptLine],
     positions: set[int],
     mark_seconds: float,
-) -> tuple[int, int] | None:
-    candidate_runs = [
-        run for run in runs if any(position in positions for position in range(run[0], run[1] + 1))
-    ]
+) -> tuple[int, ...] | None:
+    candidate_runs = []
+    for start, end in runs:
+        bounded_positions = tuple(position for position in range(start, end + 1) if position in positions)
+        if bounded_positions:
+            candidate_runs.append(bounded_positions)
     if not candidate_runs:
         return None
     return min(
         candidate_runs,
-        key=lambda run: min(abs(lines[position].seconds - mark_seconds) for position in range(run[0], run[1] + 1)),
+        key=lambda bounded: min(abs(lines[position].seconds - mark_seconds) for position in bounded),
     )
 
 
@@ -294,10 +313,9 @@ def prompts_from_marks(
         if mark < 0:
             continue
         positions = set(marked_window_indices(lines, mark))
-        run = _closest_run(runs, lines, positions, mark)
-        if run is None:
+        run_positions = _closest_run(runs, lines, positions, mark)
+        if run_positions is None:
             continue
-        run_positions = tuple(range(run[0], run[1] + 1))
         if any(position in marked_positions for position in run_positions):
             # Repeated hotkey presses around the same dictation must not make
             # duplicate cards for the same verbatim prompt run.
