@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from .calibration_policy import OWNER_OVERRIDE_STATUS, valid_owner_override
 from .judges import (
     JUDGE_PROMPT_VERSION,
     JUDGE_PROTOCOL_FINGERPRINT,
@@ -46,8 +47,11 @@ def calibrated_prompt_threshold(model: str | None, report_path: str | Path | Non
     if not isinstance(report, dict):
         raise PromptCalibrationError("the Gemini calibration report is not an object")
     chosen = report.get("chosen")
-    if report.get("status") != "passed" or not isinstance(chosen, dict):
-        raise PromptCalibrationError("Gemini prompt extraction is disabled until calibration criterion 2 passes")
+    approved_override = valid_owner_override(report)
+    if report.get("status") not in {"passed", OWNER_OVERRIDE_STATUS} or not isinstance(chosen, dict):
+        raise PromptCalibrationError("Gemini prompt extraction has no approved calibration")
+    if report.get("status") == OWNER_OVERRIDE_STATUS and not approved_override:
+        raise PromptCalibrationError("the Gemini owner override is missing or does not match the recorded decision")
     if report.get("judge_prompt_version") != JUDGE_PROMPT_VERSION:
         raise PromptCalibrationError("the Gemini calibration report was produced by a different judge prompt")
     if report.get("judge_protocol_sha256") != JUDGE_PROTOCOL_FINGERPRINT:

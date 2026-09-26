@@ -14,6 +14,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .calibration_policy import (
+    OWNER_APPROVED_CLIP_GROW_THRESHOLD,
+    OWNER_APPROVED_CLIP_SEED_THRESHOLD,
+    OWNER_APPROVED_MODEL,
+    OWNER_APPROVED_PROMPT_THRESHOLD,
+    OWNER_OVERRIDE_STATUS,
+    owner_override_payload,
+)
 from .judges import (
     JUDGE_PROMPT_VERSION,
     JUDGE_PROTOCOL_FINGERPRINT,
@@ -349,12 +357,55 @@ def choose_model(summaries: Sequence[ModelSummary], metrics: Sequence[Metric]) -
     return max(summaries, key=rank)
 
 
+def apply_owner_override(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Record the dated Slice-1 owner override without making provider calls.
+
+    The underlying aggregate measurement stays intact.  This merely records
+    the explicit decision that B Swiss-German relevance is a known limitation,
+    while retaining the measured 0.788--0.884 repeat range in the local report.
+    """
+    if not isinstance(report, Mapping):
+        raise ValueError("calibration report must be an object")
+    summaries = report.get("models")
+    if not isinstance(summaries, list) or not any(
+        isinstance(summary, Mapping) and summary.get("model") == OWNER_APPROVED_MODEL
+        for summary in summaries
+    ):
+        raise ValueError(f"calibration report has no {OWNER_APPROVED_MODEL!r} measurement")
+
+    amended = dict(report)
+    amended["schema_version"] = max(3, int(report.get("schema_version", 0) or 0))
+    # The final fingerprints bind the approved thresholds to today's exact
+    # runtime prompt/schema.  This is a metadata binding, not a claim that the
+    # provider measurement was rerun after the decision.
+    amended["judge_prompt_version"] = JUDGE_PROMPT_VERSION
+    amended["judge_protocol_sha256"] = JUDGE_PROTOCOL_FINGERPRINT
+    amended["dictating_prompt_protocol_sha256"] = question_protocol_fingerprint(
+        "dictating_prompt", DICTATING_PROMPT_QUESTION
+    )
+    amended["status"] = OWNER_OVERRIDE_STATUS
+    amended["owner_override"] = owner_override_payload()
+    amended["chosen"] = {
+        "model": OWNER_APPROVED_MODEL,
+        "prompt_threshold": OWNER_APPROVED_PROMPT_THRESHOLD,
+        "relevance_seed_threshold": OWNER_APPROVED_CLIP_SEED_THRESHOLD,
+        "relevance_grow_threshold": OWNER_APPROVED_CLIP_GROW_THRESHOLD,
+    }
+    return amended
+
+
+def read_calibration_report(path: str | Path | None = None) -> dict[str, Any]:
+    """Read the local aggregate-only report; evaluation text never enters it."""
+    location = Path(path or DEFAULT_REPORT_DIR / "latest.json").expanduser()
+    return _json_object(location)
+
+
 def calibrate(
     *,
     eval_dir: str | Path = DEFAULT_EVAL_DIR,
-    models: Sequence[str] = ("gemini-3.8-flash", "gemini-3.1-flash-lite"),
+    models: Sequence[str] = (OWNER_APPROVED_MODEL,),
 ) -> dict[str, Any]:
-    """Run both specified Gemini variants and return aggregate-only results."""
+    """Run the single approved Gemini judge and return aggregate-only results."""
     all_metrics: list[Metric] = []
     summaries: list[ModelSummary] = []
     started = time.time()
@@ -368,7 +419,7 @@ def calibrate(
         if summary.pass_relevance_a and summary.pass_relevance_b and summary.pass_prompt_c
     ]
     chosen = choose_model(passing, all_metrics) if passing else None
-    return {
+    report = {
         "schema_version": 2,
         "judge_prompt_version": JUDGE_PROMPT_VERSION,
         "judge_protocol_sha256": JUDGE_PROTOCOL_FINGERPRINT,
@@ -383,6 +434,10 @@ def calibrate(
         "status": "passed" if chosen else "failed_acceptance_criterion_2",
         "metrics": [asdict(metric) for metric in all_metrics],
     }
+    # This is the explicit owner-approved exception, not a model router.  The
+    # raw metrics above remain in the report for the later human-reference-set
+    # remeasurement.
+    return apply_owner_override(report)
 
 
 def write_calibration_report(report: Mapping[str, Any], path: str | Path | None = None) -> Path:

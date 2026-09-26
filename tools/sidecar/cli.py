@@ -7,7 +7,16 @@ import json
 import sys
 from pathlib import Path
 
-from .calibration import DEFAULT_EVAL_DIR, calibrate, markdown_table, write_calibration_report
+from .calibration import (
+    DEFAULT_EVAL_DIR,
+    DEFAULT_REPORT_DIR,
+    apply_owner_override,
+    calibrate,
+    markdown_table,
+    read_calibration_report,
+    write_calibration_report,
+)
+from .calibration_policy import OWNER_APPROVED_MODEL
 from .gate import JudgeGateError
 from .service import clip_for_stem, prompts_for_stem
 
@@ -27,14 +36,20 @@ def build_parser() -> argparse.ArgumentParser:
     clip.add_argument("--topic", required=True, help="free-text meeting topic")
     clip.add_argument("--widen", action="store_true", help="lower clip seed/grow thresholds one calibrated step")
     clip.add_argument("--judge", choices=("gemini", "jev"), default="gemini")
-    clip.add_argument("--model", default="gemini-3.8-flash", help="Gemini model when using Gemini")
+    clip.add_argument(
+        "--model", choices=(OWNER_APPROVED_MODEL,), default=OWNER_APPROVED_MODEL,
+        help="the single owner-approved Gemini judge",
+    )
     clip.add_argument("--without-timestamps", action="store_true", help="omit [MM:SS] prefixes")
     _common_paths(clip)
 
     prompts = subcommands.add_parser("prompts", help="marked and suggested dictated prompts")
     prompts.add_argument("--stem", required=True, help="recorder filename stem")
     prompts.add_argument("--judge", choices=("gemini", "jev"), default="gemini")
-    prompts.add_argument("--model", default="gemini-3.8-flash", help="Gemini model when using Gemini")
+    prompts.add_argument(
+        "--model", choices=(OWNER_APPROVED_MODEL,), default=OWNER_APPROVED_MODEL,
+        help="the single owner-approved Gemini judge",
+    )
     _common_paths(prompts)
 
     calibration = subcommands.add_parser("calibrate", help="run local-only Gemini calibration")
@@ -42,10 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
     calibration.add_argument(
         "--models",
         nargs="+",
-        default=("gemini-3.8-flash", "gemini-3.1-flash-lite"),
-        help="Gemini model ids to compare",
+        choices=(OWNER_APPROVED_MODEL,),
+        default=(OWNER_APPROVED_MODEL,),
+        help="the single owner-approved Gemini judge",
     )
     calibration.add_argument("--report", type=Path, help="aggregate-only report destination")
+    calibration.add_argument(
+        "--apply-owner-override",
+        action="store_true",
+        help="amend an existing aggregate-only report without calling a provider",
+    )
     return parser
 
 
@@ -86,8 +107,13 @@ def _run_prompts(args: argparse.Namespace) -> int:
 
 
 def _run_calibrate(args: argparse.Namespace) -> int:
-    report = calibrate(eval_dir=args.eval_dir, models=args.models)
-    destination = write_calibration_report(report, args.report)
+    if args.apply_owner_override:
+        destination = args.report or DEFAULT_REPORT_DIR / "latest.json"
+        report = apply_owner_override(read_calibration_report(destination))
+    else:
+        report = calibrate(eval_dir=args.eval_dir, models=args.models)
+        destination = args.report
+    destination = write_calibration_report(report, destination)
     print(markdown_table(report))
     print(f"\nAggregate calibration report: {destination}")
     return 0

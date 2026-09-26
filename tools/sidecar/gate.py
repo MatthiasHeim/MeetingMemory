@@ -10,9 +10,10 @@ import json
 import math
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .transcript import recordings_dir, safe_stem
 
@@ -32,6 +33,13 @@ class RecordingSidecar:
     external_attendees: bool | None = None
     marks: tuple[float, ...] = ()
     payload: dict[str, Any] | None = None
+
+
+# Menu clicks and global-shortcut callbacks are normally delivered serially by
+# AppKit, but the recorder also lets a worker finish while the menu remains
+# usable.  Serialise read-modify-write mark updates in-process so two rapid
+# shortcuts cannot overwrite one another's atomic replacement.
+_SIDECAR_WRITE_LOCK = threading.RLock()
 
 
 def sidecar_path(stem: str, root: str | Path | None = None) -> Path:
@@ -95,6 +103,7 @@ def initialise_recording_sidecar(
     jev: bool,
     external_attendees: bool,
     root: str | Path | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     """Persist the menu decision before marks can be added.
 
@@ -103,17 +112,29 @@ def initialise_recording_sidecar(
     """
     if type(jev) is not bool or type(external_attendees) is not bool:
         raise ValueError("jev and external_attendees must be booleans")
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise ValueError("metadata must be a mapping when supplied")
+    permitted_metadata: dict[str, Any] = {}
+    if metadata:
+        for key in ("calendar_title", "calendar_event_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                permitted_metadata[key] = value.strip()
+        resolved = metadata.get("calendar_attendance_resolved")
+        if type(resolved) is bool:
+            permitted_metadata["calendar_attendance_resolved"] = resolved
+
     path = sidecar_path(stem, root)
-    _atomic_json(
-        path,
-        {
-            "schema_version": 1,
-            "jev": jev,
-            "external_attendees": external_attendees,
-            "marks": [],
-            "mark_clock": "seconds_since_recorder_start_monotonic",
-        },
-    )
+    payload = {
+        "schema_version": 1,
+        "jev": jev,
+        "external_attendees": external_attendees,
+        "marks": [],
+        "mark_clock": "seconds_since_recorder_start_monotonic",
+        **permitted_metadata,
+    }
+    with _SIDECAR_WRITE_LOCK:
+        _atomic_json(path, payload)
     return path
 
 
@@ -126,23 +147,24 @@ def append_mark(stem: str, offset_seconds: float, root: str | Path | None = None
     if not math.isfinite(mark) or mark < 0:
         raise ValueError("mark offset must be finite and non-negative")
     path = sidecar_path(stem, root)
-    existing = load_recording_sidecar(stem, root)
-    payload = dict(existing.payload or {})
-    marks = list(existing.marks)
-    # Millisecond precision is materially finer than a completed transcript's
-    # timestamp resolution while keeping diffs/readability tidy.
-    mark = round(mark, 3)
-    marks.append(mark)
-    payload.update(
-        {
-            "schema_version": 1,
-            "jev": existing.jev,
-            "external_attendees": existing.external_attendees,
-            "marks": marks,
-            "mark_clock": "seconds_since_recorder_start_monotonic",
-        }
-    )
-    _atomic_json(path, payload)
+    with _SIDECAR_WRITE_LOCK:
+        existing = load_recording_sidecar(stem, root)
+        payload = dict(existing.payload or {})
+        marks = list(existing.marks)
+        # Millisecond precision is materially finer than a completed transcript's
+        # timestamp resolution while keeping diffs/readability tidy.
+        mark = round(mark, 3)
+        marks.append(mark)
+        payload.update(
+            {
+                "schema_version": 1,
+                "jev": existing.jev,
+                "external_attendees": existing.external_attendees,
+                "marks": marks,
+                "mark_clock": "seconds_since_recorder_start_monotonic",
+            }
+        )
+        _atomic_json(path, payload)
     return mark
 
 

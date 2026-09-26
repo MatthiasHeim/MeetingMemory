@@ -7,7 +7,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from sidecar.calibration import _scores_for_dataset, choose_prompt_threshold, precision_recall  # noqa: E402
+from sidecar.calibration import (  # noqa: E402
+    _scores_for_dataset,
+    apply_owner_override,
+    choose_prompt_threshold,
+    precision_recall,
+)
+from sidecar.calibration_policy import (  # noqa: E402
+    OWNER_APPROVED_MODEL,
+    OWNER_APPROVED_PROMPT_THRESHOLD,
+    OWNER_OVERRIDE_STATUS,
+    valid_owner_override,
+)
 from sidecar.judges import (  # noqa: E402
     JUDGE_PROMPT_VERSION,
     JUDGE_PROTOCOL_FINGERPRINT,
@@ -250,3 +261,25 @@ def test_runtime_uses_only_a_passing_threshold_for_the_exact_gemini_model(tmp_pa
     assert calibrated_prompt_threshold("gemini-3.8-flash", report) == pytest.approx(0.62)
     with pytest.raises(PromptCalibrationError):
         calibrated_prompt_threshold("gemini-3.1-flash-lite", report)
+
+
+def test_owner_override_enables_only_the_recorded_single_judge_threshold(tmp_path):
+    report = apply_owner_override(
+        {
+            "schema_version": 2,
+            "models": [{"model": OWNER_APPROVED_MODEL}],
+            "metrics": [],
+        }
+    )
+
+    assert report["status"] == OWNER_OVERRIDE_STATUS
+    assert valid_owner_override(report)
+    assert report["owner_override"]["date"] == "2026-09-26"
+    assert report["owner_override"]["swiss_german_relevance_auc_range"] == [0.788, 0.884]
+    assert report["chosen"]["prompt_threshold"] == OWNER_APPROVED_PROMPT_THRESHOLD
+
+    destination = tmp_path / "latest.json"
+    destination.write_text(__import__("json").dumps(report), encoding="utf-8")
+    assert calibrated_prompt_threshold(OWNER_APPROVED_MODEL, destination) == pytest.approx(0.90)
+    with pytest.raises(PromptCalibrationError):
+        calibrated_prompt_threshold("gemini-3.1-flash-lite", destination)
