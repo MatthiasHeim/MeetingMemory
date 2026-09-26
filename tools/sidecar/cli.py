@@ -101,7 +101,8 @@ def _run_prompts(args: argparse.Namespace) -> int:
     for index, prompt in enumerate(results, start=1):
         label = "marked" if prompt.source == "mark" else "suggested"
         offset = "" if prompt.mark_seconds is None else f" at mark {prompt.mark_seconds:.1f}s"
-        print(f"--- Prompt {index} ({label}{offset}) ---")
+        uncertainty = " — Zuordnung unsicher" if prompt.association_label else ""
+        print(f"--- Prompt {index} ({label}{offset}{uncertainty}) ---")
         print(prompt.text)
     return 0
 

@@ -194,7 +194,13 @@ def test_marked_card_intersects_the_run_with_its_bounded_window():
             return {question: [0.95] * len(lines)}
 
     lines = [_line(index, seconds, f"Prompt sentence at {seconds}.") for index, seconds in enumerate(range(0, 200, 5))]
-    results = prompts_from_marks(lines, [10.0], judge=_BoundedJudge())
+    results = prompts_from_marks(
+        lines,
+        [10.0],
+        judge=_BoundedJudge(),
+        channel_lag_seconds=0.0,
+        mic_origin_delay_seconds=0.0,
+    )
 
     # The marked card must not leak the detected run's text outside the
     # documented [mark - 5s, mark + 3min] window.  Its global run is consumed
@@ -267,7 +273,14 @@ def test_owner_override_enables_only_the_recorded_single_judge_threshold(tmp_pat
     report = apply_owner_override(
         {
             "schema_version": 2,
-            "models": [{"model": OWNER_APPROVED_MODEL}],
+            "models": [
+                {
+                    "model": OWNER_APPROVED_MODEL,
+                    "prompt_threshold": OWNER_APPROVED_PROMPT_THRESHOLD,
+                    "pass_relevance_a": True,
+                    "pass_prompt_c": True,
+                }
+            ],
             "metrics": [],
         }
     )

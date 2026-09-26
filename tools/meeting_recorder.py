@@ -26,7 +26,7 @@ import soundfile as sf
 import rumps
 
 from capture_provenance import archive_capture, merge_filter
-from sidecar.gate import initialise_recording_sidecar
+from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar
 from sidecar.recorder_support import (
     CalendarRecordingContext,
     append_prompt_mark,
@@ -36,6 +36,18 @@ from sidecar.recorder_support import (
 )
 from sidecar.service import clip_for_stem, prompts_for_stem
 from sidecar.transcript import format_timestamp, recent_transcripts
+
+# launchd does not pass GEMINI_API_KEY to the menu-bar application.  Mirror the
+# watcher: load the repository .env if python-dotenv is available, without ever
+# logging the key or its value.
+try:
+    from dotenv import load_dotenv
+
+    _recorder_env_path = Path(__file__).parent.parent / ".env"
+    if _recorder_env_path.exists():
+        load_dotenv(_recorder_env_path)
+except ImportError:
+    pass
 
 
 # Default config path
@@ -158,6 +170,8 @@ class AudioRecorder:
         self._mic_frames = 0
         self._previous_adc_end = None
         self._next_timing_sample = 0
+        self._mic_first_sample_monotonic: float | None = None
+        self._mic_first_sample_event = threading.Event()
 
     def _sys_proc_running(self) -> bool:
         return subprocess.run(
@@ -174,6 +188,8 @@ class AudioRecorder:
         self._mic_frames = 0
         self._previous_adc_end = None
         self._next_timing_sample = 0
+        self._mic_first_sample_monotonic = None
+        self._mic_first_sample_event.clear()
         self._capture_meta = {"schema_version": 1, "started_wall_time": time.time(),
                               "started_monotonic": time.monotonic(),
                               "mic_sample_rate": self.sample_rate,
@@ -345,6 +361,11 @@ class AudioRecorder:
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
         if self.recording:
+            # The callback must remain I/O-free.  The menu app's sidecar worker
+            # waits on this event and persists the offset away from audio.
+            if self._mic_first_sample_monotonic is None:
+                self._mic_first_sample_monotonic = time.monotonic()
+                self._mic_first_sample_event.set()
             self.audio_data.append(indata.copy())
             adc = float(time_info.inputBufferAdcTime)
             gap = None if self._previous_adc_end is None else adc - self._previous_adc_end
@@ -363,6 +384,11 @@ class AudioRecorder:
     @property
     def is_recording(self) -> bool:
         return self.recording
+
+    def wait_for_mic_first_sample(self, timeout_seconds: float = 15.0) -> float | None:
+        """Wait outside the audio callback for the first mic sample's clock."""
+        self._mic_first_sample_event.wait(timeout=max(0.0, timeout_seconds))
+        return self._mic_first_sample_monotonic
 
 
 class MeetingRecorderApp(rumps.App):
@@ -396,6 +422,7 @@ class MeetingRecorderApp(rumps.App):
         self._global_hotkey_monitor = None
         self._local_hotkey_monitor = None
         self._sidecar_threads: set[threading.Thread] = set()
+        self._sidecar_write_failed_stems: set[str] = set()
 
         # Build menu
         self._build_menu()
@@ -479,8 +506,19 @@ class MeetingRecorderApp(rumps.App):
         else:
             self._start_recording(sender)
 
-    def _calendar_context_for_start(self, output_file: Path) -> CalendarRecordingContext:
-        """Resolve the current event before showing the Jev choice.
+    def _gemini_api_key(self) -> str | None:
+        """Read the recorder's configured Gemini key without exposing it."""
+        config = getattr(self, "config", {})
+        gemini = config.get("gemini", {}) if isinstance(config, dict) else {}
+        env_name = gemini.get("api_key_env", "GEMINI_API_KEY") if isinstance(gemini, dict) else "GEMINI_API_KEY"
+        if not isinstance(env_name, str) or not env_name.strip():
+            env_name = "GEMINI_API_KEY"
+        return os.environ.get(env_name)
+
+    def _calendar_context_for_start(
+        self, output_file: Path, *, timeout_seconds: float = 3.0
+    ) -> CalendarRecordingContext:
+        """Resolve the current event off the capture path with a short timeout.
 
         The existing resolver keys its lookup from the timestamped filename;
         it does not need a completed transcript. Any lookup failure is an
@@ -489,26 +527,26 @@ class MeetingRecorderApp(rumps.App):
         try:
             from calendar_resolve import resolve
 
-            return calendar_context_from_resolution(resolve(output_file.with_suffix(".json")))
+            return calendar_context_from_resolution(
+                resolve(output_file.with_suffix(".json"), timeout_seconds=timeout_seconds)
+            )
         except Exception as exc:
             print(f"Calendar lookup unavailable for Jev gate: {exc}", file=sys.stderr)
-            return CalendarRecordingContext(external_attendees=True, attendance_resolved=False)
+            return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
 
     @staticmethod
     def _jev_dialog_message(context: CalendarRecordingContext) -> str:
         message = (
             "Standard ist Gemini (vertraglich gedeckt).\n\n"
-            "Jev darf nur für eine eindeutig als intern aufgelöste Aufnahme "
-            "verwendet werden."
+            "Jev ist standardmässig ausgeschaltet. Matthias entscheidet für "
+            "diese Aufnahme ausdrücklich selbst."
         )
-        if context.external_attendees and context.attendance_resolved:
+        if context.requires_external_acknowledgement:
             return message + "\n\nJev: nicht durch Kunden-DPA gedeckt."
-        if not context.attendance_resolved:
-            return message + "\n\nDer Kalendereintrag konnte nicht eindeutig aufgelöst werden; Jev bleibt aus Sicherheitsgründen gesperrt."
         return message
 
-    def _ask_jev_choice(self, context: CalendarRecordingContext) -> bool | None:
-        """Show a checkbox dialog whose default is off, or return cancellation."""
+    def _ask_jev_choice(self, context: CalendarRecordingContext) -> bool:
+        """Show the owner-controlled checkbox after capture has already begun."""
         message = self._jev_dialog_message(context)
         try:
             import AppKit
@@ -517,21 +555,18 @@ class MeetingRecorderApp(rumps.App):
             alert = AppKit.NSAlert.alloc().init()
             alert.setMessageText_("Jev verwenden?")
             alert.setInformativeText_(message)
-            alert.addButtonWithTitle_("Aufnahme starten")
-            alert.addButtonWithTitle_("Abbrechen")
+            alert.addButtonWithTitle_("Weiter")
+            alert.addButtonWithTitle_("Gemini verwenden")
             checkbox = AppKit.NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 360, 24))
             checkbox.setButtonType_(getattr(AppKit, "NSSwitchButton", 3))
             checkbox.setTitle_("Jev für diese Aufnahme verwenden")
             checkbox.setState_(getattr(AppKit, "NSControlStateValueOff", 0))
-            if not context.jev_can_be_selected:
-                checkbox.setEnabled_(False)
             alert.setAccessoryView_(checkbox)
             response = alert.runModal()
             if response != getattr(AppKit, "NSAlertFirstButtonReturn", 1000):
-                return None
+                return False
             return bool(
-                context.jev_can_be_selected
-                and checkbox.state() == getattr(AppKit, "NSControlStateValueOn", 1)
+                checkbox.state() == getattr(AppKit, "NSControlStateValueOn", 1)
             )
         except Exception as exc:
             # This fallback never turns Jev on. It preserves the safe default
@@ -540,51 +575,21 @@ class MeetingRecorderApp(rumps.App):
             response = rumps.alert(
                 title="Jev verwenden?",
                 message=message,
-                ok="Mit Gemini starten",
-                cancel="Abbrechen",
+                ok="Gemini verwenden",
+                cancel="Weiter",
             )
-            return False if response == 1 else None
+            return False
 
     def _start_recording(self, sender):
-        """Start a new recording."""
+        """Start capture before optional calendar/UI/sidecar work."""
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         output_file = self.recordings_dir / f"{timestamp}.wav"
 
-        calendar_context = self._calendar_context_for_start(output_file)
-        jev_choice = self._ask_jev_choice(calendar_context)
-        if jev_choice is None:
-            return
-
         try:
-            # Persist policy before recording begins. If this write failed the
-            # recorder must not start, because a missing policy fails closed but
-            # cannot faithfully record the requested decision.
-            initialise_recording_sidecar(
-                timestamp,
-                jev=jev_choice,
-                external_attendees=calendar_context.external_attendees,
-                root=self.recordings_dir,
-                metadata=sidecar_metadata_from_calendar(calendar_context),
-            )
             recording_started_monotonic = time.monotonic()
             if not self.recorder.start(output_file):
                 raise RuntimeError("recorder refused to start")
-            self.recording_start_time = datetime.now()
-            self._recording_stem = timestamp
-            self._recording_started_monotonic = recording_started_monotonic
-
-            # Update UI
-            self.title = TITLE_RECORDING
-            sender.title = "Stop Recording"
-            self._set_prompt_mark_available(True)
-
-            rumps.notification(
-                title="MeetingRecorder",
-                subtitle="Recording started",
-                message=f"Saving to: {output_file.name}"
-            )
-
         except Exception as e:
             self._recording_stem = None
             self._recording_started_monotonic = None
@@ -594,6 +599,137 @@ class MeetingRecorderApp(rumps.App):
                 subtitle="Error",
                 message=str(e)
             )
+            return
+
+        # Everything below is optional sidecar/UI work.  It must never route
+        # back through the capture-start exception path once the recorder is
+        # active, even if local persistence or a background thread fails.
+        self.recording_start_time = datetime.now()
+        self._recording_stem = timestamp
+        self._recording_started_monotonic = recording_started_monotonic
+        self.title = TITLE_RECORDING
+        sender.title = "Stop Recording"
+        self._set_prompt_mark_available(True)
+        try:
+            rumps.notification(
+                title="MeetingRecorder",
+                subtitle="Recording started",
+                message=f"Saving to: {output_file.name}",
+            )
+        except Exception as exc:
+            print(f"Recording-start notification failed: {exc}", file=sys.stderr)
+
+        # The initial policy is deliberately fail-closed.  A failed local
+        # write cannot cancel capture or re-enable Jev later.
+        self._initialise_fail_closed_sidecar(timestamp)
+        try:
+            self._start_sidecar_worker(
+                name="meeting-sidecar-mic-origin",
+                target=lambda: self._persist_mic_first_sample_offset(
+                    timestamp, recording_started_monotonic
+                ),
+            )
+            self._start_sidecar_worker(
+                name="meeting-sidecar-calendar",
+                target=lambda: self._resolve_calendar_after_capture(timestamp, output_file),
+            )
+        except Exception as exc:
+            self._sidecar_write_failed(timestamp, exc)
+
+    def _sidecar_write_failed(self, stem: str, exc: Exception) -> None:
+        """Keep recording and permanently force Gemini after any write failure."""
+        print(f"Sidecar write failed for {stem}; Jev forced off: {exc}", file=sys.stderr)
+        failures = getattr(self, "_sidecar_write_failed_stems", None)
+        if failures is None:
+            failures = set()
+            self._sidecar_write_failed_stems = failures
+        failures.add(stem)
+        # An initial sidecar is false by construction; this best-effort amend
+        # also turns off a choice made just before a later timing write failed.
+        try:
+            amend_recording_sidecar(
+                stem,
+                root=self.recordings_dir,
+                jev=False,
+                jev_external_acknowledged=False,
+            )
+        except Exception:
+            pass
+        try:
+            self._notify_from_worker(
+                subtitle="Sidecar nicht gespeichert",
+                message="Die Aufnahme läuft weiter; Jev bleibt ausgeschaltet.",
+            )
+        except Exception as notify_exc:
+            print(f"Sidecar failure notification failed: {notify_exc}", file=sys.stderr)
+
+    def _initialise_fail_closed_sidecar(self, stem: str) -> None:
+        try:
+            initialise_recording_sidecar(
+                stem,
+                jev=False,
+                external_attendees=None,
+                jev_external_acknowledged=False,
+                root=self.recordings_dir,
+                metadata=sidecar_metadata_from_calendar(
+                    CalendarRecordingContext(None, False)
+                ),
+            )
+        except Exception as exc:
+            self._sidecar_write_failed(stem, exc)
+
+    def _persist_mic_first_sample_offset(
+        self, stem: str, mark_zero_monotonic: float
+    ) -> None:
+        wait = getattr(self.recorder, "wait_for_mic_first_sample", None)
+        if not callable(wait):
+            return
+        first_sample = wait(timeout_seconds=15.0)
+        if first_sample is None:
+            return
+        if stem in getattr(self, "_sidecar_write_failed_stems", set()):
+            return
+        try:
+            amend_recording_sidecar(
+                stem,
+                root=self.recordings_dir,
+                mic_first_sample_offset_seconds=max(
+                    0.0, float(first_sample) - float(mark_zero_monotonic)
+                ),
+            )
+        except Exception as exc:
+            self._sidecar_write_failed(stem, exc)
+
+    def _resolve_calendar_after_capture(self, stem: str, output_file: Path) -> None:
+        context = self._calendar_context_for_start(output_file, timeout_seconds=3.0)
+        self._dispatch_ui(lambda: self._offer_jev_choice_for_recording(stem, context))
+
+    def _offer_jev_choice_for_recording(
+        self, stem: str, context: CalendarRecordingContext
+    ) -> None:
+        """Amend the sidecar only after the asynchronous calendar dialog."""
+        if (
+            not self.recorder.is_recording
+            or stem != getattr(self, "_recording_stem", None)
+            or stem in getattr(self, "_sidecar_write_failed_stems", set())
+        ):
+            return
+        jev_choice = self._ask_jev_choice(context)
+        if not self.recorder.is_recording or stem != getattr(self, "_recording_stem", None):
+            return
+        try:
+            amend_recording_sidecar(
+                stem,
+                root=self.recordings_dir,
+                jev=jev_choice,
+                external_attendees=context.external_attendees,
+                jev_external_acknowledged=(
+                    jev_choice and context.requires_external_acknowledgement
+                ),
+                metadata=sidecar_metadata_from_calendar(context),
+            )
+        except Exception as exc:
+            self._sidecar_write_failed(stem, exc)
 
     def _stop_recording(self, sender):
         """Stop the current recording."""
@@ -693,15 +829,19 @@ class MeetingRecorderApp(rumps.App):
     def _start_sidecar_worker(self, *, name: str, target) -> None:
         """Run completed-transcript work off the rumps and audio callback paths."""
         thread: threading.Thread
+        threads = getattr(self, "_sidecar_threads", None)
+        if threads is None:
+            threads = set()
+            self._sidecar_threads = threads
 
         def run() -> None:
             try:
                 target()
             finally:
-                self._sidecar_threads.discard(thread)
+                threads.discard(thread)
 
         thread = threading.Thread(target=run, name=name, daemon=True)
-        self._sidecar_threads.add(thread)
+        threads.add(thread)
         thread.start()
 
     def _recent_transcript_choice(self, action: str):
@@ -778,6 +918,7 @@ class MeetingRecorderApp(rumps.App):
                     topic,
                     transcripts_root=self.transcripts_dir,
                     recordings_root=self.recordings_dir,
+                    gemini_api_key=self._gemini_api_key(),
                 )
                 self._copy_to_clipboard(clip.text)
             except Exception as exc:
@@ -805,6 +946,7 @@ class MeetingRecorderApp(rumps.App):
                     transcript.stem,
                     transcripts_root=self.transcripts_dir,
                     recordings_root=self.recordings_dir,
+                    gemini_api_key=self._gemini_api_key(),
                 )
             except Exception as exc:
                 self._notify_from_worker(
@@ -828,6 +970,8 @@ class MeetingRecorderApp(rumps.App):
         for number, prompt in enumerate(prompts, start=1):
             if prompt.source == "mark":
                 label = f"Markierung bei {format_timestamp(prompt.mark_seconds or 0)}"
+                if prompt.association_label:
+                    label += f" — {prompt.association_label}"
             else:
                 label = f"Vorschlag bei {format_timestamp(prompt.start_seconds)}"
             choices.append(f"{number}. {label}")

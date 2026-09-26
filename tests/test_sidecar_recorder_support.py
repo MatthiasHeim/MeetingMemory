@@ -29,11 +29,17 @@ from sidecar.transcript import TranscriptLine, transcript_from_lines  # noqa: E4
 
 
 def _authoritative_calendar(attendees: list[dict]) -> dict:
+    external = any(attendee.get("email") != "matthias@lailix.com" for attendee in attendees)
     return {
         "participant_details": attendees,
         "participant_resolution_log": {
             "calendar_search": {
                 "identity_authoritative": True,
+                "matched_timed_event": True,
+                "attendee_roster_present": True,
+                "self_email_verified": True,
+                "synthetic_self": False,
+                "attendance_classification": "external" if external else "internal",
                 "chosen_event_title": "Synthetic planning session",
                 "chosen_event_id": "synthetic-event",
             }
@@ -45,15 +51,16 @@ def test_calendar_context_marks_external_event_and_persists_only_metadata(tmp_pa
     context = calendar_context_from_resolution(
         _authoritative_calendar(
             [
-                {"role": "self", "name": "Matthias Heim"},
-                {"role": "participant", "name": "Synthetic Guest"},
+                {"role": "self", "name": "Matthias Heim", "email": "matthias@lailix.com"},
+                {"role": "participant", "name": "Synthetic Guest", "email": "guest@example.test"},
             ]
         )
     )
 
     assert context.external_attendees is True
     assert context.attendance_resolved is True
-    assert context.jev_can_be_selected is False
+    assert context.jev_can_be_selected is True
+    assert context.requires_external_acknowledgement is True
 
     initialise_recording_sidecar(
         "2026-09-26_10-00-00",
@@ -71,16 +78,21 @@ def test_calendar_context_marks_external_event_and_persists_only_metadata(tmp_pa
         "calendar_title": "Synthetic planning session",
         "external_attendees": True,
         "jev": False,
+        "jev_external_acknowledged": False,
         "mark_clock": "seconds_since_recorder_start_monotonic",
         "marks": [],
-        "schema_version": 1,
+        "recording_stem": "2026-09-26_10-00-00",
+        "schema_version": 2,
     }
 
     internal = calendar_context_from_resolution(
-        _authoritative_calendar([{"role": "self", "name": "Matthias Heim"}])
+        _authoritative_calendar(
+            [{"role": "self", "name": "Matthias Heim", "email": "matthias@lailix.com"}]
+        )
     )
     assert internal.external_attendees is False
     assert internal.jev_can_be_selected is True
+    assert internal.requires_external_acknowledgement is False
 
 
 def test_unresolved_calendar_is_persisted_fail_closed_for_jev():
@@ -93,9 +105,10 @@ def test_unresolved_calendar_is_persisted_fail_closed_for_jev():
         }
     )
 
-    assert context.external_attendees is True
+    assert context.external_attendees is None
     assert context.attendance_resolved is False
-    assert context.jev_can_be_selected is False
+    assert context.jev_can_be_selected is True
+    assert context.requires_external_acknowledgement is True
 
 
 def test_mark_offset_uses_monotonic_elapsed_seconds(tmp_path):

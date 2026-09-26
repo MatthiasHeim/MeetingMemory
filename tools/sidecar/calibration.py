@@ -21,6 +21,7 @@ from .calibration_policy import (
     OWNER_APPROVED_PROMPT_THRESHOLD,
     OWNER_OVERRIDE_STATUS,
     owner_override_payload,
+    unwaived_owner_criteria_pass,
 )
 from .judges import (
     JUDGE_PROMPT_VERSION,
@@ -280,7 +281,11 @@ def calibrate_model(
 
     c_labels = _labels(datasets["C"], "dictating_prompt")
     c_probabilities = all_scores[("C", ORIGINAL_VERSION["C"])]["dictating_prompt"]
-    prompt_threshold = choose_prompt_threshold(c_labels, c_probabilities)
+    # Matthias's calibration decision fixes the runtime prompt threshold at
+    # 0.90.  The B waiver cannot conceal a regression in prompt recall at a
+    # conveniently lower threshold, so criterion C is measured at that exact
+    # operating point.
+    prompt_threshold = OWNER_APPROVED_PROMPT_THRESHOLD
     metrics: list[Metric] = []
     for dataset_name, dataset in datasets.items():
         for version in dataset["versions"]:
@@ -374,6 +379,14 @@ def apply_owner_override(report: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"calibration report has no {OWNER_APPROVED_MODEL!r} measurement")
 
     amended = dict(report)
+    if not unwaived_owner_criteria_pass(report):
+        # Preserve the raw measurements but refuse to turn an A/C regression
+        # into approval.  Prompt extraction then remains disabled because the
+        # runtime accepts only `passed` or a valid owner override.
+        amended["status"] = "failed_unwaived_acceptance_criteria"
+        amended["chosen"] = None
+        amended.pop("owner_override", None)
+        return amended
     amended["schema_version"] = max(3, int(report.get("schema_version", 0) or 0))
     # The final fingerprints bind the approved thresholds to today's exact
     # runtime prompt/schema.  This is a metadata binding, not a claim that the
@@ -434,10 +447,11 @@ def calibrate(
         "status": "passed" if chosen else "failed_acceptance_criterion_2",
         "metrics": [asdict(metric) for metric in all_metrics],
     }
-    # This is the explicit owner-approved exception, not a model router.  The
-    # raw metrics above remain in the report for the later human-reference-set
-    # remeasurement.
-    return apply_owner_override(report)
+    # This is the explicit owner-approved B-only exception, not a model
+    # router.  The raw metrics above remain in the report for the later
+    # human-reference-set remeasurement.  A fully passing report needs no
+    # waiver; a failed A or C remains failed.
+    return report if chosen else apply_owner_override(report)
 
 
 def write_calibration_report(report: Mapping[str, Any], path: str | Path | None = None) -> Path:

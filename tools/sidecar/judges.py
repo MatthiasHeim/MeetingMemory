@@ -14,9 +14,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
 
 from .cache import ProbabilityCache, line_fingerprint
-from .gate import judge_backend_for
+from .gate import append_jev_audit_record, judge_backend_for, load_recording_sidecar
 from .transcript import TranscriptLine
 
 
@@ -31,6 +32,7 @@ Questions = Mapping[str, QuestionInput]
 # score interpretation changes. It is part of each question cache key.
 JUDGE_PROMPT_VERSION = "sidecar-judge-v3-2026-09-26"
 GEMINI_BATCH_SIZE = 20
+APPROVED_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/"
 
 
 @dataclass(frozen=True)
@@ -299,6 +301,62 @@ class GeminiMetrics:
         return values[len(values) // 2]
 
 
+def _pinned_client_http_options(types_module: Any) -> Any:
+    """Build the only allowed SDK client endpoint configuration.
+
+    Passing an explicit base URL is important: google-genai otherwise consults
+    ``GOOGLE_GEMINI_BASE_URL``.  There is intentionally no public base-url or
+    HTTP-options argument on ``GeminiJudge`` for callers to override.
+    """
+    try:
+        return types_module.HttpOptions(
+            base_url=APPROVED_GEMINI_BASE_URL,
+            api_version="v1beta",
+        )
+    except TypeError:  # pragma: no cover - older SDK field aliases
+        return types_module.HttpOptions(
+            baseUrl=APPROVED_GEMINI_BASE_URL,
+            apiVersion="v1beta",
+        )
+
+
+def _visible_client_base_url(client: Any) -> str | None:
+    """Read a real SDK client's destination without depending on one version."""
+    candidates = (
+        getattr(getattr(client, "_api_client", None), "_http_options", None),
+        getattr(client, "http_options", None),
+        getattr(client, "_http_options", None),
+    )
+    for options in candidates:
+        if options is None:
+            continue
+        value = getattr(options, "base_url", None)
+        if value is None:
+            value = getattr(options, "baseUrl", None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _is_approved_gemini_destination(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or parsed.hostname != "generativelanguage.googleapis.com":
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return port in (None, 443) and not parsed.username and not parsed.password
+
+
+def _verify_pinned_gemini_destination(client: Any) -> str | None:
+    """Fail before a request if an inspectable client escaped the Google API."""
+    base_url = _visible_client_base_url(client)
+    if base_url is not None and not _is_approved_gemini_destination(base_url):
+        raise JudgeError("Gemini judge endpoint is not the approved Google Gemini API")
+    return base_url
+
+
 class GeminiJudge:
     """Contract-covered text judge using the recorder's Gemini key/client route."""
 
@@ -329,6 +387,12 @@ class GeminiJudge:
         if client is not None:
             self.client = client
             self.types = types_module
+            # A narrow test seam may inject an in-memory client.  It must still
+            # expose an approved destination; opaque clients cannot become an
+            # endpoint-override escape hatch.
+            self.effective_base_url = _verify_pinned_gemini_destination(client)
+            if self.effective_base_url is None:
+                raise JudgeError("Gemini judge client has no verifiable Google API destination")
             return
         key = api_key or os.environ.get("GEMINI_API_KEY")
         if not key:
@@ -338,10 +402,23 @@ class GeminiJudge:
             from google.genai import types
         except ImportError as exc:  # pragma: no cover - depends on local installation
             raise JudgeError("google-genai is required for GeminiJudge") from exc
-        self.client = genai.Client(api_key=key)
+        # Explicit client options outrank GOOGLE_GEMINI_BASE_URL inside the
+        # google-genai SDK.  Do not inherit a process-wide endpoint override:
+        # this judge may carry client transcript text only to the Google Gemini
+        # Developer API, never an OpenRouter/proxy destination.
+        self.client = genai.Client(
+            api_key=key,
+            vertexai=False,
+            http_options=_pinned_client_http_options(types),
+        )
         self.types = types
+        self.effective_base_url = _verify_pinned_gemini_destination(self.client)
 
     def _generate(self, prompt: str, schema: dict[str, Any]) -> Any:
+        # Recheck per request as well as at construction.  Besides protecting
+        # against an accidental mutable SDK configuration, this keeps an
+        # injected test/client seam from changing destination after validation.
+        _verify_pinned_gemini_destination(self.client)
         started = time.monotonic()
         try:
             if self.types is None:
@@ -350,6 +427,8 @@ class GeminiJudge:
                     "response_mime_type": "application/json",
                     "response_schema": schema,
                     "http_options": {
+                        "base_url": APPROVED_GEMINI_BASE_URL,
+                        "api_version": "v1beta",
                         "timeout": int(self.timeout_seconds * 1000),
                         "retry_options": {"attempts": self.retry_attempts},
                     },
@@ -360,6 +439,8 @@ class GeminiJudge:
                     response_mime_type="application/json",
                     response_schema=schema,
                     http_options=self.types.HttpOptions(
+                        base_url=APPROVED_GEMINI_BASE_URL,
+                        api_version="v1beta",
                         timeout=int(self.timeout_seconds * 1000),
                         retry_options=self.types.HttpRetryOptions(attempts=self.retry_attempts),
                     ),
@@ -474,6 +555,7 @@ class JevJudge:
         python: str | None = None,
         timeout_seconds: float = 30,
         model: str = "~typesafe/jev-latest",
+        audit_root: str | Path | None = None,
     ):
         # The service already checks this, but the adapter must not be a
         # bypassable public OpenRouter entry point. This rejects an
@@ -485,6 +567,7 @@ class JevJudge:
         self.helper_path = Path(helper_path or Path.home() / ".claude" / "skills" / "jev" / "scripts" / "jev_decide.py")
         self.python = python or os.environ.get("PYTHON", "python3")
         self.timeout_seconds = timeout_seconds
+        self.audit_root = audit_root
         if not self.helper_path.is_file():
             raise JudgeError(f"Jev helper not found: {self.helper_path}")
 
@@ -535,6 +618,22 @@ class JevJudge:
         context: int = 6,
     ) -> dict[str, list[float]]:
         normalised = normalise_questions(questions)
+        if not lines:
+            return {question_id: [] for question_id in normalised}
+        # The helper's classification remains the fixed internal/approved
+        # contract expected by the shared Jev skill.  Local policy facts are
+        # captured separately before any request, without recording text.
+        judge_backend_for(self.stem, "jev", recordings_root=self.recordings_root)
+        record = load_recording_sidecar(self.stem, self.recordings_root)
+        try:
+            append_jev_audit_record(
+                self.stem,
+                record,
+                len(lines),
+                audit_root=self.audit_root,
+            )
+        except (OSError, ValueError) as exc:
+            raise JudgeError("Jev audit record could not be written") from exc
         values = {question_id: [] for question_id in normalised}
         for position, line in enumerate(lines):
             previous = lines[max(0, position - context) : position]

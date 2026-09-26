@@ -185,7 +185,14 @@ def test_gemini_judge_batches_twenty_lines_with_schema_and_context():
                 )
             )
 
-    client = SimpleNamespace(models=Models())
+    client = SimpleNamespace(
+        models=Models(),
+        _api_client=SimpleNamespace(
+            _http_options=SimpleNamespace(
+                base_url="https://generativelanguage.googleapis.com/"
+            )
+        ),
+    )
     judge = GeminiJudge(client=client, types_module=None, model="synthetic")
     scores = judge.judge(_lines(21), {"relevant": "Is this synthetic line relevant?"})
 

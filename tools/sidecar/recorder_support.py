@@ -21,34 +21,43 @@ from .transcript import Transcript
 class CalendarRecordingContext:
     """Conservative calendar facts available before a recording starts."""
 
-    external_attendees: bool
+    # True = confirmed external roster, False = confirmed internal-only roster,
+    # None = no authoritative timed event/roster.  Unknown intentionally stays
+    # distinct from external in the sidecar, while receiving the same warning.
+    external_attendees: bool | None
     attendance_resolved: bool
     title: str | None = None
     event_id: str | None = None
 
     @property
     def jev_can_be_selected(self) -> bool:
-        """Only a uniquely resolved internal event may offer the Jev checkbox."""
-        return self.attendance_resolved and not self.external_attendees
+        """The owner may explicitly choose Jev for every meeting type."""
+        return True
+
+    @property
+    def requires_external_acknowledgement(self) -> bool:
+        """External and unresolved meetings need the DPA warning/acknowledgement."""
+        return self.external_attendees is not False
 
 
 def calendar_context_from_resolution(result: Mapping[str, Any] | Any) -> CalendarRecordingContext:
     """Turn ``calendar_resolve.resolve`` output into a fail-closed UI context.
 
-    A current event is considered internal only after the existing resolver
-    reports one authoritative calendar match and an explicit participant list
-    containing no non-self attendee.  A failed/ambiguous lookup is persisted
-    as ``external_attendees: true`` so the existing gate cannot accidentally
-    authorize Jev for an unknown meeting.
+    A current event is considered internal only after the resolver reports one
+    authoritative *timed* event, an explicit roster, and a verified host email.
+    Empty rosters, synthetic host rows, ambiguous matches and all-day events
+    are ``None``/unknown.  The owner can still select Jev after a clear DPA
+    warning, but the offline gate then requires a separately persisted
+    acknowledgement.
     """
     if not isinstance(result, Mapping):
-        return CalendarRecordingContext(external_attendees=True, attendance_resolved=False)
+        return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
 
     search = result.get("participant_resolution_log")
     if isinstance(search, Mapping):
         search = search.get("calendar_search")
     if not isinstance(search, Mapping):
-        return CalendarRecordingContext(external_attendees=True, attendance_resolved=False)
+        return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
 
     raw_title = search.get("chosen_event_title")
     title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else None
@@ -57,28 +66,58 @@ def calendar_context_from_resolution(result: Mapping[str, Any] | Any) -> Calenda
 
     if search.get("identity_authoritative") is not True:
         return CalendarRecordingContext(
-            external_attendees=True,
+            external_attendees=None,
             attendance_resolved=False,
             title=title,
             event_id=event_id,
         )
 
-    attendees = result.get("participant_details")
-    if not isinstance(attendees, list) or not attendees:
+    if search.get("matched_timed_event") is not True:
+        return CalendarRecordingContext(
+            external_attendees=None,
+            attendance_resolved=False,
+            title=title,
+            event_id=event_id,
+        )
+    classification = search.get("attendance_classification")
+    if classification == "external":
         return CalendarRecordingContext(
             external_attendees=True,
+            attendance_resolved=True,
+            title=title,
+            event_id=event_id,
+        )
+    if classification != "internal" or search.get("attendee_roster_present") is not True:
+        return CalendarRecordingContext(
+            external_attendees=None,
             attendance_resolved=False,
             title=title,
             event_id=event_id,
         )
 
-    external_attendees = any(
-        not isinstance(attendee, Mapping)
-        or str(attendee.get("role", "")).strip().casefold() != "self"
-        for attendee in attendees
-    )
+    # Defence in depth for callers that construct a resolver-shaped object:
+    # never accept a role/display name as proof that a row is the owner.
+    attendees = result.get("participant_details")
+    if (
+        search.get("self_email_verified") is not True
+        or search.get("synthetic_self") is not False
+        or not isinstance(attendees, list)
+        or not attendees
+        or any(
+            not isinstance(attendee, Mapping)
+            or str(attendee.get("role", "")).strip().casefold() != "self"
+            or str(attendee.get("email", "")).strip().casefold() != "matthias@lailix.com"
+            for attendee in attendees
+        )
+    ):
+        return CalendarRecordingContext(
+            external_attendees=None,
+            attendance_resolved=False,
+            title=title,
+            event_id=event_id,
+        )
     return CalendarRecordingContext(
-        external_attendees=external_attendees,
+        external_attendees=False,
         attendance_resolved=True,
         title=title,
         event_id=event_id,

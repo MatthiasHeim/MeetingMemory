@@ -158,7 +158,9 @@ def _dedupe_attendees(attendees: list[dict]) -> list[dict]:
 
 # ── Calendar query ────────────────────────────────────────────────────
 
-def _gws_calendar_events(time_min: datetime, time_max: datetime) -> list[dict]:
+def _gws_calendar_events(
+    time_min: datetime, time_max: datetime, *, timeout_seconds: float = 30.0
+) -> list[dict]:
     """Query Matthias's work calendar for events in [time_min, time_max]."""
     params = {
         "calendarId": "primary",
@@ -170,7 +172,7 @@ def _gws_calendar_events(time_min: datetime, time_max: datetime) -> list[dict]:
     cmd = [GWS_WRAPPER, "work", "calendar", "events", "list",
            "--params", json.dumps(params)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         logger.warning("Calendar lookup timed out")
         return []
@@ -262,6 +264,54 @@ def _event_start_raw(ev: dict) -> Optional[str]:
     return ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
 
 
+def _sidecar_attendance_facts(ev: dict) -> dict:
+    """Return only the conservative roster facts used by the sidecar gate.
+
+    Calendar display names are presentation data, not identity evidence.  In
+    particular, a guest named "Matthias Heim" with an external email must not
+    become the host.  A sidecar may call a meeting internal only when the
+    single matched *timed* event contains an explicit roster and Matthias's
+    exact account email is present in it.
+    """
+    start = ev.get("start")
+    timed = isinstance(start, dict) and isinstance(start.get("dateTime"), str) and bool(start.get("dateTime").strip())
+    raw_attendees = ev.get("attendees")
+    roster_present = isinstance(raw_attendees, list) and bool(raw_attendees)
+    facts: dict[str, object] = {
+        "matched_timed_event": timed,
+        "attendee_roster_present": roster_present,
+        "self_email_verified": False,
+        "synthetic_self": False,
+        "attendance_classification": "unknown",
+    }
+    if not timed or not roster_present:
+        facts["synthetic_self"] = True
+        return facts
+
+    self_seen = False
+    external_seen = False
+    malformed = False
+    for attendee in raw_attendees:
+        if not isinstance(attendee, dict):
+            malformed = True
+            continue
+        email = attendee.get("email")
+        if not isinstance(email, str) or not email.strip():
+            malformed = True
+            continue
+        if email.strip().casefold() == SELF_EMAIL.casefold():
+            self_seen = True
+        else:
+            external_seen = True
+
+    facts["self_email_verified"] = self_seen
+    facts["synthetic_self"] = not self_seen
+    if malformed or not self_seen:
+        return facts
+    facts["attendance_classification"] = "external" if external_seen else "internal"
+    return facts
+
+
 def _details_from_event(ev: dict, client_names: list[str]) -> tuple[list[dict], list[dict], Optional[str]]:
     """Attendees of one event as participant_details + forensic resolutions."""
     pdetails: list[dict] = []
@@ -276,6 +326,15 @@ def _details_from_event(ev: dict, client_names: list[str]) -> tuple[list[dict], 
         })
         return pdetails, resolutions, None
 
+    # The legacy speaker roster keeps a narrow duplicate-host collapse for an
+    # organizer alias only after the real account email is present.  This is
+    # presentation de-duplication, not identity evidence: the sidecar reads
+    # `_sidecar_attendance_facts` and accepts self only by exact email.
+    has_verified_self = any(
+        isinstance(attendee.get("email"), str)
+        and attendee["email"].strip().casefold() == SELF_EMAIL.casefold()
+        for attendee in attendees
+    )
     self_seen = False
     for att in attendees:
         email = (att.get("email") or "").lower()
@@ -284,10 +343,9 @@ def _details_from_event(ev: dict, client_names: list[str]) -> tuple[list[dict], 
             display = _humanize_email_local(email.split("@", 1)[0])
         if not display:
             continue
-        is_self = (
-            email == SELF_EMAIL
-            or att.get("self") is True
-            or display.strip().lower() == SELF_NAME.lower()
+        verified_self = email.casefold() == SELF_EMAIL.casefold()
+        is_self = verified_self or (
+            has_verified_self and display.strip().casefold() == SELF_NAME.casefold()
         )
         if is_self:
             if self_seen:
@@ -306,7 +364,11 @@ def _details_from_event(ev: dict, client_names: list[str]) -> tuple[list[dict], 
             resolutions.append({
                 "name": SELF_NAME, "method": "self",
                 "confidence": "high",
-                "evidence": "calendar attendee email match (self)",
+                "evidence": (
+                    "verified calendar attendee email match (self)"
+                    if verified_self
+                    else "duplicate host display name after verified self email"
+                ),
             })
             continue
         company = _company_from_email(email, client_names)
@@ -328,7 +390,7 @@ def _details_from_event(ev: dict, client_names: list[str]) -> tuple[list[dict], 
     if not any((p.get("role") or "").lower() == "self" for p in pdetails):
         pdetails.insert(0, _self_detail())
         resolutions.insert(0, {
-            "name": SELF_NAME, "method": "self",
+            "name": SELF_NAME, "method": "self_synthesized",
             "confidence": "high", "evidence": "host not listed on event",
         })
     return pdetails, resolutions, derived_company
@@ -347,7 +409,7 @@ def _candidate_from_event(ev: dict, client_names: list[str]) -> dict:
 
 # ── Resolution ────────────────────────────────────────────────────────
 
-def resolve(transcript_path: str | Path) -> dict:
+def resolve(transcript_path: str | Path, *, timeout_seconds: float = 30.0) -> dict:
     """Resolve participants for a transcript via Matthias's calendar.
 
     Returns a dict with keys participant_details, participant_resolution_log,
@@ -364,6 +426,11 @@ def resolve(transcript_path: str | Path) -> dict:
             "chosen_event_title": None,
             "identity_authoritative": False,
             "ambiguous": False,
+            "matched_timed_event": False,
+            "attendee_roster_present": False,
+            "self_email_verified": False,
+            "synthetic_self": True,
+            "attendance_classification": "unknown",
         },
         "resolutions": [],
     }
@@ -393,7 +460,7 @@ def resolve(transcript_path: str | Path) -> dict:
         f"{2*SEARCH_WINDOW_MIN}min around {started.strftime('%Y-%m-%dT%H:%M:%SZ')}"
     )
 
-    events = _gws_calendar_events(time_min, time_max)
+    events = _gws_calendar_events(time_min, time_max, timeout_seconds=timeout_seconds)
     _annotate_calendar_search(log["calendar_search"], len(events))
     client_names = _load_client_names()
     log["calendar_search"]["candidates"] = [
@@ -413,6 +480,7 @@ def resolve(transcript_path: str | Path) -> dict:
 
     log["calendar_search"]["chosen_event_id"] = chosen.get("id")
     log["calendar_search"]["chosen_event_title"] = chosen.get("summary")
+    log["calendar_search"].update(_sidecar_attendance_facts(chosen))
 
     if log["calendar_search"]["ambiguous"]:
         # Roster only — nearest title is forensic, not identity. Downstream

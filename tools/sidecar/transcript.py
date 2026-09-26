@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ _TRANSCRIPT_LINE = re.compile(
     r"^\s*\[(?P<timestamp>\d{1,3}:\d{2}(?::\d{2})?)\]\s*"
     r"(?P<speaker>[^:\n]+?)\s*:\s*(?P<text>.+?)\s*$"
 )
+logger = logging.getLogger(__name__)
 
 
 def safe_stem(stem: str) -> str:
@@ -104,11 +106,14 @@ def parse_transcript_lines(value: str) -> tuple[TranscriptLine, ...]:
     for source_line in value.splitlines():
         match = _TRANSCRIPT_LINE.match(source_line)
         if not match:
+            if source_line.strip():
+                logger.debug("Skipping malformed transcript line: %r", source_line)
             continue
         timestamp = match.group("timestamp")
         try:
             seconds = timestamp_seconds(timestamp)
         except ValueError:
+            logger.debug("Skipping transcript line with invalid timestamp: %r", source_line)
             continue
         text = match.group("text").strip()
         if not text:

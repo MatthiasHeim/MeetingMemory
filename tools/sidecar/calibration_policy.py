@@ -43,6 +43,31 @@ def owner_override_payload() -> dict[str, Any]:
     return deepcopy(OWNER_OVERRIDE)
 
 
+def unwaived_owner_criteria_pass(report: Mapping[str, Any]) -> bool:
+    """Require the A and C measurements that Matthias did not waive.
+
+    The waiver is narrowly for B Swiss-German relevance.  It cannot turn a
+    failed English relevance result or failed prompt recall at the approved
+    0.90 threshold into an approved runtime configuration.
+    """
+    summaries = report.get("models")
+    if not isinstance(summaries, list):
+        return False
+    for summary in summaries:
+        if not isinstance(summary, Mapping) or summary.get("model") != OWNER_APPROVED_MODEL:
+            continue
+        try:
+            threshold = float(summary.get("prompt_threshold"))
+        except (TypeError, ValueError):
+            return False
+        return (
+            summary.get("pass_relevance_a") is True
+            and summary.get("pass_prompt_c") is True
+            and abs(threshold - OWNER_APPROVED_PROMPT_THRESHOLD) < 1e-9
+        )
+    return False
+
+
 def valid_owner_override(report: Mapping[str, Any]) -> bool:
     """Check the exact, dated decision before enabling an overridden report."""
     if report.get("status") != OWNER_OVERRIDE_STATUS:
@@ -52,6 +77,8 @@ def valid_owner_override(report: Mapping[str, Any]) -> bool:
     if not isinstance(override, Mapping) or not isinstance(chosen, Mapping):
         return False
     expected = OWNER_OVERRIDE
+    if not unwaived_owner_criteria_pass(report):
+        return False
     if any(override.get(key) != expected[key] for key in ("owner", "date", "model", "scope")):
         return False
     if override.get("prompt_threshold") != OWNER_APPROVED_PROMPT_THRESHOLD:

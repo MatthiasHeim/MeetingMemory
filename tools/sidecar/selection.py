@@ -60,7 +60,12 @@ def selected_indices(
     if not 0 <= grow_threshold <= seed_threshold <= 1:
         raise ValueError("thresholds must satisfy 0 <= grow <= seed <= 1")
     values = [max(0.0, min(1.0, float(value))) for value in probabilities]
-    keep = [value >= seed_threshold for value in values]
+    # An acknowledgement can grow/bridge a substantive cluster, but it must
+    # never itself be one of the two required seeds.
+    keep = [
+        value >= seed_threshold and not is_filler(lines[index])
+        for index, value in enumerate(values)
+    ]
 
     # Grow outward from every existing kept line until no eligible neighbour
     # remains. A loop, rather than a one-pass expansion, preserves chains.
@@ -101,14 +106,16 @@ def selected_indices(
         end = index
         while end < len(keep) and keep[end]:
             end += 1
-        if sum(values[candidate] >= seed_threshold for candidate in range(index, end)) < min_seeds:
+        if sum(
+            values[candidate] >= seed_threshold and not is_filler(lines[candidate])
+            for candidate in range(index, end)
+        ) < min_seeds:
             for candidate in range(index, end):
                 keep[candidate] = False
         index = end
 
-    # Pure filler lines are omitted from the copied text. Their presence never
-    # turns a one-seed cluster into a valid clip because only probabilities are
-    # counted as seeds above.
+    # Pure filler lines are omitted from the copied text and never count as a
+    # seed, even when a model assigns them a high relevance probability.
     return tuple(index for index, included in enumerate(keep) if included and not is_filler(lines[index]))
 
 

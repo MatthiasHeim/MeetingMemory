@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ def create_judge(
     recordings_root: str | Path | None = None,
     cache_root: str | Path | None = None,
     gemini_model: str = "gemini-3.8-flash",
+    gemini_api_key: str | None = None,
+    transcript_path: str | Path | None = None,
     gemini_factory: type[GeminiJudge] = GeminiJudge,
     jev_factory: type[JevJudge] = JevJudge,
 ) -> Judge:
@@ -39,9 +42,14 @@ def create_judge(
     The order here is intentional and testable: a denied Jev choice never even
     creates a Jev adapter, so no OpenRouter-capable object exists on that path.
     """
-    backend = judge_backend_for(stem, requested, recordings_root=recordings_root)
+    backend = judge_backend_for(
+        stem,
+        requested,
+        recordings_root=recordings_root,
+        transcript_path=transcript_path,
+    )
     if backend == "gemini":
-        base: Judge = gemini_factory(model=gemini_model)
+        base: Judge = gemini_factory(api_key=gemini_api_key, model=gemini_model)
     else:
         # JevJudge independently repeats this gate before construction and
         # before each helper call; pass the recording identity through rather
@@ -71,6 +79,7 @@ def clip_for_stem(
     recordings_root: str | Path | None = None,
     cache_root: str | Path | None = None,
     gemini_model: str = "gemini-3.8-flash",
+    gemini_api_key: str | None = None,
     widen: bool = False,
     timestamps: bool = True,
 ) -> ClipResult:
@@ -81,6 +90,8 @@ def clip_for_stem(
         recordings_root=recordings_root,
         cache_root=cache_root,
         gemini_model=gemini_model,
+        gemini_api_key=gemini_api_key,
+        transcript_path=transcript.path,
     )
     return clip_for_transcript(transcript, topic, judge=judge, widen=widen, timestamps=timestamps)
 
@@ -93,6 +104,7 @@ def prompts_for_stem(
     recordings_root: str | Path | None = None,
     cache_root: str | Path | None = None,
     gemini_model: str = "gemini-3.8-flash",
+    gemini_api_key: str | None = None,
 ) -> list[PromptResult]:
     transcript = load_transcript(stem, transcripts_root)
     settings = load_recording_sidecar(stem, recordings_root)
@@ -102,13 +114,40 @@ def prompts_for_stem(
         recordings_root=recordings_root,
         cache_root=cache_root,
         gemini_model=gemini_model,
+        gemini_api_key=gemini_api_key,
+        transcript_path=transcript.path,
     )
     # A contract-covered Gemini call is only useful here when its exact model
-    # has a threshold selected by a passing calibration. Jev's historical
-    # internal-only path retains the explicit baseline threshold.
+    # has a threshold selected by a passing calibration. The explicitly gated
+    # Jev path retains the historical baseline threshold.
     threshold = (
         calibrated_prompt_threshold(judge.model)
         if judge.backend == "gemini"
         else PROMPT_THRESHOLD
     )
-    return prompts_from_marks(transcript.lines, settings.marks, judge=judge, prompt_threshold=threshold)
+    return prompts_from_marks(
+        transcript.lines,
+        settings.marks,
+        judge=judge,
+        prompt_threshold=threshold,
+        channel_lag_seconds=_channel_alignment_lag_seconds(transcript.payload),
+        mic_origin_delay_seconds=settings.mic_first_sample_offset_seconds,
+    )
+
+
+def _channel_alignment_lag_seconds(payload: dict[str, Any]) -> float | None:
+    """Read only the watcher's additive applied-alignment value."""
+    metadata = payload.get("_meta")
+    if not isinstance(metadata, dict):
+        return None
+    alignment = metadata.get("channel_alignment")
+    if not isinstance(alignment, dict):
+        return None
+    value = alignment.get("lag_seconds")
+    if isinstance(value, bool):
+        return None
+    try:
+        lag = float(value)
+    except (TypeError, ValueError):
+        return None
+    return lag if math.isfinite(lag) else None

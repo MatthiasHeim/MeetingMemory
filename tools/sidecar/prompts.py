@@ -17,6 +17,11 @@ from .judges import (
 from .questions import DICTATING_PROMPT_QUESTION, PROMPT_CONTENT_QUESTION
 from .transcript import TranscriptLine
 
+try:  # `sidecar` is also imported as a top-level package by headless tests.
+    from channel_align import MAX_LAG_SEC
+except ImportError:  # pragma: no cover - exercised by `python -m tools.sidecar`
+    from tools.channel_align import MAX_LAG_SEC
+
 
 PROMPT_THRESHOLD = 0.45
 PROMPT_CONTENT_THRESHOLD = 0.50
@@ -80,6 +85,7 @@ class PromptResult:
     lines: tuple[TranscriptLine, ...]
     source: str  # "mark" or "suggested"
     mark_seconds: float | None = None
+    mapping_uncertain: bool = False
 
     @property
     def text(self) -> str:
@@ -90,6 +96,34 @@ class PromptResult:
     @property
     def start_seconds(self) -> float:
         return self.lines[0].seconds
+
+    @property
+    def association_label(self) -> str | None:
+        """Human-facing warning for a marked card without a proven time map."""
+        return "Zuordnung unsicher" if self.source == "mark" and self.mapping_uncertain else None
+
+
+@dataclass(frozen=True)
+class MarkMapping:
+    """A mark's transcript anchor and whether its capture offsets are proven."""
+
+    transcript_seconds: float
+    lookback_seconds: float
+    uncertain: bool
+
+
+def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if nonnegative and number < 0:
+        return None
+    return number
 
 
 def mark_to_transcript_seconds(
@@ -102,12 +136,44 @@ def mark_to_transcript_seconds(
 
     ``channel_align`` defines positive lag as a mic track that is late and
     advances it by that amount. The corrected mic coordinate is therefore
-    ``mark - mic_origin_delay - lag``. The current recorder does not persist
-    either offset alongside final transcript JSON, so normal operation uses the
-    nominal zero-offset mapping and searches five seconds before the mark.
+    ``mark - mic_origin_delay - lag``.
     """
     value = float(mark_offset_seconds) - float(mic_origin_delay_seconds) - float(channel_lag_seconds)
     return max(0.0, value)
+
+
+def resolve_mark_mapping(
+    mark_seconds: float,
+    *,
+    channel_lag_seconds: float | None = None,
+    mic_origin_delay_seconds: float | None = None,
+) -> MarkMapping:
+    """Map a mark exactly when both persisted offset components are present.
+
+    Older recordings do not have one or both fields.  Rather than treating a
+    nominal timestamp as exact, they search back through the aligner's full
+    supported lag range and label the resulting marked card as uncertain.
+    """
+    mark = _finite_number(mark_seconds, nonnegative=True)
+    if mark is None:
+        raise ValueError("mark offset must be finite and non-negative")
+    lag = _finite_number(channel_lag_seconds)
+    mic_origin = _finite_number(mic_origin_delay_seconds, nonnegative=True)
+    if lag is not None and mic_origin is not None:
+        return MarkMapping(
+            transcript_seconds=mark_to_transcript_seconds(
+                mark,
+                channel_lag_seconds=lag,
+                mic_origin_delay_seconds=mic_origin,
+            ),
+            lookback_seconds=MARK_LOOKBACK_SECONDS,
+            uncertain=False,
+        )
+    return MarkMapping(
+        transcript_seconds=mark,
+        lookback_seconds=max(MARK_LOOKBACK_SECONDS, float(MAX_LAG_SEC)),
+        uncertain=True,
+    )
 
 
 def marked_window_indices(
@@ -116,15 +182,22 @@ def marked_window_indices(
     *,
     lookback_seconds: float = MARK_LOOKBACK_SECONDS,
     max_seconds: float = MARK_MAX_SECONDS,
+    channel_lag_seconds: float | None = None,
+    mic_origin_delay_seconds: float | None = None,
 ) -> tuple[int, ...]:
     """Return transcript positions in the bounded mark window.
 
-    The public mark is a monotonic elapsed offset. It maps nominally to the
-    final transcript's timeline; no hidden wall-clock conversion is attempted.
+    The public mark is a monotonic elapsed offset.  When capture and alignment
+    fields are available it maps exactly; otherwise the window intentionally
+    reaches back through ``channel_align.MAX_LAG_SEC``.
     """
-    anchor = mark_to_transcript_seconds(mark_seconds)
-    start = max(0.0, anchor - lookback_seconds)
-    end = anchor + max_seconds
+    mapping = resolve_mark_mapping(
+        mark_seconds,
+        channel_lag_seconds=channel_lag_seconds,
+        mic_origin_delay_seconds=mic_origin_delay_seconds,
+    )
+    start = max(0.0, mapping.transcript_seconds - max(lookback_seconds, mapping.lookback_seconds))
+    end = mapping.transcript_seconds + max_seconds
     return tuple(index for index, line in enumerate(lines) if start <= line.seconds <= end)
 
 
@@ -133,11 +206,10 @@ def _prompt_runs(
     lines: Sequence[TranscriptLine],
     *,
     threshold: float = PROMPT_THRESHOLD,
-) -> list[tuple[int, int]]:
-    """Merge consecutive prompt lines, allowing one low-confidence bridge."""
-    runs: list[tuple[int, int]] = []
-    start: int | None = None
-    last_positive: int | None = None
+) -> list[tuple[int, ...]]:
+    """Merge prompt lines while never returning a low-score bridge as content."""
+    runs: list[tuple[int, ...]] = []
+    positives: list[int] = []
     pending_low = False
     for index, probability in enumerate(probabilities):
         is_positive = probability >= threshold
@@ -145,50 +217,44 @@ def _prompt_runs(
             index > 0
             and 0 <= lines[index].seconds - lines[index - 1].seconds <= PROMPT_CONSECUTIVE_GAP_SECONDS
         )
-        if start is None:
+        if not positives:
             if is_positive:
-                start = index
-                last_positive = index
+                positives = [index]
                 pending_low = False
             continue
 
         if not is_consecutive:
             # A distant positive is a new dictated prompt, not a continuation.
-            assert last_positive is not None
-            runs.append((start, last_positive))
-            start = index if is_positive else None
-            last_positive = index if is_positive else None
+            runs.append(tuple(positives))
+            positives = [index] if is_positive else []
             pending_low = False
             continue
 
         if is_positive:
-            last_positive = index
+            positives.append(index)
             pending_low = False
         elif not pending_low:
             # A short acknowledgement can appear between dictation sentences.
             pending_low = True
         else:
             # A second low line ends the run before the first low bridge.
-            assert last_positive is not None
-            runs.append((start, last_positive))
-            start = None
-            last_positive = None
+            runs.append(tuple(positives))
+            positives = []
             pending_low = False
-    if start is not None:
-        assert last_positive is not None
-        runs.append((start, last_positive))
+    if positives:
+        runs.append(tuple(positives))
     return runs
 
 
 def _closest_run(
-    runs: Sequence[tuple[int, int]],
+    runs: Sequence[tuple[int, ...]],
     lines: Sequence[TranscriptLine],
     positions: set[int],
     mark_seconds: float,
 ) -> tuple[int, ...] | None:
     candidate_runs = []
-    for start, end in runs:
-        bounded_positions = tuple(position for position in range(start, end + 1) if position in positions)
+    for run in runs:
+        bounded_positions = tuple(position for position in run if position in positions)
         if bounded_positions:
             candidate_runs.append(bounded_positions)
     if not candidate_runs:
@@ -289,13 +355,17 @@ def prompts_from_marks(
     judge: Judge,
     context: int = 6,
     prompt_threshold: float = PROMPT_THRESHOLD,
+    channel_lag_seconds: float | None = None,
+    mic_origin_delay_seconds: float | None = None,
 ) -> list[PromptResult]:
     """Return marked prompt cards first, then unmarked suggested prompt cards.
 
-    A mark constrains candidate lines to ``mark - 5s`` through ``mark + 3min``.
+    A mark constrains candidate lines to its mapped ``mark - 5s`` through
+    ``mark + 3min`` window.  Without both mapping fields, it instead searches
+    back up to ``channel_align.MAX_LAG_SEC`` and marks the result uncertain.
     A line-level prompt judge decides where a prompt starts/ends; a separate
-    sentence-level judge strips only non-prompt lead-ins. Consecutive lines are
-    always returned together as one card.
+    sentence-level judge strips only non-prompt lead-ins.  A low-scored bridge
+    may connect a run but is never copied into its card.
     """
     if not lines:
         return []
@@ -314,10 +384,24 @@ def prompts_from_marks(
             mark = float(raw_mark)
         except (TypeError, ValueError):
             continue
-        if mark < 0:
+        if _finite_number(mark, nonnegative=True) is None:
             continue
-        positions = set(marked_window_indices(lines, mark))
-        run_positions = _closest_run(runs, lines, positions, mark)
+        mapping = resolve_mark_mapping(
+            mark,
+            channel_lag_seconds=channel_lag_seconds,
+            mic_origin_delay_seconds=mic_origin_delay_seconds,
+        )
+        positions = set(
+            marked_window_indices(
+                lines,
+                mark,
+                channel_lag_seconds=channel_lag_seconds,
+                mic_origin_delay_seconds=mic_origin_delay_seconds,
+            )
+        )
+        run_positions = _closest_run(
+            runs, lines, positions, mapping.transcript_seconds
+        )
         if run_positions is None:
             continue
         if any(position in marked_positions for position in run_positions):
@@ -330,10 +414,16 @@ def prompts_from_marks(
         marked_positions.update(run_positions)
         kept = _strip_leadin(lines, run_positions, judge, context=context)
         if kept:
-            results.append(PromptResult(kept, "mark", mark))
+            results.append(
+                PromptResult(
+                    kept,
+                    "mark",
+                    mark,
+                    mapping_uncertain=mapping.uncertain,
+                )
+            )
 
-    for start, end in runs:
-        positions = tuple(range(start, end + 1))
+    for positions in runs:
         if any(position in marked_positions for position in positions):
             continue
         kept = _strip_leadin(lines, positions, judge, context=context)

@@ -19,6 +19,7 @@ import sys
 import time
 import json
 import copy
+import math
 import queue
 import logging
 import argparse
@@ -385,6 +386,30 @@ def _fmt_mmss(seconds: float) -> str:
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _transcript_payload_with_channel_alignment(
+    payload: dict, lag_seconds: float | None
+) -> dict:
+    """Add only the applied alignment lag to final transcript metadata.
+
+    With no applied alignment, this returns the prior payload unchanged.  The
+    sidecar treats the absent field as an honest uncertain mark mapping.
+    """
+    if isinstance(lag_seconds, bool):
+        return payload
+    try:
+        lag = float(lag_seconds) if lag_seconds is not None else None
+    except (TypeError, ValueError):
+        return payload
+    if lag is None or not math.isfinite(lag):
+        return payload
+    amended = dict(payload)
+    metadata = payload.get("_meta")
+    amended_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    amended_metadata["channel_alignment"] = {"lag_seconds": round(lag, 3)}
+    amended["_meta"] = amended_metadata
+    return amended
 
 
 class _PermissiveValidation:
@@ -1344,8 +1369,12 @@ class TranscribeWatcher:
                              elapsed_seconds=time.time() - start_time)
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
+            output_payload = _transcript_payload_with_channel_alignment(
+                result.parsed_response,
+                getattr(self, "_applied_channel_alignment_lag_seconds", None),
+            )
             with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(result.parsed_response, f, indent=2, ensure_ascii=False)
+                json.dump(output_payload, f, indent=2, ensure_ascii=False)
             self.logger.info(f"Saved result to: {json_path.name}")
 
             # Step 5: Send webhook if configured (legacy path; disabled by default)
@@ -1937,6 +1966,7 @@ class TranscribeWatcher:
         Skipped for single-source recordings (no system channel to align to)
         and for anything that is not the 3-channel hybrid layout.
         """
+        self._applied_channel_alignment_lag_seconds = None
         if topology is not None and getattr(topology, "topology", None) == TOPOLOGY_SINGLE_SOURCE:
             return audio_file
         import tempfile  # module-level import is not available here
@@ -1970,6 +2000,7 @@ class TranscribeWatcher:
                 audio_file, offset.lag_seconds,
                 output_path=aligned_dir / audio_file.name,
             )
+            self._applied_channel_alignment_lag_seconds = float(offset.lag_seconds)
             self.logger.info(f"Aligned copy: {aligned}")
             return aligned
         except Exception as e:
