@@ -2,14 +2,18 @@
 
 Status on 2026-09-26: Slice 1 has the finished-transcript clerk plus its
 recorder menu-bar entry points. `gemini-3.8-flash` is the only Gemini judge.
-The recorder changes are menu/UI and local sidecar metadata only: capture,
-WAV writing, the watcher, and transcription are unchanged.
+The recorder always starts capture before optional sidecar/calendar work. The
+watcher change is one additive final-JSON metadata field for an alignment lag;
+WAV capture, transcription decisions, and all other output stay unchanged.
 
 ## Use
 
 The CLI reads a completed recorder JSON from
 `~/Documents/MeetingRecorder/Transcripts/<stem>.json`; it never edits that
-file. Set the recorder's existing `GEMINI_API_KEY` in the invoking environment.
+file. The menu-bar app loads the repository `.env` exactly like
+`transcribe_watcher.py` and reads the configured `gemini.api_key_env` (default
+`GEMINI_API_KEY`) without logging it. Direct CLI use still needs that key in
+its invoking environment.
 
 ```bash
 python -m tools.sidecar clip \
@@ -27,19 +31,25 @@ one-step lower pair `0.50` / `0.15`.
 
 The rumps menu bar app adds these actions:
 
-- **Start Recording** asks **“Jev verwenden?”** with its checkbox off by
-  default. The current event is resolved through the existing calendar resolver
-  before recording begins. A uniquely resolved external event displays
-  **“nicht durch Kunden-DPA gedeckt”** and leaves Jev disabled. An ambiguous or
-  failed lookup is also fail-closed: its local sidecar records
-  `external_attendees: true` and Jev is disabled.
+- **Start Recording** starts capture immediately with a fail-closed local
+  sidecar (`jev: false`, `external_attendees: null`). Calendar resolution then
+  runs on a background worker with a three-second timeout; it never delays mic
+  or system capture. The later **“Jev verwenden?”** checkbox is off by default.
+  It remains switchable for external **and unresolved** meetings, but displays
+  **“nicht durch Kunden-DPA gedeckt”**. If Matthias enables it in either case,
+  the amended sidecar records `jev: true` and
+  `jev_external_acknowledged: true`. A timeout stays `external_attendees: null`
+  and receives the same warning. A sidecar write failure is logged/notified,
+  forces Jev off, and never stops recording.
 - **Prompt markieren** is enabled while recording and appends a monotonic
   elapsed offset to `Recordings/<stem>.sidecar.json`. The global shortcut is
   **Ctrl–Option–Command–P** (`⌃⌥⌘P`). It uses AppKit global and local key-event
   monitors; macOS requires Accessibility permission for global key monitoring.
   Grant it to the interpreter/app running MeetingRecorder under **System
   Settings → Privacy & Security → Accessibility**. The menu item still works
-  without that permission.
+  without that permission. After the first mic callback, a background writer
+  also persists `mic_first_sample_offset_seconds` relative to this mark-zero
+  boundary; the callback itself performs no file I/O.
 - **Clip…** offers the newest ten valid finished transcripts (metadata/calendar
   title when available, otherwise the stem), asks for a topic, then evaluates
   and copies the clip on a background thread. Its completion notification gives
@@ -51,20 +61,39 @@ The score cache is local-only at `~/.local/share/meeting-sidecar/cache/`. Its
 entries contain probability vectors and hashes, never transcript text. The
 calibration corpus and aggregate report remain under
 `~/.local/share/meeting-sidecar/` and are never copied into this repository.
+Each Jev use also appends a text-free audit record (`stem`, attendee state,
+external acknowledgement, UTC timestamp, and request count) to
+`~/.local/share/meeting-sidecar/jev-audit.jsonl`.
 
 ## Provider gate
 
-Gemini is the default. `--judge jev` is rejected unless the exact recording has
-`Recordings/<stem>.sidecar.json` containing both `"jev": true` and an explicit
-boolean `"external_attendees": false`. Missing, malformed, opt-out, unresolved,
-or external sidecars fail closed to Gemini. The factory decides before
-constructing `JevJudge`, and `JevJudge` checks again at direct construction and
-immediately before its helper request, so a denied path cannot create or use an
-OpenRouter-capable client.
+Gemini is the default. `--judge jev` is accepted only when the exact recording
+has a regular, non-symlinked `Recordings/<stem>.sidecar.json` whose
+`recording_stem` matches the transcript stem, and it records:
 
-The menu writes `jev`, `external_attendees`, `marks`, and small calendar
-metadata to the local sidecar before capture starts. The strict offline gate is
-unchanged: a checkbox is never legal authority for client material.
+```
+jev is true AND (
+  external_attendees is explicitly false OR
+  jev_external_acknowledged is explicitly true
+)
+```
+
+`external_attendees` is tri-state: `false` means a uniquely matched timed event
+with an explicit roster and verified `matthias@lailix.com` self identity; `true`
+means a verified other attendee; `null` means unknown. An empty roster, a
+resolver-synthesised self row, an all-day/no timed match, a malformed roster,
+or a display-name-only self match is unknown and receives the external warning.
+Missing, malformed, opt-out, or unacknowledged external/unknown sidecars fail
+closed to Gemini. The CLI rejects Jev if its recordings root comes from
+`MEETING_SIDECAR_RECORDINGS_DIR`.
+
+The factory decides before constructing `JevJudge`, and `JevJudge` checks again
+at direct construction and immediately before each helper request. The helper
+is always invoked with its internal/approved contract flags; the local audit
+record preserves the actual attendee/acknowledgement facts. Gemini construction
+explicitly pins `https://generativelanguage.googleapis.com/`, so inherited
+`GOOGLE_GEMINI_BASE_URL` and SDK endpoint overrides cannot redirect transcript
+text to another provider.
 
 ## Gemini calibration and owner override
 
@@ -87,7 +116,10 @@ hysteresis **0.60 / 0.25**. There is no Flash/Lite routing.
 `~/.local/share/meeting-sidecar/calibration/latest.json` records this as
 `status: "owner_approved_override"` with the date, model, thresholds, and B
 range. `prompts` accepts that exact dated override; a missing or altered
-override does not activate prompt extraction. To amend an existing
+override does not activate prompt extraction. The waiver applies only to B:
+English relevance A must still pass, and C prompt recall/false-positive checks
+must still pass at the approved `0.90` threshold. A failed A or C remains a
+failed calibration with prompts disabled. To amend an existing
 aggregate-only report without a provider call:
 
 ```bash
@@ -112,14 +144,25 @@ defined in spec §11 before tightening or generalising these thresholds.
 
 The sidecar format stores numeric `marks` as seconds since the app's monotonic
 recording-start boundary, captured immediately before `AudioRecorder.start()`.
-Prompt extraction nominally maps a mark `m` to transcript time `m`, searches
-from `m - 5 s`, and stops at `m + 3 min` or the line-level prompt end. A
-sentence-level yes/no judge strips only a leading non-prompt prefix; it never
-rewrites prompt text.
+It later stores `mic_first_sample_offset_seconds`: the monotonic instant of the
+first mic sample relative to that same mark-zero boundary. When the watcher
+actually aligns channels, it adds
+`_meta.channel_alignment.lag_seconds` to the final transcript JSON. Prompt
+extraction applies both through:
+
+```
+max(0, mark - mic_first_sample_offset_seconds - channel_alignment.lag_seconds)
+```
+
+It then searches five seconds before that mapped point and stops at `m + 3 min`
+or the line-level prompt end. A sentence-level yes/no judge strips only a
+leading non-prompt prefix; it never rewrites prompt text.
 
 Prompt lines merge only when consecutive transcript timestamps are at most
-12 seconds apart. A marked card is bounded to the exact `m - 5 s` through
-`m + 3 min` window, even when a detected prompt run is longer.
+12 seconds apart. A marked card is bounded to the exact mapped `m - 5 s`
+through `m + 3 min` window, even when a detected prompt run is longer. A
+low-scored bridging acknowledgement may connect a detected run but is never
+copied into the prompt card.
 
 This nominal map is not an exact shared-clock map in the current recorder:
 
@@ -131,30 +174,40 @@ This nominal map is not an exact shared-clock map in the current recorder:
   positive lag means the mic was late and is advanced, while system zero stays
   unchanged.
 
-If those offsets were persisted, a mic-derived timestamp would be
-`max(0, m - mic_origin_delay - channel_lag)`. They are not persisted today, so
-the menu uses the documented nominal map plus its five-second look-back
-tolerance.
+When either persisted value is missing, the mapper searches backward through
+`channel_align.MAX_LAG_SEC` (currently 60 seconds) rather than pretending the
+nominal mark is exact. Any resulting marked card is labelled
+**“Zuordnung unsicher”** in the menu and CLI. This is intentionally conservative
+for historical recordings and for runs where no correctable alignment was
+applied.
 
 ## Headless verification and attended checklist
 
-The automated suite covers the strict Jev gate, monotonic mark offsets, and a
-scripted concurrent mark-plus-clip run without opening an audio device; the
-test proves all marks survive while a fake recording remains active. The
-AppKit dialogs and global hotkey need an attended macOS session. Before merge:
+The automated suite covers the tri-state/acknowledged Jev gate, endpoint pin,
+regular-sidecar authority, text-free Jev audit, capture-first sidecar failure,
+monotonic mark offsets, alignment mapping, and a scripted concurrent
+mark-plus-clip run without opening an audio device. The AppKit dialogs and
+global hotkey need an attended macOS session. Before merge:
 
 1. Start an internal calendar event, leave Jev off, mark once from the menu and
-   once with `⌃⌥⌘P`, then confirm both numeric marks in its local sidecar.
-2. Start an external event and confirm the DPA note appears and Jev cannot be
-   selected.
-3. With a prior completed transcript, run **Clip…** during a short recording;
+   once with `⌃⌥⌘P`, then confirm both numeric marks and the first-mic offset in
+   its local sidecar.
+2. Start an external event and an unresolved/no-attendee event. Confirm capture
+   starts immediately, **“nicht durch Kunden-DPA gedeckt”** appears in each
+   later dialog, the checkbox is switchable but off by default, and enabling it
+   writes `jev_external_acknowledged: true` alongside `jev: true`.
+3. Temporarily make the sidecar directory unwritable; confirm recording still
+   starts, a failure notification appears, and Jev remains off.
+4. With a prior completed transcript, run **Clip…** during a short recording;
    confirm the clip notification shows a line count and the WAV duration still
    matches wall clock.
-4. Run **Prompts…** and confirm a marked or suggested prompt can be selected
-   and copied.
+5. Run **Prompts…** on one aligned recording and one historical/mapping-missing
+   recording; confirm the latter card displays **“Zuordnung unsicher”**.
 
 ## Known offline limitation
 
 The loader judges only complete `[mm:ss] Speaker: text` turns. It deliberately
 does not invent timestamps or speakers for malformed/untimestamped continuation
-text, so such text is not sent to a judge.
+text, so such text is not sent to a judge; nonblank skipped lines are retained
+only in local debug logs. Historic transcripts lacking either mapping datum are
+still usable, but their marked prompt cards are explicitly uncertain.
