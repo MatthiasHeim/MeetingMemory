@@ -69,8 +69,42 @@ def test_hysteresis_grows_bridges_requires_two_seeds_and_removes_pure_fillers():
 
     assert clip.text.startswith(CLIP_HEADER + "\n\n")
     assert "mhm" not in clip.text
-    assert "[…]" in clip.text
+    assert "[…]" not in clip.text
     assert "one isolated mention" not in clip.text
+
+
+def test_clip_omits_filler_inside_a_kept_stretch_without_a_gap_marker():
+    """A copied clip must not claim omitted substance where only filler was removed."""
+    lines = [
+        _line(0, "Synthetic roles overview."),
+        _line(1, "Yeah."),
+        _line(2, "Okay."),
+        _line(3, "Synthetic permissions detail."),
+    ]
+
+    clip = select_clip(lines, [0.9, 0.3, 0.3, 0.9])
+
+    assert clip.indices == (0, 3)
+    assert "Yeah." not in clip.text and "Okay." not in clip.text
+    assert "[…]" not in clip.text
+
+
+def test_clip_marks_a_gap_between_clusters_separated_by_omitted_substance():
+    lines = [
+        _line(0, "Synthetic roles overview."),
+        _line(1, "Yeah."),
+        _line(2, "Synthetic permissions detail."),
+        _line(3, "Synthetic unrelated discussion."),
+        _line(4, "Synthetic unrelated continuation."),
+        _line(5, "Synthetic unrelated conclusion."),
+        _line(6, "Synthetic access control detail."),
+        _line(7, "Synthetic access control decision."),
+    ]
+
+    clip = select_clip(lines, [0.9, 0.3, 0.9, 0.01, 0.01, 0.01, 0.9, 0.9])
+
+    assert clip.indices == (0, 2, 6, 7)
+    assert clip.text.count("[…]") == 1
 
 
 def test_widen_uses_the_explicit_lower_threshold_pair():

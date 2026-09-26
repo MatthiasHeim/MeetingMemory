@@ -24,8 +24,10 @@ python -m tools.sidecar clip \
 python -m tools.sidecar prompts --stem 2026-09-08_14-31-16
 ```
 
-`clip` produces the fixed header plus verbatim transcript lines. Its approved
-default hysteresis is seed `0.60`, grow `0.25`, bridge at most two lines,
+`clip` produces the fixed header plus verbatim transcript lines. Gap markers
+appear only where substantive lines between selected clusters were excluded;
+omitted acknowledgements inside a kept stretch do not create a marker. Its
+approved default hysteresis is seed `0.60`, grow `0.25`, bridge at most two lines,
 require two seeds, and remove pure fillers. `--widen` deliberately uses the
 one-step lower pair `0.50` / `0.15`.
 
@@ -94,6 +96,11 @@ record preserves the actual attendee/acknowledgement facts. Gemini construction
 explicitly pins `https://generativelanguage.googleapis.com/`, so inherited
 `GOOGLE_GEMINI_BASE_URL` and SDK endpoint overrides cannot redirect transcript
 text to another provider.
+
+Gemini clip and prompt scoring keeps the same 20-line request contract, retry
+behaviour, and score-only cache, while sending independent batches through a
+bounded pool of up to eight workers. Results are placed back in transcript-line
+order before deterministic selection or prompt assembly.
 
 ## Gemini calibration and owner override
 

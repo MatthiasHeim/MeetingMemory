@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -32,6 +34,7 @@ Questions = Mapping[str, QuestionInput]
 # score interpretation changes. It is part of each question cache key.
 JUDGE_PROMPT_VERSION = "sidecar-judge-v3-2026-09-26"
 GEMINI_BATCH_SIZE = 20
+GEMINI_MAX_BATCH_WORKERS = 8
 APPROVED_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/"
 
 
@@ -370,20 +373,25 @@ class GeminiJudge:
         client: Any | None = None,
         types_module: Any | None = None,
         batch_size: int = GEMINI_BATCH_SIZE,
+        max_batch_workers: int = GEMINI_MAX_BATCH_WORKERS,
         timeout_seconds: float = 45,
         retry_attempts: int = 2,
     ):
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if max_batch_workers < 1:
+            raise ValueError("max_batch_workers must be positive")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if retry_attempts < 1:
             raise ValueError("retry_attempts must be positive")
         self.model = model
         self.batch_size = batch_size
+        self.max_batch_workers = max_batch_workers
         self.timeout_seconds = timeout_seconds
         self.retry_attempts = retry_attempts
         self.metrics = GeminiMetrics()
+        self._metrics_lock = threading.Lock()
         if client is not None:
             self.client = client
             self.types = types_module
@@ -453,20 +461,22 @@ class GeminiJudge:
         except Exception as exc:
             raise JudgeError(f"Gemini judge request failed: {type(exc).__name__}") from exc
         finally:
-            self.metrics.requests += 1
-            self.metrics.latencies_seconds.append(time.monotonic() - started)
+            with self._metrics_lock:
+                self.metrics.requests += 1
+                self.metrics.latencies_seconds.append(time.monotonic() - started)
         usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
         if usage is not None:
-            self.metrics.input_tokens += int(
-                getattr(usage, "prompt_token_count", None)
-                or getattr(usage, "promptTokenCount", None)
-                or 0
-            )
-            self.metrics.output_tokens += int(
-                getattr(usage, "candidates_token_count", None)
-                or getattr(usage, "candidatesTokenCount", None)
-                or 0
-            )
+            with self._metrics_lock:
+                self.metrics.input_tokens += int(
+                    getattr(usage, "prompt_token_count", None)
+                    or getattr(usage, "promptTokenCount", None)
+                    or 0
+                )
+                self.metrics.output_tokens += int(
+                    getattr(usage, "candidates_token_count", None)
+                    or getattr(usage, "candidatesTokenCount", None)
+                    or 0
+                )
         return response
 
     def judge(
@@ -483,6 +493,7 @@ class GeminiJudge:
         if len(positions) != len(lines):
             raise JudgeError("line indexes must be unique")
         result = {question_id: [0.0] * len(lines) for question_id in normalised}
+        batches: list[tuple[set[int], str]] = []
         for batch_start in range(0, len(lines), self.batch_size):
             batch = lines[batch_start : batch_start + self.batch_size]
             items: list[dict[str, Any]] = []
@@ -498,11 +509,20 @@ class GeminiJudge:
                 items.append(
                     {"previous_lines": [_line_payload(item) for item in previous], "current_line": _line_payload(line)}
                 )
-            response = _load_json_response(self._generate(_batch_prompt(items, normalised), _response_schema(list(normalised))))
+            batches.append((expected_indexes, _batch_prompt(items, normalised)))
+
+        if not batches:
+            return result
+
+        def score_batch(expected_indexes: set[int], prompt: str) -> dict[int, Mapping[str, Any]]:
+            response = _load_json_response(
+                self._generate(prompt, _response_schema(list(normalised)))
+            )
             rows = response.get("results")
             if not isinstance(rows, list):
                 raise JudgeError("Gemini judge JSON has no results array")
             seen: set[int] = set()
+            scores: dict[int, Mapping[str, Any]] = {}
             for row in rows:
                 if not isinstance(row, Mapping):
                     continue
@@ -513,13 +533,26 @@ class GeminiJudge:
                 probabilities = row.get("probabilities")
                 if line_index not in expected_indexes or line_index in seen or not isinstance(probabilities, Mapping):
                     continue
-                for question_id in normalised:
-                    result[question_id][positions[line_index]] = _bounded_probability(
-                        probabilities.get(question_id), question_id=question_id
-                    )
                 seen.add(line_index)
+                scores[line_index] = probabilities
             if seen != expected_indexes:
                 raise JudgeError("Gemini judge response did not score every requested line exactly once")
+            return scores
+
+        # Each request has complete per-line context embedded in its prompt, so
+        # batches are independent. Preserve deterministic output placement by
+        # consuming their futures in source-batch order after bounded parallel
+        # execution. Cache lookup/write remains outside this provider layer.
+        with ThreadPoolExecutor(
+            max_workers=min(self.max_batch_workers, len(batches))
+        ) as pool:
+            futures = [pool.submit(score_batch, expected, prompt) for expected, prompt in batches]
+            for future in futures:
+                for line_index, probabilities in future.result().items():
+                    for question_id in normalised:
+                        result[question_id][positions[line_index]] = _bounded_probability(
+                            probabilities.get(question_id), question_id=question_id
+                        )
         return result
 
 

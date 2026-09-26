@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -202,6 +204,66 @@ def test_gemini_judge_batches_twenty_lines_with_schema_and_context():
     assert requested[0][2]["response_schema"]["properties"]["results"]["items"]["properties"]["probabilities"]
     assert '"previous_lines"' in requested[0][1]
     assert 'Synthetic line 0' in requested[0][1]
+
+
+def test_gemini_judge_runs_batches_concurrently_and_orders_scores():
+    """Independent batches may complete out of order without reordering lines."""
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    class Models:
+        def generate_content(self, *, model, contents, config):
+            nonlocal active, peak_active
+            indexes = [int(value) for value in __import__("re").findall(r'"line_index":(\d+)', contents)]
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                if peak_active >= 2:
+                    started.set()
+            assert release.wait(timeout=2)
+            # Deliberately make the first batch slower after release.
+            if indexes[0] == 0:
+                time.sleep(0.03)
+            with lock:
+                active -= 1
+            return SimpleNamespace(
+                text=json.dumps(
+                    {"results": [
+                        {"line_index": index, "probabilities": {"relevant": index / 100}}
+                        for index in indexes
+                    ]}
+                )
+            )
+
+    client = SimpleNamespace(
+        models=Models(),
+        _api_client=SimpleNamespace(
+            _http_options=SimpleNamespace(base_url="https://generativelanguage.googleapis.com/")
+        ),
+    )
+    judge = GeminiJudge(
+        client=client,
+        types_module=None,
+        model="synthetic",
+        batch_size=2,
+        max_batch_workers=2,
+    )
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(judge.judge(_lines(4), {"relevant": "Synthetic question"})),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=1)
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert peak_active == 2
+    assert result == [{"relevant": [0.0, 0.01, 0.02, 0.03]}]
 
 
 def test_cached_judge_cache_contains_scores_and_hashes_not_transcript_text(tmp_path):
