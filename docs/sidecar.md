@@ -28,8 +28,11 @@ python -m tools.sidecar prompts --stem 2026-09-08_14-31-16
 appear only where substantive lines between selected clusters were excluded;
 omitted acknowledgements inside a kept stretch do not create a marker. Its
 approved default hysteresis is seed `0.60`, grow `0.25`, bridge at most two lines,
-require two seeds, and remove pure fillers. `--widen` deliberately uses the
-one-step lower pair `0.50` / `0.15`.
+require two seeds, and remove pure fillers. An isolated non-filler seed at
+`0.90` or above is retained for sparse topics. `--widen` deliberately uses the
+one-step lower pair `0.50` / `0.15`. If no line qualifies, `clip` prints
+**“Nichts Passendes gefunden.”** followed by the three highest-scored verbatim
+candidate lines and their scores, rather than returning only its header.
 
 The rumps menu bar app adds these actions:
 
@@ -162,8 +165,11 @@ max(0, mark - mic_first_sample_offset_seconds - channel_alignment.lag_seconds)
 ```
 
 It then searches five seconds before that mapped point and stops at `m + 3 min`
-or the line-level prompt end. A sentence-level yes/no judge strips only a
-leading non-prompt prefix; it never rewrites prompt text.
+or the line-level prompt end. A sentence-level yes/no judge strips leading and
+trailing non-prompt sentences; it never rewrites prompt text. A high-confidence
+(`>= 0.90`) line-level prompt decision remains verbatim in a card if the
+sentence pass has a recall miss, so calibrated prompt-scored lines remain
+available for copying.
 
 Prompt lines merge only when consecutive transcript timestamps are at most
 12 seconds apart. A marked card is bounded to the exact mapped `m - 5 s`
@@ -218,3 +224,9 @@ does not invent timestamps or speakers for malformed/untimestamped continuation
 text, so such text is not sent to a judge; nonblank skipped lines are retained
 only in local debug logs. Historic transcripts lacking either mapping datum are
 still usable, but their marked prompt cards are explicitly uncertain.
+
+## Known prompt recall limitation
+
+The line at `01:28:16` in the July 8 recording that asks for a status-line
+prompt scored `0.15` for `dictating_prompt`. This is a Gemini judge recall miss;
+it is documented here only and does not change the calibrated threshold.

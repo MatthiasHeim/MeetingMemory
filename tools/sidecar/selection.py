@@ -14,6 +14,11 @@ DEFAULT_SEED_THRESHOLD = 0.60
 DEFAULT_GROW_THRESHOLD = 0.25
 WIDE_SEED_THRESHOLD = 0.50
 WIDE_GROW_THRESHOLD = 0.15
+# Gemini's relevance scores are normally guarded by two independent seeds.
+# A non-filler line at this level is strong enough evidence on its own; this
+# retains sparse, otherwise isolated topic answers without admitting ordinary
+# one-line mentions at the regular seed threshold.
+SINGLETON_CONFIDENT_SEED_THRESHOLD = 0.90
 
 # Short acknowledgements carry no stand-alone meeting substance. This list is
 # intentionally conservative; it does not strip words from a substantive line.
@@ -35,10 +40,16 @@ class ClipResult:
     seed_threshold: float
     grow_threshold: float
     widened: bool
+    candidate_lines: tuple[TranscriptLine, ...] = ()
 
     @property
     def line_count(self) -> int:
         return len(self.lines)
+
+    @property
+    def has_fallback(self) -> bool:
+        """Whether rendering contains candidate guidance instead of a clip."""
+        return not self.lines
 
 
 def is_filler(line: TranscriptLine) -> bool:
@@ -101,8 +112,10 @@ def _selected_mask(
         if left is not None and right is not None and right - left <= bridge + 1:
             keep[index] = True
 
-    # A cluster must contain at least two high-confidence seeds. Do this after
+    # A cluster normally needs two high-confidence seeds. Do this after
     # bridging so a bridge cannot turn two weak islands into a false clip.
+    # A single non-filler seed at the separately conservative confidence level
+    # is an exception for sparse topics whose relevant turns are isolated.
     index = 0
     while index < len(keep):
         if not keep[index]:
@@ -111,10 +124,19 @@ def _selected_mask(
         end = index
         while end < len(keep) and keep[end]:
             end += 1
-        if sum(
-            values[candidate] >= seed_threshold and not is_filler(lines[candidate])
+        seed_positions = [
+            candidate
             for candidate in range(index, end)
-        ) < min_seeds:
+            if values[candidate] >= seed_threshold and not is_filler(lines[candidate])
+        ]
+        singleton_is_confident = (
+            len(seed_positions) == 1
+            and values[seed_positions[0]] >= SINGLETON_CONFIDENT_SEED_THRESHOLD
+            # A high-scored acknowledgement may grow beside a real line, but
+            # it must not help that lone seed bypass the two-seed safeguard.
+            and not any(is_filler(lines[candidate]) for candidate in range(index, end))
+        )
+        if len(seed_positions) < min_seeds and not singleton_is_confident:
             for candidate in range(index, end):
                 keep[candidate] = False
         index = end
@@ -174,6 +196,24 @@ def _format_indices(
     return "\n".join(output)
 
 
+def _format_no_match(
+    lines: Sequence[TranscriptLine], probabilities: Sequence[float], *, timestamps: bool
+) -> tuple[str, tuple[TranscriptLine, ...]]:
+    """Render useful, local-only candidate guidance instead of a blank clip."""
+    ranked = sorted(
+        range(len(lines)), key=lambda index: (-float(probabilities[index]), index)
+    )[:3]
+    candidates = tuple(lines[index] for index in ranked)
+    output = [CLIP_HEADER, "", "Nichts Passendes gefunden."]
+    if candidates:
+        output.append("Top-Kandidaten:")
+        output.extend(
+            f"{line.display(timestamps=timestamps)} (Score: {float(probabilities[index]):.2f})"
+            for index, line in zip(ranked, candidates)
+        )
+    return "\n".join(output), candidates
+
+
 def select_clip(
     lines: Sequence[TranscriptLine],
     probabilities: Sequence[float],
@@ -187,11 +227,16 @@ def select_clip(
     keep = _selected_mask(probabilities, lines, seed_threshold=seed, grow_threshold=grow)
     indices = tuple(index for index, included in enumerate(keep) if included and not is_filler(lines[index]))
     selected = tuple(lines[index] for index in indices)
+    if not selected:
+        text, candidates = _format_no_match(lines, probabilities, timestamps=timestamps)
+    else:
+        text, candidates = _format_indices(lines, indices, timestamps=timestamps, selected_mask=keep), ()
     return ClipResult(
-        text=_format_indices(lines, indices, timestamps=timestamps, selected_mask=keep),
+        text=text,
         lines=selected,
         indices=indices,
         seed_threshold=seed,
         grow_threshold=grow,
         widened=widen,
+        candidate_lines=candidates,
     )

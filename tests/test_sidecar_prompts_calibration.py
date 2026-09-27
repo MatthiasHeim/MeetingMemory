@@ -139,6 +139,54 @@ def test_leadin_filter_keeps_a_low_scored_interior_prompt_sentence_verbatim():
     assert results[0].text == "Write a deployment plan.\nIt must preserve all data.\nReturn the risks."
 
 
+def test_prompt_sentence_filter_removes_trailing_chatter_verbatim():
+    class _TrailingJudge:
+        backend = "fake"
+        model = "fake"
+
+        def judge(self, lines, questions, *, context=6):
+            question = next(iter(questions))
+            if question == "dictating_prompt":
+                return {question: [0.95]}
+            if question == "prompt_content":
+                return {question: [0.95, 0.1, 0.1]}
+            raise AssertionError(question)
+
+    lines = [_line(0, 10, "Write a synthetic deployment plan. Is that what you want? Waiting now.")]
+    results = prompts_from_marks(lines, [], judge=_TrailingJudge())
+
+    assert results[0].text == "Write a synthetic deployment plan."
+
+
+def test_every_line_level_prompt_survives_a_sentence_judge_recall_miss():
+    class _RecallJudge:
+        backend = "fake"
+        model = "fake"
+
+        def judge(self, lines, questions, *, context=6):
+            question = next(iter(questions))
+            if question == "dictating_prompt":
+                return {question: [0.95, 0.01, 0.95]}
+            if question == "prompt_content":
+                # The second isolated positive is a sentence-level false
+                # negative. Its line-level prompt evidence must still produce
+                # a card, without inventing or rewriting text.
+                return {question: [0.95] if len(lines) == 1 and lines[0].seconds == 10 else [0.01]}
+            raise AssertionError(question)
+
+    lines = [
+        _line(0, 10, "First synthetic dictated prompt."),
+        _line(1, 20, "Synthetic ordinary discussion."),
+        _line(2, 90, "Second synthetic dictated prompt."),
+    ]
+    results = prompts_from_marks(lines, [], judge=_RecallJudge())
+
+    assert [(result.start_seconds, result.text) for result in results] == [
+        (10, "First synthetic dictated prompt."),
+        (90, "Second synthetic dictated prompt."),
+    ]
+
+
 def test_mark_suppresses_only_its_selected_run_not_a_nearby_suggested_prompt():
     class _MarkJudge:
         backend = "fake"

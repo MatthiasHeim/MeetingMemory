@@ -927,6 +927,13 @@ class MeetingRecorderApp(rumps.App):
                     message=str(exc),
                 )
                 return
+            if clip.has_fallback:
+                self._copy_to_clipboard(clip.text)
+                self._notify_from_worker(
+                    subtitle="Clip…",
+                    message="Nichts Passendes gefunden; Top-Kandidaten wurden kopiert.",
+                )
+                return
             self._notify_from_worker(
                 subtitle="Clip kopiert",
                 message=f"{clip.line_count} Zeilen in die Zwischenablage kopiert.",

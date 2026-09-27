@@ -117,3 +117,31 @@ def test_widen_uses_the_explicit_lower_threshold_pair():
     assert default.line_count == 0
     assert wide.indices == (0, 1, 2)
     assert (wide.seed_threshold, wide.grow_threshold) == (0.50, 0.15)
+
+
+def test_confident_isolated_substantive_seeds_are_kept_for_sparse_topics():
+    lines = [
+        _line(0, "Synthetic unrelated discussion."),
+        _line(1, "Synthetic access permission decision."),
+        _line(2, "Synthetic unrelated wrap-up."),
+        _line(3, "Synthetic unrelated implementation chatter."),
+        _line(4, "Synthetic unrelated conclusion."),
+        _line(5, "Synthetic repository access detail."),
+    ]
+
+    clip = select_clip(lines, [0.05, 0.98, 0.05, 0.05, 0.05, 0.95])
+
+    assert clip.indices == (1, 5)
+    assert clip.line_count == 2
+
+
+def test_empty_clip_lists_top_three_scored_candidates_instead_of_only_header():
+    lines = [_line(index, f"Synthetic candidate {index}.") for index in range(4)]
+
+    clip = select_clip(lines, [0.20, 0.40, 0.30, 0.10])
+
+    assert clip.line_count == 0
+    assert clip.has_fallback
+    assert [line.index for line in clip.candidate_lines] == [1, 2, 0]
+    assert "Nichts Passendes gefunden." in clip.text
+    assert "Score: 0.40" in clip.text

@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover - exercised by `python -m tools.sidecar`
 
 PROMPT_THRESHOLD = 0.45
 PROMPT_CONTENT_THRESHOLD = 0.50
+LINE_PROMPT_FALLBACK_THRESHOLD = 0.90
 MARK_LOOKBACK_SECONDS = 5.0
 MARK_MAX_SECONDS = 3 * 60.0
 PROMPT_CONSECUTIVE_GAP_SECONDS = 12.0
@@ -271,6 +272,7 @@ def _strip_leadin(
     judge: Judge,
     *,
     context: int,
+    line_probabilities: Sequence[float],
 ) -> tuple[TranscriptLine, ...]:
     if not positions:
         return ()
@@ -287,15 +289,31 @@ def _strip_leadin(
         {"prompt_content": PROMPT_CONTENT_QUESTION},
         context=context,
     )["prompt_content"]
-    # This is lead-in stripping, not free-form sentence filtering. Once the
-    # first prompt sentence is reached, retain every remaining verbatim
-    # sentence—including a low-scored interior constraint—rather than silently
-    # changing the meaning of a copied prompt.
-    first_prompt = next(
-        (index for index, score in enumerate(scores) if score >= PROMPT_CONTENT_THRESHOLD),
-        None,
-    )
-    return () if first_prompt is None else tuple(sentence_lines[first_prompt:])
+    # Retain the verbatim interval from the first through the last accepted
+    # sentence of *each* line. This removes both surrounding lead-ins and
+    # trailing meeting chatter, while preserving a low-scored interior
+    # constraint. A highly confident line-level prompt decision is never
+    # silently lost merely because its separate sentence pass disagrees: keep
+    # that original, verbatim line as a conservative fallback.
+    kept: list[TranscriptLine] = []
+    cursor = 0
+    for position in positions:
+        source = lines[position]
+        count = len(_verbatim_sentences(source.text))
+        line_sentences = sentence_lines[cursor:cursor + count]
+        line_scores = scores[cursor:cursor + count]
+        cursor += count
+        accepted = [
+            index for index, score in enumerate(line_scores)
+            if score >= PROMPT_CONTENT_THRESHOLD
+        ]
+        if not accepted and line_probabilities[position] >= LINE_PROMPT_FALLBACK_THRESHOLD:
+            kept.append(source)
+            continue
+        if not accepted:
+            continue
+        kept.extend(line_sentences[accepted[0]:accepted[-1] + 1])
+    return tuple(kept)
 
 
 def _verbatim_sentence_lines(
@@ -412,7 +430,13 @@ def prompts_from_marks(
         # [mark - 5s, mark + 3min] window. A different candidate merely near a
         # mark remains an honest suggested prompt.
         marked_positions.update(run_positions)
-        kept = _strip_leadin(lines, run_positions, judge, context=context)
+        kept = _strip_leadin(
+            lines,
+            run_positions,
+            judge,
+            context=context,
+            line_probabilities=prompt_scores,
+        )
         if kept:
             results.append(
                 PromptResult(
@@ -426,7 +450,13 @@ def prompts_from_marks(
     for positions in runs:
         if any(position in marked_positions for position in positions):
             continue
-        kept = _strip_leadin(lines, positions, judge, context=context)
+        kept = _strip_leadin(
+            lines,
+            positions,
+            judge,
+            context=context,
+            line_probabilities=prompt_scores,
+        )
         if kept:
             results.append(PromptResult(kept, "suggested", None))
     return results
