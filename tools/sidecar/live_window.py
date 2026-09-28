@@ -112,6 +112,32 @@ class LivePanel:
         self.status_field = None
         self.topic_field = None
         self._target = None
+        self._closed = False
+
+    def close(self) -> None:
+        """Hide the panel. Recording is unchanged. Safe to call more than once."""
+        self._closed = True
+        panel = self.panel
+        self.panel = None
+        if panel is None:
+            return
+
+        def hide() -> None:
+            panel.orderOut_(None)
+            panel.close()
+
+        _dispatch_main(hide)
+
+    def order_front(self) -> None:
+        """Show the panel again without activating the app or running a modal."""
+        panel = self.panel
+        if panel is None or self._closed:
+            return
+
+        def show() -> None:
+            panel.orderFrontRegardless()
+
+        _dispatch_main(show)
 
     def show(self) -> None:
         """Order the panel front without activating the app or running a modal."""
@@ -193,6 +219,8 @@ class LivePanel:
         snapshot_cards = tuple(cards)
 
         def render() -> None:
+            if self._closed:
+                return
             self._lines = snapshot_lines
             self._cards = snapshot_cards
             self._status = status

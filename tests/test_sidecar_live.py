@@ -402,3 +402,534 @@ def test_start_records_preference_and_opens_no_dialog(tmp_path, monkeypatch):
     assert time.perf_counter() - stopped < 0.5
     assert live_calls == ["start", "stop"]
     assert app.recorder.is_recording is False
+
+
+def test_short_fragment_is_replaced_by_the_longer_nearby_hearing():
+    committed = [LiveLine(439.0, 439.4, "Ich", "Okay.")]
+    incoming = [LiveLine(439.8, 443.0, "Ich", "Okay, also ich würde sagen,")]
+    all_lines, added, revised = commit_new_lines(committed, incoming)
+    assert added == []
+    assert revised == 0
+    assert len(all_lines) == 1
+    assert "würde" in all_lines[0].text
+    assert all_lines[0].start == 439.0
+
+
+def test_prompt_opening_stays_with_its_continuation_on_one_card():
+    class Transcriber:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe_tails(self, *_args):
+            self.calls += 1
+            opening = {
+                "speaker": "Ich",
+                "text": "Ich würde jetzt Claude sagen, er soll",
+                "start_offset": 20.0,
+                "end_offset": 28.0,
+            }
+            if self.calls == 1:
+                return [opening]
+            return [
+                opening,
+                {"speaker": "Ich", "text": "er soll", "start_offset": 34.0, "end_offset": 36.0},
+                {"speaker": "Andere", "text": "Papi", "start_offset": 37.0, "end_offset": 37.4},
+                {
+                    "speaker": "Ich",
+                    "text": "den Plan Schritt für Schritt implementieren und die Fragen fragen",
+                    "start_offset": 38.0,
+                    "end_offset": 46.0,
+                },
+            ]
+
+    class Judge:
+        def judge(self, lines, questions, *, context=6):
+            plan_present = any("Plan" in line.text for line in lines)
+            scores = []
+            for line in lines:
+                if "Plan" in line.text:
+                    scores.append(0.98)
+                elif "Claude" in line.text:
+                    scores.append(0.85 if plan_present else 0.95)
+                else:
+                    scores.append(0.1)
+            return {name: scores for name in questions}
+
+    engine = LiveEngine(
+        snapshot=lambda _tail: None,
+        transcriber=Transcriber(),
+        judge=Judge(),
+        prompt_threshold=0.9,
+    )
+    window = TailSnapshot(np.zeros(8, dtype=np.int16), 16000, None, 16000, 0.0, 80.0, closed=True)
+    engine.process_snapshot(window)
+    assert len(engine.cards) == 1
+    engine.process_snapshot(window)
+    assert len(engine.cards) == 1
+    card = engine.cards[0]
+    assert card.start_seconds == pytest.approx(20.0)
+    assert card.end_seconds == pytest.approx(38.0)
+    assert "Claude" in card.verbatim_text
+    assert "Plan" in card.verbatim_text
+
+
+def test_cut_off_instruction_stays_with_the_later_prompt_line():
+    class Transcriber:
+        def transcribe_tails(self, *_args):
+            return [
+                {
+                    "speaker": "Ich",
+                    "text": "Ich würde jetzt Claude sagen, er soll",
+                    "start_offset": 20.0,
+                    "end_offset": 28.0,
+                },
+                {"speaker": "Ich", "text": "er soll", "start_offset": 34.0, "end_offset": 36.0},
+                {"speaker": "Andere", "text": "Papi", "start_offset": 37.0, "end_offset": 37.4},
+                {
+                    "speaker": "Ich",
+                    "text": "den Plan Schritt für Schritt implementieren und die Fragen fragen",
+                    "start_offset": 38.0,
+                    "end_offset": 46.0,
+                },
+            ]
+
+    class Judge:
+        def judge(self, lines, questions, *, context=6):
+            scores = []
+            for line in lines:
+                if "Plan" in line.text:
+                    scores.append(0.98)
+                elif "Claude" in line.text:
+                    scores.append(0.40)
+                else:
+                    scores.append(0.1)
+            return {name: scores for name in questions}
+
+    engine = LiveEngine(
+        snapshot=lambda _tail: None,
+        transcriber=Transcriber(),
+        judge=Judge(),
+        prompt_threshold=0.9,
+    )
+    window = TailSnapshot(np.zeros(8, dtype=np.int16), 16000, None, 16000, 0.0, 80.0, closed=True)
+    engine.process_snapshot(window)
+    assert len(engine.cards) == 1
+    card = engine.cards[0]
+    assert card.start_seconds == pytest.approx(20.0)
+    assert card.end_seconds == pytest.approx(38.0)
+    assert "Claude" in card.verbatim_text
+    assert "Plan" in card.verbatim_text
+
+
+def test_overlapping_rewording_adds_nothing():
+    committed = [LiveLine(100.0, 101.0, "Ich", "Ja, es ist gut.")]
+    incoming = [LiveLine(99.5, 101.8, "Ich", "Messt es gut.")]
+    all_lines, added, revised = commit_new_lines(committed, incoming)
+    assert added == []
+    assert revised is None
+    assert [line.text for line in all_lines] == ["Ja, es ist gut."]
+
+
+def test_frontier_drops_lines_more_than_half_a_second_behind():
+    committed = [LiveLine(10.0, 12.0, "Ich", "Schon gesagt und abgeschlossen.")]
+    too_old = [LiveLine(11.4, 13.5, "Andere", "Das beginnt zu früh.")]
+    still_new = [LiveLine(11.6, 13.5, "Andere", "Das ist noch neu genug.")]
+    _old_lines, old_added, _old_revised = commit_new_lines(committed, too_old)
+    _new_lines, new_added, _new_revised = commit_new_lines(committed, still_new)
+    assert old_added == []
+    assert [line.text for line in new_added] == ["Das ist noch neu genug."]
+
+
+def test_unpunctuated_monologue_commits_every_word():
+    words = [f"w{i:03d}" for i in range(100)]
+    state = {"start": 0.0, "end": 0.0}
+
+    class Transcriber:
+        def transcribe_tails(self, *_args):
+            start = int(state["start"])
+            end = int(state["end"])
+            return [
+                {
+                    "speaker": "Ich",
+                    "text": " ".join(words[start:end]),
+                    "start_offset": 0.0,
+                    "end_offset": float(end - start),
+                }
+            ]
+
+    engine = LiveEngine(
+        snapshot=lambda _tail: None,
+        transcriber=Transcriber(),
+        interval=20,
+        tail=60,
+    )
+    for end in (20, 40, 60, 80, 100):
+        state["start"] = float(max(0, end - 60))
+        state["end"] = float(end)
+        engine.process_snapshot(
+            TailSnapshot(
+                np.zeros(8, dtype=np.int16),
+                16000,
+                None,
+                16000,
+                state["start"],
+                state["end"],
+                closed=end == 100,
+            )
+        )
+    assert " ".join(line.text for line in engine.lines).split() == words
+
+
+def test_clean_prompt_retries_only_while_empty_and_stops_at_three():
+    calls: list[str] = []
+
+    def clean(_text: str) -> str:
+        calls.append("empty")
+        return ""
+
+    class Transcriber:
+        def transcribe_tails(self, *_args):
+            return [
+                {
+                    "speaker": "Ich",
+                    "text": "Ich würde Claude sagen, er soll den Plan umsetzen.",
+                    "start_offset": 1.0,
+                    "end_offset": 4.0,
+                }
+            ]
+
+    class Judge:
+        def judge(self, lines, questions, *, context=6):
+            return {name: [0.99] * len(lines) for name in questions}
+
+    engine = LiveEngine(
+        snapshot=lambda _tail: None,
+        transcriber=Transcriber(),
+        judge=Judge(),
+        clean_prompt=clean,
+        prompt_threshold=0.9,
+    )
+    snapshot = TailSnapshot(
+        np.zeros(16000, dtype=np.int16), 16000, None, 16000, 0.0, 20.0, closed=True
+    )
+    for _ in range(4):
+        engine.process_snapshot(snapshot)
+    assert calls == ["empty", "empty", "empty"]
+    assert engine.cards[0].clean_text == ""
+
+    calls.clear()
+
+    def succeed(_text: str) -> str:
+        calls.append("ok")
+        return " Implement the plan. "
+
+    engine = LiveEngine(
+        snapshot=lambda _tail: None,
+        transcriber=Transcriber(),
+        judge=Judge(),
+        clean_prompt=succeed,
+        prompt_threshold=0.9,
+    )
+    engine.process_snapshot(snapshot)
+    engine.process_snapshot(snapshot)
+    assert calls == ["ok"]
+    assert engine.cards[0].clean_text == "Implement the plan."
+
+
+def test_mic_tail_walks_backward_and_stops():
+    class Chunks:
+        def __init__(self):
+            self.n = 1000
+            self.rate = 16000
+            self.touched: list[int] = []
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, index):
+            if index < 0:
+                index += self.n
+            self.touched.append(index)
+            if index < self.n - 2:
+                raise AssertionError(f"walked into chunk {index}")
+            return np.full(self.rate, 3, dtype=np.int16)
+
+    chunks = Chunks()
+    tail, start, end = tail_from_chunks(
+        chunks, chunks.rate, 1.5, total_samples=chunks.n * chunks.rate
+    )
+    assert start == pytest.approx(998.5)
+    assert end == pytest.approx(1000.0)
+    assert tail.shape == (int(1.5 * chunks.rate),)
+    assert min(chunks.touched) >= chunks.n - 2
+
+
+def test_hallucinated_offset_is_clamped_to_the_tail():
+    from sidecar.live import _absolute_lines
+
+    lines = _absolute_lines(
+        [{"speaker": "Ich", "text": "Hallo", "start_offset": 100000, "end_offset": 100001}],
+        10.0,
+        70.0,
+    )
+    assert lines[0].start == pytest.approx(70.0)
+    assert lines[0].end == pytest.approx(70.0)
+
+
+def test_closed_tick_skips_gemini_when_the_system_wav_is_gone():
+    calls: list[int] = []
+
+    class Transcriber:
+        def transcribe_tails(self, *_args):
+            calls.append(1)
+            return []
+
+    snapshot = TailSnapshot(
+        np.zeros(1600, dtype=np.int16),
+        16000,
+        None,
+        16000,
+        0.0,
+        0.1,
+        system_gone=True,
+    )
+    engine = LiveEngine(snapshot=lambda _tail: snapshot, transcriber=Transcriber(), interval=0.01)
+    engine._safe_tick(closed=True)
+    assert calls == []
+    engine._safe_tick(closed=False)
+    assert calls == [1]
+
+
+def test_live_clients_are_built_on_the_worker_not_at_start(monkeypatch):
+    import sidecar.live_session as session_mod
+
+    calls: list[int] = []
+
+    class Transcriber:
+        def __init__(self, api_key=None):
+            calls.append(threading.get_ident())
+
+        def transcribe_tails(self, *_args):
+            return []
+
+    class Judge:
+        def __init__(self, api_key=None, model=None):
+            calls.append(threading.get_ident())
+
+        def judge(self, lines, questions, *, context=6):
+            return {name: [0.0] * len(lines) for name in questions}
+
+    monkeypatch.setattr(session_mod, "GeminiLiveTranscriber", Transcriber)
+    monkeypatch.setattr(session_mod, "GeminiJudge", Judge)
+
+    def threshold(_model):
+        calls.append(threading.get_ident())
+        return 0.9
+
+    monkeypatch.setattr(session_mod, "calibrated_prompt_threshold", threshold)
+    recorder = SimpleNamespace(audio_data=[], sample_rate=16000, _sys_wav=None, _mic_frames=0)
+    session = session_mod.RecordingLiveSession(
+        recorder, api_key="test-key", copy_text=lambda _text: None, open_window=False
+    )
+    assert calls == []
+    session.engine.interval = 0.05
+    started = time.perf_counter()
+    session.start()
+    assert time.perf_counter() - started < 0.3
+    deadline = time.perf_counter() + 2
+    while len(calls) < 3 and time.perf_counter() < deadline:
+        time.sleep(0.01)
+    session.stop()
+    assert len(calls) >= 3
+    assert threading.main_thread().ident not in calls
+
+
+def test_recording_menu_cannot_open_a_modal(monkeypatch):
+    import importlib
+    import types
+
+    log: list[str] = []
+    fake_rumps = types.ModuleType("rumps")
+
+    class App:
+        pass
+
+    class MenuItem:
+        def __init__(self, title, callback=None):
+            self.title = title
+            self._callback = callback
+            self.state = 0
+
+        def set_callback(self, callback):
+            self._callback = callback
+
+        @property
+        def callback(self):
+            return self._callback
+
+    class Window:
+        def __init__(self, **_kwargs):
+            log.append("window")
+
+        def run(self):
+            log.append("run")
+            return SimpleNamespace(clicked=False, text="")
+
+    fake_rumps.App = App
+    fake_rumps.MenuItem = MenuItem
+    fake_rumps.notification = lambda **_kwargs: log.append("notification")
+    fake_rumps.alert = lambda **_kwargs: log.append("alert")
+    fake_rumps.Window = Window
+    fake_rumps.quit_application = lambda: log.append("quit")
+    fake_sounddevice = types.ModuleType("sounddevice")
+    fake_sounddevice.query_devices = lambda: [{"name": "Mic", "max_input_channels": 1}]
+    previous = sys.modules.get("meeting_recorder")
+    monkeypatch.setitem(sys.modules, "rumps", fake_rumps)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sounddevice)
+    sys.modules.pop("meeting_recorder", None)
+    try:
+        recorder_module = importlib.import_module("meeting_recorder")
+        monkeypatch.setattr(
+            recorder_module, "activate_app_for_modal", lambda: log.append("activate")
+        )
+        app = recorder_module.MeetingRecorderApp.__new__(recorder_module.MeetingRecorderApp)
+        app.config_path = None
+        app.recordings_dir = Path("/tmp")
+        app.transcripts_dir = Path("/tmp")
+        app.config = {}
+        app._dispatch_ui = lambda callback: callback()
+        app._sidecar_threads = set()
+        app._sidecar_write_failed_stems = set()
+        app._live_session = None
+
+        class Recorder:
+            is_recording = True
+            device = 0
+            audio_data = []
+            sample_rate = 16000
+
+            def stop(self):
+                self.is_recording = False
+                return None
+
+        app.recorder = Recorder()
+        app._build_menu()
+        app._set_modal_menu_enabled(False)
+        modal_titles = {"Clip…", "Prompts…", "List Audio Devices"}
+        for item in app.menu:
+            if item is None or item.title not in modal_titles:
+                continue
+            assert item.callback is None
+        app.copy_clip(None)
+        app.copy_prompt(None)
+        app.list_devices(None)
+        app._prompt_text("Clip…", "Thema")
+        app._choose_prompt_to_copy([SimpleNamespace(
+            source="suggested",
+            start_seconds=1.0,
+            mark_seconds=None,
+            association_label=None,
+            lines=(),
+            copy_text="x",
+        )])
+        assert "window" not in log
+        assert "run" not in log
+        assert "alert" not in log
+        for item in app.menu:
+            if item is None or item.callback is None:
+                continue
+            source = inspect.getsource(item.callback)
+            assert "rumps.Window" not in source
+            assert "rumps.alert" not in source
+            assert "runModal" not in source
+            assert "_run_window" not in source
+            assert "_run_alert" not in source
+
+        app.recorder.is_recording = False
+        app._set_modal_menu_enabled(True)
+        log.clear()
+        app.list_devices(None)
+        assert log[0] == "activate"
+        assert "alert" in log
+        log.clear()
+        app._prompt_text("Clip…", "Thema")
+        assert log[0] == "activate"
+        assert log[1:] == ["window", "run"]
+    finally:
+        if previous is not None:
+            sys.modules["meeting_recorder"] = previous
+        else:
+            sys.modules.pop("meeting_recorder", None)
+
+
+def test_activate_for_modal_uses_the_ignoring_other_apps_option():
+    import meeting_recorder
+
+    seen: list[int] = []
+
+    class App:
+        def activateWithOptions_(self, options):
+            seen.append(options)
+
+    class Kit:
+        NSApp = App()
+        NSApplicationActivateIgnoringOtherApps = 2
+
+    meeting_recorder.activate_app_for_modal(Kit)
+    assert seen == [2]
+
+
+def test_new_start_closes_the_previous_panel_and_a_failed_start_notifies(monkeypatch, tmp_path):
+    import importlib
+    import types
+
+    notes: list[str] = []
+    fake_rumps = types.ModuleType("rumps")
+    fake_rumps.App = object
+    fake_rumps.MenuItem = object
+    fake_rumps.notification = lambda **kwargs: notes.append(kwargs.get("message", ""))
+    fake_rumps.alert = lambda **_kwargs: notes.append("alert")
+    fake_rumps.Window = object
+    previous = sys.modules.get("meeting_recorder")
+    monkeypatch.setitem(sys.modules, "rumps", fake_rumps)
+    monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
+    sys.modules.pop("meeting_recorder", None)
+    try:
+        recorder_module = importlib.import_module("meeting_recorder")
+        app = recorder_module.MeetingRecorderApp.__new__(recorder_module.MeetingRecorderApp)
+        app.config = {}
+        app._dispatch_ui = lambda callback: callback()
+        closed: list[str] = []
+
+        class Panel:
+            def close(self):
+                closed.append("close")
+
+        class Session:
+            panel = Panel()
+
+            def stop(self):
+                closed.append("stop")
+
+        app._live_session = Session()
+
+        def fail(_app):
+            raise RuntimeError("missing key")
+
+        app._live_session_factory = fail
+        app._start_live_session()
+        assert closed == ["stop", "close"]
+        assert notes == ["Die Aufnahme läuft weiter (RuntimeError)."]
+        assert "alert" not in notes
+
+        notes.clear()
+        app._live_session = None
+        app._live_session_factory = None
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        app._start_live_session()
+        assert notes == ["Gemini-Schlüssel fehlt. Die Aufnahme läuft weiter."]
+    finally:
+        if previous is not None:
+            sys.modules["meeting_recorder"] = previous
+        else:
+            sys.modules.pop("meeting_recorder", None)

@@ -61,10 +61,18 @@ The rumps menu bar app adds these actions:
 - **Clip…** offers the newest ten valid finished transcripts (metadata/calendar
   title when available, otherwise the stem), asks for a topic, then evaluates
   and copies the clip on a background thread. Its completion notification gives
-  the copied line count.
+  the copied line count. While a recording is running this item is disabled.
+  The live panel's topic field is the clip control during capture. Outside a
+  recording, the app is activated before the dialog so it cannot sit behind
+  other windows.
 - **Prompts…** similarly selects a finished transcript, evaluates marked and
   suggested prompt cards on a background thread, then asks which card to copy.
   The clipboard receives the clean prompt. The verbatim lines stay on the card.
+  This item is also disabled while recording; prompt cards are on the live
+  panel. The same activation rule applies when the dialog is allowed.
+- **List Audio Devices** is disabled while recording. Outside a recording it
+  activates the app and then shows the device list. It never uses a modal
+  during capture.
 
 The score cache is local-only at `~/.local/share/meeting-sidecar/cache/`. Its
 entries contain probability vectors and hashes, never transcript text. The
@@ -219,14 +227,40 @@ The panel shows:
 
 The live worker is a daemon thread. About every 20 seconds it copies references
 to the in-memory mic blocks and reads the tail of the system-audio WAV (the
-last 60 seconds of each, taken at the same moment). It sends those tails to
-`gemini-3.8-flash` on the pinned Gemini endpoint. Lines already committed are
-dropped. A transcription or prompt failure shows a status line in the panel and
-does not stop or delay capture. The audio callback is not on this path.
+last 60 seconds of each, taken at the same moment). The mic tail is walked from
+the newest block and stops once those 60 seconds are in hand; the recorder's
+frame count supplies the clock, so the older blocks are not concatenated.
+Gemini clients and the calibration-file read are created on that worker's
+first tick. Start only opens the panel. If the session cannot start (for
+example a missing Gemini key), a non-modal notification says so and recording
+continues. A new Start closes the previous panel.
+
+It sends those tails to `gemini-3.8-flash` on the pinned Gemini endpoint.
+An incoming line that overlaps a committed line of the same speaker by more
+than half of the shorter interval replaces that line when the new text is
+longer and still covers its start; otherwise the re-hear is dropped. A tail
+that has slid forward keeps the committed words and appends only the new
+aligned suffix. A short fragment is absorbed when a longer same-speaker
+hearing starts within two seconds and its text begins with that fragment.
+Any other line that starts more than half a second before the
+frontier is dropped. Offsets from Gemini are clamped to the tail, so a
+hallucinated timestamp cannot push the frontier past the audio. An unfinished
+line at the edge of an open tail is held for one tick and then committed, so
+a long unpunctuated monologue is not left behind the frontier. A later tick
+can still upgrade that fragment. After Stop, the final tick is skipped when
+the system WAV has already been archived. A transcription or prompt failure
+shows a status line in the panel and does not stop or delay capture. A clean
+prompt is reused only when the cleaned text is non-empty; an empty result is
+retried up to three times per card. The audio callback is not on this path.
 
 Prompt detection uses the broadened judge question: Swiss German and Hochdeutsch
 indirect instructions (“ich würd em Claude säge, er söll …”, “mir müessted em
-Agent säge …”) and English dictation inside dialect. Gemini then writes the
+Agent säge …”) and English dictation inside dialect. A line that once scored
+at or above the threshold keeps that score, so a later window cannot split
+the same dictation onto a second card. An unfinished line that tells Claude
+or an agent what to do stays on that card when the same speaker continues
+it within 20 seconds, even if one judge call scored the opening under the
+threshold. Gemini then writes the
 clean prompt (intent only; English for AI tools unless the speaker clearly
 wants German). Clips stay verbatim.
 
@@ -239,9 +273,10 @@ python -m tools.sidecar replay --wav /path/to/recording.wav
 It reveals the WAV in 20-second steps, prints each new line with its lag, and
 prints each prompt card again when a later tail completes it. Lag is the
 simulated tick time plus the real transcription duration, minus the line's
-audio time. A line that is still cut off at the end of a tick is held for the
-next tail; a finished sentence is committed immediately, and a later tail can
-replace a fragment with the complete hearing. Optional `--from-seconds`
+audio time. A line that is still cut off at the end of a tick is held for that
+one tick and committed on the next; a finished sentence is committed
+immediately, and a later tail can replace a fragment with the complete
+hearing. Optional `--from-seconds`
 and `--to-seconds` limit the span. The command reads `GEMINI_API_KEY` from the
 environment or from the repository `.env` (the main checkout's `.env` when
 this directory is a worktree).
@@ -276,9 +311,10 @@ need an attended macOS session. Before merge:
    and the first-mic offset in the sidecar.
 7. Temporarily make the sidecar directory unwritable; confirm recording still
    starts, a failure notification appears, and Jev remains off.
-8. With a prior completed transcript, run **Clip…** during a short recording;
-   confirm the clip notification shows a line count and the WAV duration still
-   matches wall clock.
+8. During a short recording, confirm **Clip…**, **Prompts…**, and **List Audio
+   Devices** are disabled and Stop stays clickable. After stop, run **Clip…**
+   on a prior transcript and confirm the dialog comes to the front and the
+   notification shows a line count. The WAV duration still matches wall clock.
 9. Run **Prompts…** on one aligned recording and one historical/mapping-missing
    recording; confirm the latter card displays **“Zuordnung unsicher”**.
 

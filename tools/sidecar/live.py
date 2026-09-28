@@ -2,8 +2,9 @@
 
 Every tick takes the last minute of microphone audio and, when present, the
 tail of the system-audio WAV captured at that same moment. Gemini returns
-speaker-labelled lines. Only lines newer than the ones already committed are
-kept. A failure sets a status string and does not touch recording.
+speaker-labelled lines. Same-speaker overlaps replace or drop a re-hear;
+other lines older than the frontier are dropped. A failure sets a status
+string and does not touch recording.
 """
 
 from __future__ import annotations
@@ -53,8 +54,10 @@ class TailSnapshot:
     window_start: float
     window_end: float
     # A closed tail is the last one (stop, or the end of a replay). Open tails
-    # withhold a line that is still running into the window edge.
+    # may withhold one unfinished edge line, and only for a single tick.
     closed: bool = False
+    # Stop archived or deleted the system WAV. The final tick must not call Gemini.
+    system_gone: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,34 +104,17 @@ class LiveCard:
         return self.lines[-1].seconds if self.lines else 0.0
 
 
+# An incoming line must overlap a committed line of the same speaker by more
+# than this share of the shorter interval before it can replace or drop it.
+OVERLAP_REPLACE_RATIO = 0.5
+# Lines that start earlier than this behind the committed frontier are old.
+FRONTIER_SLACK_SECONDS = 0.5
+# A failed clean-prompt call is retried on later ticks, then left verbatim.
+CLEAN_PROMPT_ATTEMPTS = 3
+
+
 def _norm(text: str) -> str:
     return " ".join(text.casefold().split())
-
-
-def _stem(text: str) -> str:
-    return _norm(text).replace("…", " ").replace("...", " ").strip(" .")
-
-
-def _same_utterance(left: str, right: str) -> bool:
-    a, b = _norm(left), _norm(right)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    if len(a) >= 20 and len(b) >= 20 and (a in b or b in a):
-        return True
-    return False
-
-
-def _extends(existing: str, incoming: str) -> bool:
-    """True when ``incoming`` is a longer hearing of the same utterance."""
-    old, new = _stem(existing), _stem(incoming)
-    if len(new) < len(old) + 8:
-        return False
-    if old and old in new:
-        return True
-    head = old[:48]
-    return len(head) >= 24 and head in new
 
 
 def _looks_unfinished(text: str) -> bool:
@@ -140,37 +126,235 @@ def _looks_unfinished(text: str) -> bool:
     return stripped[-1] not in ".?!"
 
 
-def _without_open_tail(
-    lines: Sequence[LiveLine], window_end: float, *, closed: bool
-) -> list[LiveLine]:
-    """Hold only a line that is still cut off at the end of an open tail.
+def _same_speaker(left: LiveLine, right: LiveLine) -> bool:
+    return _norm(left.speaker) == _norm(right.speaker)
 
-    A finished sentence that happens to end near the window edge is committed
-    immediately. Holding every trailing line delayed it by another tick and
-    pushed transcript lag past the live budget. A later tail still replaces a
-    committed fragment when it hears the same utterance more completely.
+
+def _duration(line: LiveLine) -> float:
+    return max(0.0, line.end - line.start)
+
+
+def _overlap_seconds(left: LiveLine, right: LiveLine) -> float:
+    return max(0.0, min(left.end, right.end) - max(left.start, right.start))
+
+
+def _overlap_ratio(left: LiveLine, right: LiveLine) -> float:
+    """Fraction of the shorter interval covered by both lines."""
+    short = min(_duration(left), _duration(right))
+    overlap = _overlap_seconds(left, right)
+    if short <= 1e-3:
+        if _duration(left) <= 1e-3 and right.start - 1e-3 <= left.start <= right.end + 1e-3:
+            return 1.0
+        if _duration(right) <= 1e-3 and left.start - 1e-3 <= right.start <= left.end + 1e-3:
+            return 1.0
+        return 0.0
+    return overlap / short
+
+
+def _tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw in text.casefold().replace("…", " ").replace("...", " ").split():
+        token = raw.strip(".,;:!?\"'“”«»()[]")
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _cut_off_instruction(text: str) -> bool:
+    """An unfinished line that names the assistant and the act of telling it."""
+    if text.rstrip().endswith((".", "!", "?")):
+        return False
+    tokens = _tokens(text)
+    if len(tokens) < 4:
+        return False
+    has_tool = any(token in {"claude", "agent"} for token in tokens)
+    has_verb = any(token.startswith(("sag", "säg")) for token in tokens)
+    return has_tool and has_verb
+
+
+def _scores_keeping_cut_off_instructions(
+    scores: Sequence[float], lines: Sequence[TranscriptLine], *, threshold: float
+) -> list[float]:
+    """Keep a cut-off instruction on the card when its continuation scores.
+
+    A later window sometimes scores 'ich würde Claude sagen, er soll' under
+    the threshold and then scores the rest of the same dictation above it.
+    The opening would otherwise become its own missed line.
     """
-    if closed or not lines:
-        return list(lines)
-    last = max(lines, key=lambda line: (line.end, line.start))
-    if window_end - last.end > 2.0 or not _looks_unfinished(last.text):
-        return list(lines)
-    return [line for line in lines if line is not last]
+    adjusted = [float(score) for score in scores]
+    for index, line in enumerate(lines):
+        if adjusted[index] >= threshold or not _cut_off_instruction(line.text):
+            continue
+        for later in range(index + 1, len(lines)):
+            if lines[later].seconds - line.seconds > PROMPT_CONSECUTIVE_GAP_SECONDS:
+                break
+            if adjusted[later] >= threshold and lines[later].speaker == line.speaker:
+                adjusted[index] = threshold
+                break
+    return adjusted
+
+
+def _contains_committed(committed: str, incoming: str) -> bool:
+    old = " ".join(_tokens(committed))
+    new = " ".join(_tokens(incoming))
+    return len(old) >= 12 and old in new
+
+
+def _continuation_words(committed: str, incoming: str) -> list[str] | None:
+    """Words ``incoming`` adds after the end of ``committed``.
+
+    The match is a long suffix of the committed line and a prefix of the
+    incoming line. A reworded overlap does not line up, so the caller drops
+    it instead of appending a second copy.
+    """
+    old = _tokens(committed)
+    new = _tokens(incoming)
+    if len(old) < 3 or len(new) < 3:
+        return None
+    matched = 0
+    for length in range(min(len(old), len(new)), 2, -1):
+        if old[-length:] == new[:length]:
+            matched = length
+            break
+    if matched < max(3, (len(new) + 1) // 2) or matched >= len(new):
+        return None
+    original = incoming.split()
+    if len(original) == len(new):
+        return original[matched:]
+    return new[matched:]
+
+
+def _covered(held: LiveLine, rows: Sequence[LiveLine]) -> bool:
+    return any(_same_speaker(held, line) and _overlap_ratio(held, line) > OVERLAP_REPLACE_RATIO for line in rows)
+
+
+def _held_is_due(held: LiveLine | None, line: LiveLine) -> bool:
+    """True when ``line`` is the next tick's hearing of a line already held."""
+    if held is None or not _same_speaker(held, line):
+        return False
+    if _overlap_ratio(held, line) > 0:
+        return True
+    return abs(line.start - held.start) <= 1.0
+
+
+def _continues_committed(line: LiveLine, committed: Sequence[LiveLine]) -> bool:
+    return any(_same_speaker(line, other) and _overlap_ratio(line, other) > OVERLAP_REPLACE_RATIO for other in committed)
+
+
+def _select_lines_to_commit(
+    lines: Sequence[LiveLine],
+    window_end: float,
+    *,
+    closed: bool,
+    held: LiveLine | None,
+    committed: Sequence[LiveLine],
+) -> tuple[list[LiveLine], LiveLine | None]:
+    """Commit every line, holding an unfinished edge line for one tick only.
+
+    The next tick commits that fragment even if it is still unpunctuated.
+    Overlap replacement can then upgrade it. A finished sentence at the edge
+    is committed immediately.
+    """
+    rows = [line for line in lines if line.text.strip()]
+    if closed or not rows:
+        extra = [held] if held is not None and not _covered(held, rows) else []
+        return extra + rows, None
+    last = max(rows, key=lambda line: (line.end, line.start))
+    at_edge = window_end - last.end <= 2.0 and _looks_unfinished(last.text)
+    if not at_edge or _held_is_due(held, last) or _continues_committed(last, committed):
+        extra = [held] if held is not None and not _covered(held, rows) else []
+        return extra + rows, None
+    return [line for line in rows if line is not last], last
+
+
+def _without_open_tail(
+    lines: Sequence[LiveLine],
+    window_end: float,
+    *,
+    closed: bool,
+    held: LiveLine | None = None,
+    committed: Sequence[LiveLine] = (),
+) -> list[LiveLine]:
+    """Lines from ``_select_lines_to_commit`` that should be committed now."""
+    chosen, _held = _select_lines_to_commit(
+        lines, window_end, closed=closed, held=held, committed=committed
+    )
+    return chosen
+
+
+def _extends_fragment(committed: str, incoming: str) -> bool:
+    """A short committed fragment is the opening of a longer nearby hearing."""
+    if len(committed) > 40:
+        return False
+    old = " ".join(_tokens(committed))
+    new = " ".join(_tokens(incoming))
+    return bool(old) and new.startswith(old) and len(new) >= len(old) + 8
+
+
+def _nearby_extension(lines: Sequence[LiveLine], stored: LiveLine) -> int | None:
+    """Same-speaker fragment just before this line, when the clocks barely miss.
+
+    Time overlap handles a re-hear of the same interval. A one-word fragment
+    whose next hearing starts a fraction of a second later would otherwise
+    stay as a second line.
+    """
+    for index in range(len(lines) - 1, -1, -1):
+        other = lines[index]
+        if not _same_speaker(other, stored):
+            continue
+        if abs(other.start - stored.start) > 15:
+            continue
+        gap = max(0.0, stored.start - other.end, other.start - stored.end)
+        if gap > 2.0:
+            continue
+        old = " ".join(_tokens(other.text))
+        new = " ".join(_tokens(stored.text))
+        if old and (old == new or _extends_fragment(other.text, stored.text)):
+            return index
+    return None
+
+
+def _drop_covered_lines(
+    lines: list[LiveLine], primary: int, note: Callable[[int], None]
+) -> tuple[list[LiveLine], int]:
+    """Drop same-speaker lines the updated line now covers and is at least as long as."""
+    updated = lines[primary]
+    kept: list[LiveLine] = []
+    shift = 0
+    for index, other in enumerate(lines):
+        covered = (
+            index != primary
+            and _same_speaker(other, updated)
+            and _overlap_ratio(other, updated) > OVERLAP_REPLACE_RATIO
+            and len(other.text) <= len(updated.text)
+        )
+        if covered:
+            note(index)
+            if index < primary:
+                shift += 1
+            continue
+        kept.append(other)
+    return kept, primary - shift
 
 
 def commit_new_lines(
     committed: Sequence[LiveLine], incoming: Sequence[LiveLine]
 ) -> tuple[list[LiveLine], list[LiveLine], int | None]:
-    """Keep lines newer than the committed frontier and drop overlap repeats.
+    """Keep new lines and collapse same-speaker overlaps.
 
-    A later tail may hear the same utterance more completely (the first window
-    ended mid-sentence). That line is replaced in place. ``revised_from`` is
-    the earliest replaced index, so the caller can rescore from there.
+    An incoming line that overlaps a committed line of the same speaker by
+    more than half of the shorter interval replaces it when the new text is
+    longer and still covers that line's start. Otherwise that re-hear is
+    dropped. A tail that has slid forward keeps the committed prefix and
+    appends only the aligned new suffix, so an unpunctuated monologue does
+    not lose the words that left the window and does not gain a second copy.
+    Anything else starting more than half a second before the frontier is
+    old. ``revised_from`` is the earliest replaced index.
     """
     all_lines = list(committed)
     added: list[LiveLine] = []
     revised_from: int | None = None
-    frontier = all_lines[-1].end if all_lines else -1.0
+    frontier = max((line.end for line in all_lines), default=-1.0)
 
     def _note_revision(index: int) -> None:
         nonlocal revised_from
@@ -182,35 +366,50 @@ def commit_new_lines(
         if not text:
             continue
         stored = LiveLine(line.start, max(line.end, line.start), line.speaker.strip() or "Ich", text)
-        extension_at = None
-        for index in range(len(all_lines) - 1, max(-1, len(all_lines) - 13), -1):
-            other = all_lines[index]
-            if abs(other.start - stored.start) > 15:
+        match_at: int | None = None
+        match_ratio = 0.0
+        for index, other in enumerate(all_lines):
+            if not _same_speaker(other, stored):
                 continue
-            if _norm(other.speaker) != _norm(stored.speaker):
-                continue
-            if _extends(other.text, stored.text):
-                extension_at = index
-                break
-        if extension_at is not None:
-            previous = all_lines[extension_at]
-            all_lines[extension_at] = LiveLine(
-                previous.start,
-                max(previous.end, stored.end),
-                previous.speaker,
-                stored.text,
+            ratio = _overlap_ratio(other, stored)
+            if ratio > OVERLAP_REPLACE_RATIO and (match_at is None or ratio >= match_ratio):
+                match_ratio = ratio
+                match_at = index
+        if match_at is None:
+            match_at = _nearby_extension(all_lines, stored)
+        if match_at is not None:
+            previous = all_lines[match_at]
+            longer = len(stored.text) > len(previous.text)
+            covers = (
+                stored.start <= previous.start + 0.75
+                or _contains_committed(previous.text, stored.text)
+                or _extends_fragment(previous.text, stored.text)
             )
-            _note_revision(extension_at)
-            frontier = max(frontier, all_lines[extension_at].end)
+            updated = False
+            if longer and covers:
+                all_lines[match_at] = LiveLine(
+                    min(previous.start, stored.start),
+                    max(previous.end, stored.end),
+                    previous.speaker,
+                    stored.text,
+                )
+                updated = True
+            else:
+                extra = _continuation_words(previous.text, stored.text)
+                if extra and stored.end > previous.end + FRONTIER_SLACK_SECONDS:
+                    all_lines[match_at] = LiveLine(
+                        previous.start,
+                        max(previous.end, stored.end),
+                        previous.speaker,
+                        previous.text.rstrip() + " " + " ".join(extra),
+                    )
+                    updated = True
+            if updated:
+                _note_revision(match_at)
+                all_lines, match_at = _drop_covered_lines(all_lines, match_at, _note_revision)
+                frontier = max(line.end for line in all_lines)
             continue
-        if all_lines and stored.start < frontier - 2.0:
-            continue
-        if any(
-            _same_utterance(stored.text, other.text) and abs(other.start - stored.start) <= 15
-            for other in all_lines[-12:]
-        ):
-            continue
-        if all_lines and stored.end <= frontier + 0.05 and stored.start <= frontier:
+        if all_lines and stored.start < frontier - FRONTIER_SLACK_SECONDS:
             continue
         all_lines.append(stored)
         added.append(stored)
@@ -227,20 +426,29 @@ def snapshot_recording_tails(recorder: Any, tail_seconds: float = LIVE_TAIL_SECO
     rate = int(getattr(recorder, "sample_rate", 0) or 0)
     if rate <= 0:
         return None
-    mic, window_start, window_end = tail_from_chunks(chunks, rate, tail_seconds)
+    frames = getattr(recorder, "_mic_frames", None)
+    total_samples = int(frames) if isinstance(frames, int) and frames > 0 else None
+    mic, window_start, window_end = tail_from_chunks(
+        chunks, rate, tail_seconds, total_samples=total_samples
+    )
     system = None
     system_rate = rate
+    system_gone = False
     path = getattr(recorder, "_sys_wav", None)
     if path is not None:
         wav_path = Path(path)
         try:
             if wav_path.is_file() and wav_path.stat().st_size > 44:
                 system, system_rate = read_wav_pcm_tail(wav_path, tail_seconds)
+            elif not wav_path.is_file():
+                system_gone = True
         except (OSError, ValueError):
             system = None
     if mic.size == 0 and (system is None or getattr(system, "size", 0) == 0):
         return None
-    return TailSnapshot(mic, rate, system, system_rate, window_start, window_end)
+    return TailSnapshot(
+        mic, rate, system, system_rate, window_start, window_end, system_gone=system_gone
+    )
 
 
 class GeminiLiveTranscriber:
@@ -409,14 +617,29 @@ def _lines_from_response(response: Any) -> list[dict[str, Any]]:
     return lines
 
 
-def _absolute_lines(raw: Sequence[dict[str, Any]], window_start: float) -> list[LiveLine]:
+def _absolute_lines(
+    raw: Sequence[dict[str, Any]], window_start: float, window_end: float
+) -> list[LiveLine]:
+    """Place offsets on the microphone clock, clamped to this tail.
+
+    A hallucinated offset past the audio would move the frontier into the
+    future and drop every later real line.
+    """
+    span = max(0.0, float(window_end) - float(window_start))
     lines: list[LiveLine] = []
     for row in raw:
-        start = window_start + float(row["start_offset"])
-        end = window_start + float(row["end_offset"])
-        if end < start:
-            end = start
-        lines.append(LiveLine(start, end, str(row["speaker"]), str(row["text"])))
+        start_offset = min(max(0.0, float(row["start_offset"])), span)
+        end_offset = min(max(0.0, float(row["end_offset"])), span)
+        if end_offset < start_offset:
+            end_offset = start_offset
+        lines.append(
+            LiveLine(
+                window_start + start_offset,
+                window_start + end_offset,
+                str(row["speaker"]),
+                str(row["text"]),
+            )
+        )
     return lines
 
 
@@ -431,19 +654,27 @@ class LiveEngine:
         self,
         *,
         snapshot: Callable[[float], TailSnapshot | None],
-        transcriber: GeminiLiveTranscriber,
+        transcriber: GeminiLiveTranscriber | None = None,
+        transcriber_factory: Callable[[], GeminiLiveTranscriber] | None = None,
         judge: Judge | None = None,
+        judge_factory: Callable[[], Judge | None] | None = None,
+        threshold_factory: Callable[[], float] | None = None,
         clean_prompt: Cleaner | None = None,
         on_update: UpdateCallback | None = None,
+        on_unavailable: Callable[[str], None] | None = None,
         interval: float = LIVE_TICK_SECONDS,
         tail: float = LIVE_TAIL_SECONDS,
         prompt_threshold: float = OWNER_APPROVED_PROMPT_THRESHOLD,
     ):
         self._snapshot = snapshot
         self._transcriber = transcriber
+        self._transcriber_factory = transcriber_factory
         self._judge = judge
+        self._judge_factory = judge_factory
+        self._threshold_factory = threshold_factory
         self._clean_prompt = clean_prompt
         self._on_update = on_update
+        self._on_unavailable = on_unavailable
         self.interval = interval
         self.tail = tail
         self.prompt_threshold = prompt_threshold
@@ -452,6 +683,10 @@ class LiveEngine:
         self.status = ""
         self.last_transcribe_seconds = 0.0
         self._scores: list[float] = []
+        self._held: LiveLine | None = None
+        self._clean_attempts: dict[str, int] = {}
+        self._runtime_ready = False
+        self._unavailable_notified = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -467,11 +702,31 @@ class LiveEngine:
         self._stop.set()
 
     def _loop(self) -> None:
+        # Clients are built here, on the worker, before the first sleep. Start
+        # has already returned on the main thread with only the panel open.
+        try:
+            self._ensure_runtime()
+        except Exception as exc:
+            self._fail(exc)
         while not self._stop.is_set():
             if self._stop.wait(self.interval):
                 break
             self._safe_tick()
         self._safe_tick(closed=True)
+
+    def _ensure_runtime(self) -> None:
+        """Build the Gemini clients on the worker, not on the menu thread."""
+        if self._runtime_ready:
+            return
+        if self._transcriber is None:
+            if self._transcriber_factory is None:
+                raise RuntimeError("live transcriber is not configured")
+            self._transcriber = self._transcriber_factory()
+        if self._judge is None and self._judge_factory is not None:
+            self._judge = self._judge_factory()
+        if self._threshold_factory is not None:
+            self.prompt_threshold = float(self._threshold_factory())
+        self._runtime_ready = True
 
     def _safe_tick(self, *, closed: bool = False) -> None:
         try:
@@ -480,19 +735,29 @@ class LiveEngine:
                 return
             if closed and not snapshot.closed:
                 snapshot = replace(snapshot, closed=True)
+            if closed and snapshot.system_gone:
+                return
             self.process_snapshot(snapshot)
         except Exception as exc:
             self._fail(exc)
 
     def process_snapshot(self, snapshot: TailSnapshot) -> list[LiveLine]:
         """Transcribe one tail, commit new lines, and refresh prompt cards."""
+        self._ensure_runtime()
+        assert self._transcriber is not None
         started = time.perf_counter()
         raw = self._transcriber.transcribe_tails(
             snapshot.mic, snapshot.mic_rate, snapshot.system, snapshot.system_rate
         )
         self.last_transcribe_seconds = time.perf_counter() - started
-        incoming = _absolute_lines(raw, snapshot.window_start)
-        incoming = _without_open_tail(incoming, snapshot.window_end, closed=snapshot.closed)
+        incoming = _absolute_lines(raw, snapshot.window_start, snapshot.window_end)
+        incoming, self._held = _select_lines_to_commit(
+            incoming,
+            snapshot.window_end,
+            closed=snapshot.closed,
+            held=self._held,
+            committed=self.lines,
+        )
         self.lines, added, revised_from = commit_new_lines(self.lines, incoming)
         self.status = ""
         if added or revised_from is not None:
@@ -507,6 +772,14 @@ class LiveEngine:
             except Exception as exc:
                 self.status = (
                     f"Prompt-Erkennung unterbrochen ({type(exc).__name__}). "
+                    "Die Aufnahme läuft weiter."
+                )
+        elif self._cards_need_clean_retry():
+            try:
+                self._refresh_cards()
+            except Exception as exc:
+                self.status = (
+                    f"Sauberer Prompt fehlgeschlagen ({type(exc).__name__}). "
                     "Die Aufnahme läuft weiter."
                 )
         self._publish()
@@ -525,13 +798,26 @@ class LiveEngine:
         )["dictating_prompt"]
         if len(scores) != len(subset):
             raise JudgeError("prompt judge did not score every new line")
-        self._scores = self._scores[:start] + [float(score) for score in scores]
+        # A later window can score the opening of a dictated prompt lower once
+        # the rest of the sentence arrives. Keeping the higher score leaves
+        # that opening in the run so the continuation stays on the same card.
+        prior = self._scores[start:previous_count]
+        merged: list[float] = []
+        for index, score in enumerate(scores):
+            value = float(score)
+            if index < len(prior):
+                value = max(prior[index], value)
+            merged.append(value)
+        self._scores = self._scores[:start] + merged
 
     def _refresh_cards(self) -> None:
         if self._judge is None or not self.lines or len(self._scores) != len(self.lines):
             return
         transcript = [line.as_transcript_line(index) for index, line in enumerate(self.lines)]
-        runs = _prompt_runs(self._scores, transcript, threshold=self.prompt_threshold)
+        scores = _scores_keeping_cut_off_instructions(
+            self._scores, transcript, threshold=self.prompt_threshold
+        )
+        runs = _prompt_runs(scores, transcript, threshold=self.prompt_threshold)
         seen: set[str] = set()
         cards: list[LiveCard] = []
         for run in runs:
@@ -542,20 +828,7 @@ class LiveEngine:
             verbatim_lines = tuple(transcript[index] for index in run)
             verbatim = "\n".join(line.text for line in verbatim_lines)
             previous = next((card for card in self.cards if card.key == key), None)
-            if previous is not None and previous.verbatim_text == verbatim:
-                cards.append(previous)
-                continue
-            clean = ""
-            if self._clean_prompt is not None:
-                try:
-                    clean = self._clean_prompt(verbatim).strip()
-                except Exception as exc:
-                    self.status = (
-                        f"Sauberer Prompt fehlgeschlagen ({type(exc).__name__}). "
-                        "Die Aufnahme läuft weiter."
-                    )
-                    clean = ""
-            cards.append(LiveCard(key, verbatim_lines, clean))
+            cards.append(self._card_with_clean(key, verbatim_lines, verbatim, previous))
         # Keep a card that was already shown if a later rescore drops it for one tick.
         for card in self.cards:
             if card.key not in seen:
@@ -563,8 +836,57 @@ class LiveEngine:
         cards.sort(key=lambda card: card.start_seconds)
         self.cards = cards
 
+    def _card_with_clean(
+        self,
+        key: str,
+        verbatim_lines: tuple[TranscriptLine, ...],
+        verbatim: str,
+        previous: LiveCard | None,
+    ) -> LiveCard:
+        """Reuse a clean prompt only when one was actually produced.
+
+        An empty result is a failed attempt. Later ticks retry until
+        ``CLEAN_PROMPT_ATTEMPTS``, then the card stays on the verbatim text.
+        """
+        same = previous is not None and previous.verbatim_text == verbatim
+        if same and previous is not None and previous.clean_text.strip():
+            return previous
+        attempts = self._clean_attempts.get(key, 0) if same else 0
+        if not same:
+            self._clean_attempts.pop(key, None)
+        if same and previous is not None and attempts >= CLEAN_PROMPT_ATTEMPTS:
+            return previous
+        clean = ""
+        if self._clean_prompt is not None:
+            self._clean_attempts[key] = attempts + 1
+            try:
+                clean = (self._clean_prompt(verbatim) or "").strip()
+            except Exception as exc:
+                self.status = (
+                    f"Sauberer Prompt fehlgeschlagen ({type(exc).__name__}). "
+                    "Die Aufnahme läuft weiter."
+                )
+                clean = ""
+        return LiveCard(key, verbatim_lines, clean)
+
+    def _cards_need_clean_retry(self) -> bool:
+        if self._clean_prompt is None or not self.cards:
+            return False
+        for card in self.cards:
+            if card.clean_text.strip():
+                continue
+            if self._clean_attempts.get(card.key, 0) < CLEAN_PROMPT_ATTEMPTS:
+                return True
+        return False
+
     def _fail(self, exc: Exception) -> None:
         self.status = f"Live-Transkription unterbrochen ({type(exc).__name__}). Die Aufnahme läuft weiter."
+        if not self._unavailable_notified and self._on_unavailable is not None:
+            self._unavailable_notified = True
+            try:
+                self._on_unavailable(self.status)
+            except Exception:
+                pass
         self._publish()
 
     def _publish(self) -> None:

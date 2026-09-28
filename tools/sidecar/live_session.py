@@ -33,22 +33,32 @@ class RecordingLiveSession:
         transcriber: GeminiLiveTranscriber | None = None,
         judge: GeminiJudge | None = None,
         prompt_threshold: float | None = None,
+        on_unavailable: Callable[[str], None] | None = None,
     ):
         self.recorder = recorder
         self._copy_text = copy_text
         self._open_window = open_window
         self.panel = None
         self._api_key = api_key
-        threshold = prompt_threshold if prompt_threshold is not None else _live_prompt_threshold()
+        # Clients and the calibration read happen on the worker's first tick.
+        # Building them here used to block Start for about half a second.
         self.engine = LiveEngine(
             snapshot=lambda tail: snapshot_recording_tails(recorder, tail),
-            transcriber=transcriber or GeminiLiveTranscriber(api_key=api_key),
-            judge=judge if judge is not None else _maybe_judge(api_key),
+            transcriber=transcriber,
+            transcriber_factory=None
+            if transcriber is not None
+            else (lambda: GeminiLiveTranscriber(api_key=api_key)),
+            judge=judge,
+            judge_factory=None if judge is not None else (lambda: _maybe_judge(api_key)),
+            threshold_factory=None if prompt_threshold is not None else _live_prompt_threshold,
             clean_prompt=default_clean_prompt(api_key),
             on_update=self._on_update,
-            prompt_threshold=threshold,
+            on_unavailable=on_unavailable,
+            prompt_threshold=prompt_threshold
+            if prompt_threshold is not None
+            else OWNER_APPROVED_PROMPT_THRESHOLD,
         )
-        self._clip_judge = judge if judge is not None else None
+        self._clip_judge = judge
 
     def start(self) -> None:
         if self._open_window:
@@ -85,7 +95,10 @@ class RecordingLiveSession:
             self._on_update(self.engine.lines, self.engine.cards, self.engine.status)
             return
         try:
-            judge = self._clip_judge or GeminiJudge(api_key=self._api_key, model=OWNER_APPROVED_MODEL)
+            judge = self._clip_judge or self.engine._judge
+            if judge is None:
+                judge = GeminiJudge(api_key=self._api_key, model=OWNER_APPROVED_MODEL)
+                self._clip_judge = judge
             clip = select_clip(
                 lines,
                 judge.judge(

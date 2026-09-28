@@ -24,34 +24,67 @@ def copy_chunk_references(chunks: list) -> list:
     return list(chunks)
 
 
+def _mono_samples(chunk) -> np.ndarray:
+    """First channel of one callback block, without copying the meeting."""
+    array = np.asarray(chunk)
+    if array.size == 0:
+        return np.zeros(0, dtype=np.int16)
+    if array.ndim == 2:
+        array = array[:, 0]
+    return np.reshape(array, -1)
+
+
 def tail_from_chunks(
-    chunks: list, sample_rate: int, tail_seconds: float
+    chunks: list,
+    sample_rate: int,
+    tail_seconds: float,
+    total_samples: int | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """Return the last ``tail_seconds`` of mono int16 audio and its time span.
 
-    Times are seconds from the start of the concatenated buffer, which is the
-    microphone clock from the first captured block.
+    Times are seconds from the start of the capture. The walk starts at the
+    newest block and stops once the tail is full, so a long meeting is not
+    concatenated on every tick. Pass ``total_samples`` (the recorder's running
+    frame count) so the clock does not require visiting the older blocks.
     """
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
-    if not chunks:
-        return np.zeros(0, dtype=np.int16), 0.0, 0.0
-    arrays: list[np.ndarray] = []
-    for chunk in chunks:
-        array = np.asarray(chunk)
-        if array.size == 0:
-            continue
-        if array.ndim == 2:
-            array = array[:, 0]
-        arrays.append(np.ascontiguousarray(array).reshape(-1))
-    if not arrays:
-        return np.zeros(0, dtype=np.int16), 0.0, 0.0
-    pcm = np.concatenate(arrays)
-    total = int(pcm.shape[0])
-    keep = min(total, max(0, int(float(tail_seconds) * sample_rate)))
-    start = total - keep
+    keep = max(0, int(float(tail_seconds) * sample_rate))
+    if not chunks or keep == 0:
+        if total_samples is None:
+            total = 0
+            for chunk in chunks:
+                total += int(_mono_samples(chunk).shape[0])
+        else:
+            total = max(0, int(total_samples))
+        return np.zeros(0, dtype=np.int16), total / float(sample_rate), total / float(sample_rate)
+    kept: list[np.ndarray] = []
+    got = 0
+    scanned = 0
+    visited = 0
+    for index in range(len(chunks) - 1, -1, -1):
+        visited += 1
+        samples = _mono_samples(chunks[index])
+        count = int(samples.shape[0])
+        scanned += count
+        if count and got < keep:
+            need = keep - got
+            piece = samples if count <= need else samples[-need:]
+            kept.append(np.ascontiguousarray(piece, dtype=np.int16))
+            got += int(piece.shape[0])
+        if total_samples is not None and got >= keep:
+            break
+    if kept:
+        pcm = np.concatenate(list(reversed(kept)))
+    else:
+        pcm = np.zeros(0, dtype=np.int16)
+    if total_samples is None or visited == len(chunks):
+        total = scanned
+    else:
+        total = max(int(pcm.shape[0]), int(total_samples))
+    start = max(0, total - int(pcm.shape[0]))
     return (
-        np.ascontiguousarray(pcm[start:]),
+        pcm,
         start / float(sample_rate),
         total / float(sample_rate),
     )

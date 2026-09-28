@@ -17,6 +17,7 @@ import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional
 
 import yaml
@@ -89,6 +90,32 @@ def is_prompt_mark_shortcut(event, appkit) -> bool:
         | _appkit_constant(appkit, "NSEventModifierFlagCommand", "NSCommandKeyMask", 1 << 20)
     )
     return flags & required == required
+
+
+def activate_app_for_modal(appkit=None) -> None:
+    """Bring MeetingRecorder forward so a dialog is not stuck behind other apps.
+
+    A modal that opens behind the frontmost window blocks the menu, including
+    Stop, until it is found. Tests pass ``appkit``; under pytest the real
+    activation is skipped unless a double is injected.
+    """
+    if appkit is None and os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        if appkit is None:
+            import AppKit
+
+            appkit = AppKit
+        app = appkit.NSApp
+        if app is None:
+            app = appkit.NSApplication.sharedApplication()
+        options = int(getattr(appkit, "NSApplicationActivateIgnoringOtherApps", 2))
+        if hasattr(app, "activateWithOptions_"):
+            app.activateWithOptions_(options)
+        elif hasattr(app, "activateIgnoringOtherApps_"):
+            app.activateIgnoringOtherApps_(True)
+    except Exception as exc:
+        print(f"Could not activate MeetingRecorder before a dialog: {exc}", file=sys.stderr)
 
 
 def expand_path(path: str) -> Path:
@@ -434,19 +461,22 @@ class MeetingRecorderApp(rumps.App):
         """Build the menu bar menu."""
         self._start_stop_item = rumps.MenuItem("Start Recording", callback=self.toggle_recording)
         self._prompt_mark_item = rumps.MenuItem("Prompt markieren", callback=None)
+        self._clip_item = rumps.MenuItem("Clip…", callback=self.copy_clip)
+        self._prompts_item = rumps.MenuItem("Prompts…", callback=self.copy_prompt)
+        self._devices_item = rumps.MenuItem("List Audio Devices", callback=self.list_devices)
         self._jev_pref_item = rumps.MenuItem("Jev verwenden", callback=self.toggle_jev_preference)
         self.menu = [
             self._start_stop_item,
             self._prompt_mark_item,
-            rumps.MenuItem("Clip…", callback=self.copy_clip),
-            rumps.MenuItem("Prompts…", callback=self.copy_prompt),
+            self._clip_item,
+            self._prompts_item,
             None,  # Separator
             rumps.MenuItem("Open Recordings Folder", callback=self.open_recordings),
             rumps.MenuItem("Open Transcripts Folder", callback=self.open_transcripts),
             None,  # Separator
             self._jev_pref_item,
             rumps.MenuItem("Preferences...", callback=self.open_preferences),
-            rumps.MenuItem("List Audio Devices", callback=self.list_devices),
+            self._devices_item,
             None,  # Separator
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
@@ -599,6 +629,7 @@ class MeetingRecorderApp(rumps.App):
         self.title = TITLE_RECORDING
         sender.title = "Stop Recording"
         self._set_prompt_mark_available(True)
+        self._set_modal_menu_enabled(False)
         try:
             rumps.notification(
                 title="MeetingRecorder",
@@ -669,14 +700,47 @@ class MeetingRecorderApp(rumps.App):
         except Exception as exc:
             self._sidecar_write_failed(stem, exc)
 
+    def _close_previous_live_session(self) -> None:
+        """Stop the previous worker and close its panel before a new recording."""
+        session = getattr(self, "_live_session", None)
+        if session is None:
+            return
+        stopper = getattr(session, "stop", None)
+        if callable(stopper):
+            try:
+                stopper()
+            except Exception as exc:
+                print(f"Previous live sidecar stop failed: {exc}", file=sys.stderr)
+        panel = getattr(session, "panel", None)
+        closer = getattr(panel, "close", None) if panel is not None else None
+        if callable(closer):
+            try:
+                closer()
+            except Exception as exc:
+                print(f"Previous live panel close failed: {exc}", file=sys.stderr)
+        self._live_session = None
+
+    def _notify_live_unavailable(self, message: str) -> None:
+        """One non-modal notice when the live session cannot start."""
+        if getattr(self, "_live_unavailable_notified", False):
+            return
+        self._live_unavailable_notified = True
+        self._notify_from_worker(subtitle="Live-Sitzung nicht gestartet", message=message)
+
     def _start_live_session(self) -> None:
         """Open the side window and start the live worker after capture is up.
 
         Tests build the app without a run loop. They skip the real panel unless
         they inject ``_live_session_factory``. A failure here cannot stop
-        recording.
+        recording. Gemini clients are built on the worker, not here.
         """
+        self._close_previous_live_session()
+        self._live_unavailable_notified = False
         factory = getattr(self, "_live_session_factory", None)
+        if factory is None and not (self._gemini_api_key() or "").strip():
+            self._notify_live_unavailable(
+                "Gemini-Schlüssel fehlt. Die Aufnahme läuft weiter."
+            )
         if factory is None and os.environ.get("PYTEST_CURRENT_TEST"):
             return
         try:
@@ -687,6 +751,7 @@ class MeetingRecorderApp(rumps.App):
                     self.recorder,
                     api_key=self._gemini_api_key(),
                     copy_text=self._copy_to_clipboard,
+                    on_unavailable=self._notify_live_unavailable,
                 )
                 self._live_session.start()
             else:
@@ -696,6 +761,52 @@ class MeetingRecorderApp(rumps.App):
                     start()
         except Exception as exc:
             print(f"Live sidecar unavailable; recording continues: {exc}", file=sys.stderr)
+            self._notify_live_unavailable(
+                f"Die Aufnahme läuft weiter ({type(exc).__name__})."
+            )
+
+    def _set_modal_menu_enabled(self, enabled: bool) -> None:
+        """Clip, Prompts, and device list open modals. They stay off while recording."""
+        for name, callback in (
+            ("_clip_item", self.copy_clip),
+            ("_prompts_item", self.copy_prompt),
+            ("_devices_item", self.list_devices),
+        ):
+            item = getattr(self, name, None)
+            if item is None or not hasattr(item, "set_callback"):
+                continue
+            item.set_callback(callback if enabled else None)
+
+    def _recording_blocks_modals(self) -> bool:
+        recorder = getattr(self, "recorder", None)
+        return bool(getattr(recorder, "is_recording", False))
+
+    def _reveal_live_panel(self) -> None:
+        session = getattr(self, "_live_session", None)
+        panel = getattr(session, "panel", None) if session is not None else None
+        reveal = getattr(panel, "order_front", None) if panel is not None else None
+        if not callable(reveal):
+            return
+        try:
+            reveal()
+        except Exception as exc:
+            print(f"Could not show the live panel: {exc}", file=sys.stderr)
+
+    def _run_window(self, **kwargs):
+        """Modal text prompt. Never while recording; activate the app first otherwise."""
+        if self._recording_blocks_modals():
+            self._reveal_live_panel()
+            return SimpleNamespace(clicked=False, text="")
+        activate_app_for_modal()
+        return rumps.Window(**kwargs).run()
+
+    def _run_alert(self, **kwargs):
+        """Modal alert. Never while recording; activate the app first otherwise."""
+        if self._recording_blocks_modals():
+            self._reveal_live_panel()
+            return None
+        activate_app_for_modal()
+        return rumps.alert(**kwargs)
 
     def _persist_mic_first_sample_offset(
         self, stem: str, mark_zero_monotonic: float
@@ -759,6 +870,7 @@ class MeetingRecorderApp(rumps.App):
         self._recording_stem = None
         self._recording_started_monotonic = None
         self._set_prompt_mark_available(False)
+        self._set_modal_menu_enabled(True)
 
         if output_file and output_file.exists():
             rumps.notification(
@@ -875,13 +987,13 @@ class MeetingRecorderApp(rumps.App):
             f"{number}. {recent_transcript_title(transcript, recordings_root=self.recordings_dir)}"
             for number, transcript in enumerate(transcripts, start=1)
         )
-        response = rumps.Window(
+        response = self._run_window(
             message=f"Wähle ein fertiges Meeting:\n\n{choices}",
             title=action,
             default_text="1",
             ok="Weiter",
             cancel="Abbrechen",
-        ).run()
+        )
         if not response.clicked:
             return None
         try:
@@ -889,7 +1001,7 @@ class MeetingRecorderApp(rumps.App):
         except (AttributeError, TypeError, ValueError):
             selected = 0
         if not 1 <= selected <= len(transcripts):
-            rumps.alert(
+            self._run_alert(
                 title=action,
                 message=f"Bitte eine Zahl von 1 bis {len(transcripts)} eingeben.",
                 ok="OK",
@@ -897,15 +1009,14 @@ class MeetingRecorderApp(rumps.App):
             return None
         return transcripts[selected - 1]
 
-    @staticmethod
-    def _prompt_text(title: str, message: str):
-        response = rumps.Window(
+    def _prompt_text(self, title: str, message: str):
+        response = self._run_window(
             message=message,
             title=title,
             default_text="",
             ok="Weiter",
             cancel="Abbrechen",
-        ).run()
+        )
         if not response.clicked:
             return None
         text = response.text.strip()
@@ -913,6 +1024,9 @@ class MeetingRecorderApp(rumps.App):
 
     def copy_clip(self, _):
         """Select a finished transcript and create a clipboard-ready topic clip."""
+        if self._recording_blocks_modals():
+            self._reveal_live_panel()
+            return
         transcript = self._recent_transcript_choice("Clip…")
         if transcript is None:
             return
@@ -952,6 +1066,9 @@ class MeetingRecorderApp(rumps.App):
 
     def copy_prompt(self, _):
         """Find marked/suggested prompts in a finished transcript off the UI thread."""
+        if self._recording_blocks_modals():
+            self._reveal_live_panel()
+            return
         transcript = self._recent_transcript_choice("Prompts…")
         if transcript is None:
             return
@@ -991,13 +1108,13 @@ class MeetingRecorderApp(rumps.App):
             else:
                 label = f"Vorschlag bei {format_timestamp(prompt.start_seconds)}"
             choices.append(f"{number}. {label}")
-        response = rumps.Window(
+        response = self._run_window(
             message="Welchen Prompt kopieren?\n\n" + "\n".join(choices),
             title="Prompts…",
             default_text="1",
             ok="Kopieren",
             cancel="Abbrechen",
-        ).run()
+        )
         if not response.clicked:
             return
         try:
@@ -1005,7 +1122,7 @@ class MeetingRecorderApp(rumps.App):
         except (AttributeError, TypeError, ValueError):
             selected = 0
         if not 1 <= selected <= len(prompts):
-            rumps.alert(
+            self._run_alert(
                 title="Prompts…",
                 message=f"Bitte eine Zahl von 1 bis {len(prompts)} eingeben.",
                 ok="OK",
@@ -1044,7 +1161,9 @@ class MeetingRecorderApp(rumps.App):
         subprocess.run(["open", str(self.config_path)])
 
     def list_devices(self, _):
-        """Show available audio devices."""
+        """Show available audio devices. Disabled while a recording is open."""
+        if self._recording_blocks_modals():
+            return
         devices = sd.query_devices()
         input_devices = []
 
@@ -1057,7 +1176,7 @@ class MeetingRecorderApp(rumps.App):
         if len(input_devices) > 10:
             device_list += f"\n... and {len(input_devices) - 10} more"
 
-        rumps.alert(
+        self._run_alert(
             title="Available Audio Input Devices",
             message=device_list or "No input devices found",
             ok="OK"
