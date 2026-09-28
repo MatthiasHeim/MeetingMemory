@@ -74,14 +74,14 @@ class _FakeJev:
         return {question: [0.9] * len(lines) for question in questions}
 
 
-def test_external_and_unknown_owner_acknowledgements_are_required_offline(tmp_path):
-    """The final owner decision is switchable, but only with durable evidence."""
+def test_preference_jev_true_authorises_external_and_unknown_meetings(tmp_path):
+    """The Preferences switch is the authority; acknowledgement is not required."""
     _FakeJev.constructed = 0
     initialise_recording_sidecar(
         STEM,
         jev=True,
         external_attendees=True,
-        jev_external_acknowledged=True,
+        jev_external_acknowledged=False,
         root=tmp_path,
     )
     judge = create_judge(
@@ -99,20 +99,10 @@ def test_external_and_unknown_owner_acknowledgements_are_required_offline(tmp_pa
         STEM,
         jev=True,
         external_attendees=None,
-        jev_external_acknowledged=True,
-        root=tmp_path,
-    )
-    assert judge_backend_for(STEM, "jev", recordings_root=tmp_path) == "jev"
-
-    initialise_recording_sidecar(
-        STEM,
-        jev=True,
-        external_attendees=True,
         jev_external_acknowledged=False,
         root=tmp_path,
     )
-    with pytest.raises(JudgeGateError):
-        judge_backend_for(STEM, "jev", recordings_root=tmp_path)
+    assert judge_backend_for(STEM, "jev", recordings_root=tmp_path) == "jev"
 
     # A malformed/omitted attendance field is not interchangeable with the
     # explicitly stored unknown (`null`) state, even if an attacker adds ack.
@@ -481,7 +471,7 @@ def test_recorder_starts_capture_before_calendar_or_sidecar_and_keeps_recording_
     assert app._sidecar_write_failed_stems
 
 
-def test_calendar_resolution_worker_uses_short_timeout_and_amends_after_choice(tmp_path, monkeypatch):
+def test_calendar_resolution_worker_updates_metadata_without_a_dialog(tmp_path, monkeypatch):
     recorder_module = _load_recorder_with_fake_platform(monkeypatch)
     app = recorder_module.MeetingRecorderApp.__new__(recorder_module.MeetingRecorderApp)
     app.recordings_dir = tmp_path
@@ -489,27 +479,28 @@ def test_calendar_resolution_worker_uses_short_timeout_and_amends_after_choice(t
     app._recording_stem = STEM
     app._sidecar_write_failed_stems = set()
     app._notify_from_worker = lambda **_kwargs: None
-    initialise_recording_sidecar(STEM, jev=False, external_attendees=None, root=tmp_path)
+    initialise_recording_sidecar(STEM, jev=True, external_attendees=None, root=tmp_path)
     observed = {}
-    callbacks = []
+    dialogs = []
     worker_thread = []
 
     def resolve(_output, *, timeout_seconds):
         observed["timeout"] = timeout_seconds
         worker_thread.append(threading.get_ident())
-        return CalendarRecordingContext(True, True)
+        return CalendarRecordingContext(True, True, title="Synthetic", event_id="evt")
 
     app._calendar_context_for_start = resolve
-    app._dispatch_ui = callbacks.append
+    app._dispatch_ui = lambda callback: dialogs.append(callback)
+    recorder_module.rumps.alert = lambda **_kwargs: dialogs.append("alert")
     app._resolve_calendar_after_capture(STEM, tmp_path / f"{STEM}.wav")
     assert observed["timeout"] == 3.0
-    assert len(callbacks) == 1
-    app._ask_jev_choice = lambda _context: True
-    callbacks.pop()()
+    assert dialogs == []
+    assert worker_thread == [threading.get_ident()]
     sidecar = load_recording_sidecar(STEM, tmp_path)
     assert sidecar.jev is True
     assert sidecar.external_attendees is True
-    assert sidecar.jev_external_acknowledged is True
+    assert sidecar.jev_external_acknowledged is False
+    assert judge_backend_for(STEM, "jev", recordings_root=tmp_path) == "jev"
 
 
 def test_recorder_uses_configured_dotenv_key_name_and_persists_first_mic_offset(tmp_path, monkeypatch):

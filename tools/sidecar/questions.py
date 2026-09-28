@@ -11,13 +11,23 @@ from typing import Mapping
 DICTATING_PROMPT_QUESTION: Mapping[str, object] = MappingProxyType(
     {
         "instructions": (
-            "Is the current line itself part of a reusable prompt/instruction being dictated for later copying? "
-            "Prompts may be English inside Swiss German. Exclude mere discussion of prompting and lead-ins."
+            "Is the current line part of an instruction being dictated for an AI, agent, or coding assistant to carry out? "
+            "Count direct dictation and indirect instructions in Swiss German or Hochdeutsch, for example "
+            "'ich würd em Claude säge, er söll …', 'mir müessted em Agent säge …', or "
+            "'ich würde Claude sagen, er soll …'. "
+            "Count English dictation inside dialect. "
+            "Do not count talk that merely mentions an AI without stating a task."
         ),
         "criteria": MappingProxyType(
             {
-                "true": "The current line is prompt text being dictated for reuse.",
-                "false": "The line is ordinary meeting discussion, a lead-in, or an explanation around a prompt.",
+                "true": (
+                    "The line states, even indirectly, a task, constraint, or question "
+                    "an AI or agent should carry out."
+                ),
+                "false": (
+                    "The line has no task aimed at an AI or agent. "
+                    "Recording asides and ordinary discussion do not count."
+                ),
             }
         ),
     }
@@ -26,13 +36,20 @@ DICTATING_PROMPT_QUESTION: Mapping[str, object] = MappingProxyType(
 PROMPT_CONTENT_QUESTION: Mapping[str, object] = MappingProxyType(
     {
         "instructions": (
-            "Is this whole sentence itself part of the reusable prompt text being dictated, "
-            "rather than a lead-in, recording aside, or explanation?"
+            "Is this whole sentence part of the instruction being given to an AI, agent, or coding assistant, "
+            "including an indirect frame such as telling Claude or an agent what it should do? "
+            "A recording aside or unrelated chatter is not prompt content."
         ),
         "criteria": MappingProxyType(
             {
-                "true": "The full sentence belongs verbatim in the reusable prompt.",
-                "false": "The sentence is surrounding talk, a lead-in, or an explanation rather than prompt text.",
+                "true": (
+                    "The sentence carries the task, constraint, or question for the AI, "
+                    "including an indirect instruction frame."
+                ),
+                "false": (
+                    "The sentence is a recording aside, filler, or unrelated conversation "
+                    "rather than the instruction."
+                ),
             }
         ),
     }

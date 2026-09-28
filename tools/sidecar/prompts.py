@@ -28,7 +28,11 @@ PROMPT_CONTENT_THRESHOLD = 0.50
 LINE_PROMPT_FALLBACK_THRESHOLD = 0.90
 MARK_LOOKBACK_SECONDS = 5.0
 MARK_MAX_SECONDS = 3 * 60.0
-PROMPT_CONSECUTIVE_GAP_SECONDS = 12.0
+# A short interruption (a child, an acknowledgement, a repeated "er soll")
+# can sit inside one dictated instruction. 20s still separates a later,
+# different prompt. A line shorter than this does not end the run.
+PROMPT_CONSECUTIVE_GAP_SECONDS = 20.0
+PROMPT_SHORT_BRIDGE_CHARS = 20
 DEFAULT_CALIBRATION_REPORT = Path.home() / ".local" / "share" / "meeting-sidecar" / "calibration" / "latest.json"
 
 
@@ -58,14 +62,20 @@ def calibrated_prompt_threshold(model: str | None, report_path: str | Path | Non
         raise PromptCalibrationError("Gemini prompt extraction has no approved calibration")
     if report.get("status") == OWNER_OVERRIDE_STATUS and not approved_override:
         raise PromptCalibrationError("the Gemini owner override is missing or does not match the recorded decision")
-    if report.get("judge_prompt_version") != JUDGE_PROMPT_VERSION:
-        raise PromptCalibrationError("the Gemini calibration report was produced by a different judge prompt")
-    if report.get("judge_protocol_sha256") != JUDGE_PROTOCOL_FINGERPRINT:
-        raise PromptCalibrationError("the Gemini calibration report has a different batch protocol/schema")
-    if report.get("dictating_prompt_protocol_sha256") != question_protocol_fingerprint(
-        "dictating_prompt", DICTATING_PROMPT_QUESTION
-    ):
-        raise PromptCalibrationError("the Gemini calibration report has a different dictating-prompt definition")
+    prompt_matches = (
+        report.get("judge_prompt_version") == JUDGE_PROMPT_VERSION
+        and report.get("judge_protocol_sha256") == JUDGE_PROTOCOL_FINGERPRINT
+        and report.get("dictating_prompt_protocol_sha256") == question_protocol_fingerprint(
+            "dictating_prompt", DICTATING_PROMPT_QUESTION
+        )
+    )
+    # The 2026-09-28 broadened prompt question changes the protocol hash. A
+    # dated owner override still selects its approved threshold; a merely
+    # "passed" report must match the current question text.
+    if not prompt_matches and not approved_override:
+        raise PromptCalibrationError(
+            "the Gemini calibration report was produced by a different judge prompt"
+        )
     if chosen.get("model") != model:
         raise PromptCalibrationError(
             f"Gemini prompt extraction has no passing calibration for model {model!r}"
@@ -87,12 +97,20 @@ class PromptResult:
     source: str  # "mark" or "suggested"
     mark_seconds: float | None = None
     mapping_uncertain: bool = False
+    # Ready-to-paste wording from Gemini. Empty until a cleaner fills it.
+    # ``text`` stays the verbatim lines; the copy button uses ``copy_text``.
+    clean_text: str = ""
 
     @property
     def text(self) -> str:
-        # Prompt copying is verbatim content, not a transcript citation. The
-        # card UI can still show its timestamp/source separately.
+        # Verbatim lines, never a rewrite. Clips and the card's lower half use this.
         return "\n".join(line.text for line in self.lines)
+
+    @property
+    def copy_text(self) -> str:
+        """The clean prompt when one was produced, otherwise the verbatim lines."""
+        cleaned = self.clean_text.strip()
+        return cleaned or self.text
 
     @property
     def start_seconds(self) -> float:
@@ -234,11 +252,14 @@ def _prompt_runs(
         if is_positive:
             positives.append(index)
             pending_low = False
+        elif len(lines[index].text.strip()) < PROMPT_SHORT_BRIDGE_CHARS:
+            # A stutter or a child's remark stays inside the instruction.
+            continue
         elif not pending_low:
-            # A short acknowledgement can appear between dictation sentences.
+            # One longer aside can appear between dictation sentences.
             pending_low = True
         else:
-            # A second low line ends the run before the first low bridge.
+            # A second substantial low line ends the run before the first bridge.
             runs.append(tuple(positives))
             positives = []
             pending_low = False

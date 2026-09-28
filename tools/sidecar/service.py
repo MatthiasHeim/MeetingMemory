@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .cache import ProbabilityCache
 from .gate import judge_backend_for, load_recording_sidecar
@@ -105,6 +106,7 @@ def prompts_for_stem(
     cache_root: str | Path | None = None,
     gemini_model: str = "gemini-3.8-flash",
     gemini_api_key: str | None = None,
+    clean_prompt: Callable[[str], str] | None = None,
 ) -> list[PromptResult]:
     transcript = load_transcript(stem, transcripts_root)
     settings = load_recording_sidecar(stem, recordings_root)
@@ -125,7 +127,7 @@ def prompts_for_stem(
         if judge.backend == "gemini"
         else PROMPT_THRESHOLD
     )
-    return prompts_from_marks(
+    results = prompts_from_marks(
         transcript.lines,
         settings.marks,
         judge=judge,
@@ -133,6 +135,37 @@ def prompts_for_stem(
         channel_lag_seconds=_channel_alignment_lag_seconds(transcript.payload),
         mic_origin_delay_seconds=settings.mic_first_sample_offset_seconds,
     )
+    return _attach_clean_prompts(results, clean_prompt=clean_prompt, api_key=gemini_api_key)
+
+
+def _attach_clean_prompts(
+    results: list[PromptResult],
+    *,
+    clean_prompt: Callable[[str], str] | None,
+    api_key: str | None,
+) -> list[PromptResult]:
+    """Add a ready-to-paste prompt beside each verbatim card.
+
+    The cleaner is Gemini even when the detector was Jev: rewriting stays on
+    the contract-covered route. A failure leaves ``clean_text`` empty so the
+    card can still show the verbatim lines.
+    """
+    if clean_prompt is None:
+        from .clean_prompt import clean_prompt_text
+
+        def clean_prompt(verbatim: str, _key: str | None = api_key) -> str:
+            return clean_prompt_text(verbatim, api_key=_key)
+
+    attached: list[PromptResult] = []
+    for result in results:
+        clean = ""
+        if result.text.strip():
+            try:
+                clean = clean_prompt(result.text).strip()
+            except Exception:
+                clean = ""
+        attached.append(replace(result, clean_text=clean))
+    return attached
 
 
 def _channel_alignment_lag_seconds(payload: dict[str, Any]) -> float | None:

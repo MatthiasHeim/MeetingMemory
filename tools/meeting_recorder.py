@@ -31,8 +31,10 @@ from sidecar.recorder_support import (
     CalendarRecordingContext,
     append_prompt_mark,
     calendar_context_from_resolution,
+    jev_preference_enabled,
     recent_transcript_title,
     sidecar_metadata_from_calendar,
+    write_jev_preference,
 )
 from sidecar.service import clip_for_stem, prompts_for_stem
 from sidecar.transcript import format_timestamp, recent_transcripts
@@ -432,6 +434,7 @@ class MeetingRecorderApp(rumps.App):
         """Build the menu bar menu."""
         self._start_stop_item = rumps.MenuItem("Start Recording", callback=self.toggle_recording)
         self._prompt_mark_item = rumps.MenuItem("Prompt markieren", callback=None)
+        self._jev_pref_item = rumps.MenuItem("Jev verwenden", callback=self.toggle_jev_preference)
         self.menu = [
             self._start_stop_item,
             self._prompt_mark_item,
@@ -441,11 +444,13 @@ class MeetingRecorderApp(rumps.App):
             rumps.MenuItem("Open Recordings Folder", callback=self.open_recordings),
             rumps.MenuItem("Open Transcripts Folder", callback=self.open_transcripts),
             None,  # Separator
+            self._jev_pref_item,
             rumps.MenuItem("Preferences...", callback=self.open_preferences),
             rumps.MenuItem("List Audio Devices", callback=self.list_devices),
             None,  # Separator
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
+        self._sync_jev_menu_state()
 
     def _set_prompt_mark_available(self, available: bool) -> None:
         """Enable marking only while there is a persisted recording identity."""
@@ -534,51 +539,35 @@ class MeetingRecorderApp(rumps.App):
             print(f"Calendar lookup unavailable for Jev gate: {exc}", file=sys.stderr)
             return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
 
-    @staticmethod
-    def _jev_dialog_message(context: CalendarRecordingContext) -> str:
-        message = (
-            "Standard ist Gemini (vertraglich gedeckt).\n\n"
-            "Jev ist standardmässig ausgeschaltet. Matthias entscheidet für "
-            "diese Aufnahme ausdrücklich selbst."
-        )
-        if context.requires_external_acknowledgement:
-            return message + "\n\nJev: nicht durch Kunden-DPA gedeckt."
-        return message
+    def _jev_preference(self) -> bool:
+        """Read the Preferences switch. Missing config stays off."""
+        return jev_preference_enabled(getattr(self, "config_path", None))
 
-    def _ask_jev_choice(self, context: CalendarRecordingContext) -> bool:
-        """Show the owner-controlled checkbox after capture has already begun."""
-        message = self._jev_dialog_message(context)
+    def _sync_jev_menu_state(self) -> None:
+        item = getattr(self, "_jev_pref_item", None)
+        if item is None:
+            return
         try:
-            import AppKit
-            from Foundation import NSMakeRect
-
-            alert = AppKit.NSAlert.alloc().init()
-            alert.setMessageText_("Jev verwenden?")
-            alert.setInformativeText_(message)
-            alert.addButtonWithTitle_("Weiter")
-            alert.addButtonWithTitle_("Gemini verwenden")
-            checkbox = AppKit.NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 360, 24))
-            checkbox.setButtonType_(getattr(AppKit, "NSSwitchButton", 3))
-            checkbox.setTitle_("Jev für diese Aufnahme verwenden")
-            checkbox.setState_(getattr(AppKit, "NSControlStateValueOff", 0))
-            alert.setAccessoryView_(checkbox)
-            response = alert.runModal()
-            if response != getattr(AppKit, "NSAlertFirstButtonReturn", 1000):
-                return False
-            return bool(
-                checkbox.state() == getattr(AppKit, "NSControlStateValueOn", 1)
-            )
+            item.state = 1 if self._jev_preference() else 0
         except Exception as exc:
-            # This fallback never turns Jev on. It preserves the safe default
-            # when an AppKit checkbox cannot be created.
-            print(f"Jev checkbox unavailable; using Gemini: {exc}", file=sys.stderr)
-            response = rumps.alert(
-                title="Jev verwenden?",
-                message=message,
-                ok="Gemini verwenden",
-                cancel="Weiter",
+            print(f"Could not show Jev preference state: {exc}", file=sys.stderr)
+
+    def toggle_jev_preference(self, sender):
+        """Flip the Jev switch. This is not shown when a recording starts."""
+        enabled = not self._jev_preference()
+        try:
+            write_jev_preference(self.config_path, enabled)
+        except Exception as exc:
+            rumps.notification(
+                title="MeetingRecorder",
+                subtitle="Jev verwenden",
+                message=f"Die Einstellung konnte nicht gespeichert werden: {exc}",
             )
-            return False
+            return
+        try:
+            sender.state = 1 if enabled else 0
+        except Exception:
+            self._sync_jev_menu_state()
 
     def _start_recording(self, sender):
         """Start capture before optional calendar/UI/sidecar work."""
@@ -619,9 +608,10 @@ class MeetingRecorderApp(rumps.App):
         except Exception as exc:
             print(f"Recording-start notification failed: {exc}", file=sys.stderr)
 
-        # The initial policy is deliberately fail-closed.  A failed local
-        # write cannot cancel capture or re-enable Jev later.
-        self._initialise_fail_closed_sidecar(timestamp)
+        # The preference is a local file read. It does not wait on calendar
+        # or on a dialog. A failed write still forces Jev off.
+        self._initialise_recording_choice(timestamp)
+        self._start_live_session()
         try:
             self._start_sidecar_worker(
                 name="meeting-sidecar-mic-origin",
@@ -663,11 +653,12 @@ class MeetingRecorderApp(rumps.App):
         except Exception as notify_exc:
             print(f"Sidecar failure notification failed: {notify_exc}", file=sys.stderr)
 
-    def _initialise_fail_closed_sidecar(self, stem: str) -> None:
+    def _initialise_recording_choice(self, stem: str) -> None:
+        """Write the Preferences switch into the sidecar as soon as capture starts."""
         try:
             initialise_recording_sidecar(
                 stem,
-                jev=False,
+                jev=self._jev_preference(),
                 external_attendees=None,
                 jev_external_acknowledged=False,
                 root=self.recordings_dir,
@@ -677,6 +668,34 @@ class MeetingRecorderApp(rumps.App):
             )
         except Exception as exc:
             self._sidecar_write_failed(stem, exc)
+
+    def _start_live_session(self) -> None:
+        """Open the side window and start the live worker after capture is up.
+
+        Tests build the app without a run loop. They skip the real panel unless
+        they inject ``_live_session_factory``. A failure here cannot stop
+        recording.
+        """
+        factory = getattr(self, "_live_session_factory", None)
+        if factory is None and os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        try:
+            if factory is None:
+                from sidecar.live_session import RecordingLiveSession
+
+                self._live_session = RecordingLiveSession(
+                    self.recorder,
+                    api_key=self._gemini_api_key(),
+                    copy_text=self._copy_to_clipboard,
+                )
+                self._live_session.start()
+            else:
+                self._live_session = factory(self)
+                start = getattr(self._live_session, "start", None)
+                if callable(start):
+                    start()
+        except Exception as exc:
+            print(f"Live sidecar unavailable; recording continues: {exc}", file=sys.stderr)
 
     def _persist_mic_first_sample_offset(
         self, stem: str, mark_zero_monotonic: float
@@ -701,38 +720,28 @@ class MeetingRecorderApp(rumps.App):
             self._sidecar_write_failed(stem, exc)
 
     def _resolve_calendar_after_capture(self, stem: str, output_file: Path) -> None:
+        """Store calendar metadata. This never opens a dialog and never changes ``jev``."""
         context = self._calendar_context_for_start(output_file, timeout_seconds=3.0)
-        self._dispatch_ui(lambda: self._offer_jev_choice_for_recording(stem, context))
-
-    def _offer_jev_choice_for_recording(
-        self, stem: str, context: CalendarRecordingContext
-    ) -> None:
-        """Amend the sidecar only after the asynchronous calendar dialog."""
-        if (
-            not self.recorder.is_recording
-            or stem != getattr(self, "_recording_stem", None)
-            or stem in getattr(self, "_sidecar_write_failed_stems", set())
-        ):
-            return
-        jev_choice = self._ask_jev_choice(context)
-        if not self.recorder.is_recording or stem != getattr(self, "_recording_stem", None):
+        if stem in getattr(self, "_sidecar_write_failed_stems", set()):
             return
         try:
             amend_recording_sidecar(
                 stem,
                 root=self.recordings_dir,
-                jev=jev_choice,
                 external_attendees=context.external_attendees,
-                jev_external_acknowledged=(
-                    jev_choice and context.requires_external_acknowledgement
-                ),
                 metadata=sidecar_metadata_from_calendar(context),
             )
         except Exception as exc:
             self._sidecar_write_failed(stem, exc)
 
     def _stop_recording(self, sender):
-        """Stop the current recording."""
+        """Stop the current recording. The live window stays open."""
+        session = getattr(self, "_live_session", None)
+        if session is not None:
+            try:
+                session.stop()
+            except Exception as exc:
+                print(f"Live sidecar stop failed: {exc}", file=sys.stderr)
         output_file = self.recorder.stop()
 
         # Calculate duration
@@ -1006,7 +1015,7 @@ class MeetingRecorderApp(rumps.App):
 
         def copy_selected_prompt() -> None:
             try:
-                self._copy_to_clipboard(prompt.text)
+                self._copy_to_clipboard(prompt.copy_text)
             except Exception as exc:
                 self._notify_from_worker(
                     subtitle="Prompt konnte nicht kopiert werden",

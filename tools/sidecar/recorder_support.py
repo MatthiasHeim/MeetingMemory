@@ -8,6 +8,7 @@ without opening an audio stream or a macOS window.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,11 @@ class CalendarRecordingContext:
 
     @property
     def requires_external_acknowledgement(self) -> bool:
-        """External and unresolved meetings need the DPA warning/acknowledgement."""
+        """Whether attendance is external or unresolved.
+
+        Since 2026-09-28 this is metadata only. The Preferences switch writes
+        ``jev`` and the offline gate honours that boolean alone.
+        """
         return self.external_attendees is not False
 
 
@@ -164,3 +169,40 @@ def recent_transcript_title(
         if isinstance(value, str) and value.strip():
             return value.strip()
     return title or transcript.stem
+
+
+PREFERENCE_FILENAME = "sidecar-preferences.json"
+
+
+def preference_path(config_path: str | Path) -> Path:
+    """Store the Jev switch beside the recorder config, not inside it.
+
+    Rewriting ``config.yaml`` would drop comments. The switch is a separate
+    JSON file so the default stays off until Matthias turns it on.
+    """
+    return Path(config_path).expanduser().with_name(PREFERENCE_FILENAME)
+
+
+def jev_preference_enabled(config_path: str | Path | None) -> bool:
+    """Return the Preferences switch. Missing or malformed files stay off."""
+    if config_path is None:
+        return False
+    path = preference_path(config_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return isinstance(raw, dict) and raw.get("use_jev") is True
+
+
+def write_jev_preference(config_path: str | Path, enabled: bool) -> Path:
+    """Persist the Preferences switch. The value must be an exact boolean."""
+    if type(enabled) is not bool:
+        raise ValueError("Jev preference must be a boolean")
+    path = preference_path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"use_jev": enabled}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path

@@ -33,10 +33,8 @@ class RecordingSidecar:
     # malformed.  It must remain distinct from an explicit internal-only
     # ``false`` so the Jev route can fail closed.
     external_attendees: bool | None = None
-    # A recorded acknowledgement is required when the owner explicitly opts
-    # into Jev for an external or unresolved meeting.  It is deliberately a
-    # separate boolean from the checkbox so the offline gate can distinguish
-    # a normal internal choice from an informed external choice.
+    # Kept so older sidecars stay readable. Since 2026-09-28 the Preferences
+    # switch alone authorises Jev; this flag is no longer required.
     jev_external_acknowledged: bool = False
     marks: tuple[float, ...] = ()
     # The first mic callback is later than the app's mark-zero boundary.  The
@@ -359,7 +357,8 @@ def judge_backend_for(
 
     Gemini is always the default. ``--judge jev`` is an offline override and
     succeeds only when this exact recording persisted an explicit ``jev: true``
-    choice. A missing/corrupt JSON is therefore indistinguishable from opt-out.
+    choice from the Preferences switch. External attendance does not withdraw
+    that choice. A missing or corrupt JSON is indistinguishable from opt-out.
     """
     normalised = (requested or "gemini").lower()
     if normalised not in {"gemini", "jev"}:
@@ -373,26 +372,17 @@ def judge_backend_for(
     if not record.payload or record.payload.get("recording_stem") != stem:
         raise JudgeGateError("Jev requires a sidecar bound to this recording stem")
     raw_external = record.payload.get("external_attendees", _UNSET)
-    raw_acknowledgement = record.payload.get("jev_external_acknowledged", _UNSET)
-    if (
-        raw_external is _UNSET
-        or (raw_external is not None and type(raw_external) is not bool)
-        or type(raw_acknowledgement) is not bool
-    ):
+    if raw_external is _UNSET or (raw_external is not None and type(raw_external) is not bool):
         raise JudgeGateError(
-            "Jev requires explicit tri-state attendance and acknowledgement fields"
+            "Jev requires an explicit tri-state attendance field"
         )
     if not record.jev:
         raise JudgeGateError(
             "Jev is disabled for this recording; use Gemini or record an explicit jev: true choice"
         )
-    if not (
-        record.external_attendees is False
-        or record.jev_external_acknowledged is True
-    ):
-        raise JudgeGateError(
-            "Jev requires an internal recording or an explicit external-meeting acknowledgement"
-        )
+    # 2026-09-28: the Preferences switch is the authority. A stored ``jev: true``
+    # authorises Jev for this recording. External attendance stays metadata;
+    # it no longer needs a separate acknowledgement.
     return "jev"
 
 

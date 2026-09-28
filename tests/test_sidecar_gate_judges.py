@@ -115,22 +115,23 @@ def test_sidecar_policy_flags_and_marks_reject_ambiguous_values(tmp_path):
         append_mark("2026-09-08_14-31-16", float("inf"), root=tmp_path)
 
 
-def test_gate_rejects_external_recording_even_when_jev_was_requested(tmp_path):
+def test_gate_authorises_jev_from_preference_even_with_external_attendees(tmp_path):
+    """2026-09-28: jev true is enough. External attendance is metadata only."""
     _FakeJev.constructed = 0
     initialise_recording_sidecar(
         "2026-09-08_14-31-16", jev=True, external_attendees=True, root=tmp_path
     )
 
-    with pytest.raises(JudgeGateError):
-        create_judge(
-            "2026-09-08_14-31-16",
-            requested="jev",
-            recordings_root=tmp_path,
-            cache_root=tmp_path / "cache",
-            gemini_factory=_FakeGemini,
-            jev_factory=_FakeJev,
-        )
-    assert _FakeJev.constructed == 0
+    judge = create_judge(
+        "2026-09-08_14-31-16",
+        requested="jev",
+        recordings_root=tmp_path,
+        cache_root=tmp_path / "cache",
+        gemini_factory=_FakeGemini,
+        jev_factory=_FakeJev,
+    )
+    assert judge.backend == "jev"
+    assert _FakeJev.constructed == 1
 
 
 @pytest.mark.parametrize(

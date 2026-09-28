@@ -32,7 +32,7 @@ Questions = Mapping[str, QuestionInput]
 
 # Bump whenever the provider system prompt, JSON schema, batching semantics, or
 # score interpretation changes. It is part of each question cache key.
-JUDGE_PROMPT_VERSION = "sidecar-judge-v3-2026-09-26"
+JUDGE_PROMPT_VERSION = "sidecar-judge-v4-2026-09-28"
 GEMINI_BATCH_SIZE = 20
 GEMINI_MAX_BATCH_WORKERS = 8
 APPROVED_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/"
@@ -141,7 +141,7 @@ def _batch_prompt(
     payload = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
     return f"""You are a careful meeting-transcript classifier. Return a probability from 0 to 1 for each requested binary question and each item. Assess only the current line; previous_lines are context for resolving pronouns or references, not separate evidence. Be conservative with greetings, acknowledgements, filler, process talk, and vague semantic overlap.
 
-For a dictated-prompt question, count text that is itself a reusable instruction/prompt the speaker dictates. Do not count a sentence merely talking about prompts, a lead-in such as 'I will record this prompt', or an explanation around a prompt. English prompt text embedded in Swiss German still counts.
+For a dictated-prompt question, count an instruction the speaker wants an AI, agent, or coding assistant to carry out. Count indirect Swiss German or Hochdeutsch such as telling Claude or an agent what it should do, and English dictation inside dialect. Do not count mere talk that names an AI but gives it no task. A recording aside such as 'I will record this prompt' is not itself the prompt.
 
 Questions:
 {question_text}
@@ -352,6 +352,29 @@ def _is_approved_gemini_destination(value: str) -> bool:
     return port in (None, 443) and not parsed.username and not parsed.password
 
 
+def pinned_gemini_client(api_key: str | None):
+    """Open the recorder's Gemini client pinned to the approved endpoint.
+
+    Live transcription and clean-prompt generation use the same key and the
+    same pin as ``GeminiJudge``. There is no caller-supplied base URL.
+    """
+    key = api_key or os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise JudgeError("GEMINI_API_KEY is not configured")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:  # pragma: no cover - depends on local installation
+        raise JudgeError("google-genai is required for the Gemini client") from exc
+    client = genai.Client(
+        api_key=key,
+        vertexai=False,
+        http_options=_pinned_client_http_options(types),
+    )
+    _verify_pinned_gemini_destination(client)
+    return client, types
+
+
 def _verify_pinned_gemini_destination(client: Any) -> str | None:
     """Fail before a request if an inspectable client escaped the Google API."""
     base_url = _visible_client_base_url(client)
@@ -402,24 +425,9 @@ class GeminiJudge:
             if self.effective_base_url is None:
                 raise JudgeError("Gemini judge client has no verifiable Google API destination")
             return
-        key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not key:
-            raise JudgeError("GEMINI_API_KEY is not configured")
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError as exc:  # pragma: no cover - depends on local installation
-            raise JudgeError("google-genai is required for GeminiJudge") from exc
         # Explicit client options outrank GOOGLE_GEMINI_BASE_URL inside the
-        # google-genai SDK.  Do not inherit a process-wide endpoint override:
-        # this judge may carry client transcript text only to the Google Gemini
-        # Developer API, never an OpenRouter/proxy destination.
-        self.client = genai.Client(
-            api_key=key,
-            vertexai=False,
-            http_options=_pinned_client_http_options(types),
-        )
-        self.types = types
+        # google-genai SDK.  Do not inherit a process-wide endpoint override.
+        self.client, self.types = pinned_gemini_client(api_key)
         self.effective_base_url = _verify_pinned_gemini_destination(self.client)
 
     def _generate(self, prompt: str, schema: dict[str, Any]) -> Any:
