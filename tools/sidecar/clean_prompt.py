@@ -17,7 +17,7 @@ CLEAN_PROMPT_INSTRUCTIONS = """Turn these dictated meeting lines into one clean 
 Keep the intent only. Remove filler, hesitation, greetings, names of bystanders, and asides.
 The lines may be consecutive pieces of one instruction. Include every action that is actually present.
 Do not add requirements that were not asked for.
-Write the prompt in English when it is aimed at an AI, coding assistant, or agent, unless the speaker clearly asks for German.
+Write the prompt in the language the speaker used: Swiss German or Standard German becomes Standard German (Hochdeutsch, Swiss spelling with "ss" instead of "ß"); English stays English. Only switch language when the speaker clearly asks for it.
 Return JSON {"prompt": "<the prompt>"} and nothing else.
 """
 

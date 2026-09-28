@@ -261,8 +261,8 @@ the same dictation onto a second card. An unfinished line that tells Claude
 or an agent what to do stays on that card when the same speaker continues
 it within 20 seconds, even if one judge call scored the opening under the
 threshold. Gemini then writes the
-clean prompt (intent only; English for AI tools unless the speaker clearly
-wants German). Clips stay verbatim.
+clean prompt (intent only; in the language spoken: German or Swiss German becomes Hochdeutsch, English stays English, unless the speaker clearly
+asks for another language). Clips stay verbatim.
 
 Headless replay, no window:
 
@@ -304,7 +304,7 @@ need an attended macOS session. Before merge:
 4. During or after the recording, type a topic and press **Clip kopieren**.
    Confirm the clipboard is verbatim transcript text with the fixed header.
 5. Dictate an indirect instruction (“ich würde Claude sagen, er soll …”).
-   Confirm a card appears, **Kopieren** pastes a clean English prompt, and the
+   Confirm a card appears, **Kopieren** pastes a clean prompt in the spoken language, and the
    verbatim lines are visible under it. Run **Prompts…** on the finished
    transcript and confirm that path also copies the clean prompt.
 6. Mark once from the menu and once with `⌃⌥⌘P`. Confirm both numeric marks
