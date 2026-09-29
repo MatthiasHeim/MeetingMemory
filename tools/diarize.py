@@ -13,6 +13,7 @@ import multiprocessing as mp
 import queue as pyqueue
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -101,6 +102,56 @@ def _decode_to_mono_wav(audio_path: Path, work_dir: Path) -> Path:
     return wav_path
 
 
+def _worker_repo_root() -> Path:
+    """Repository root. This module lives in tools/; the worker does not."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _ensure_worker_importable() -> None:
+    """Put the repo root on sys.path.
+
+    launchd starts ``python tools/transcribe_watcher.py``. That makes
+    ``sys.path[0]`` the tools directory, so ``import pyannote_mp_worker``
+    fails even though the module sits at the repository root. The failure
+    has been ``No module named 'pyannote_mp_worker'`` since the watcher
+    moved under tools/.
+    """
+    root = str(_worker_repo_root())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def _pyannote_child(args, q) -> None:
+    """Spawn target. Defined here so the child can import it from tools/.
+
+    The child then adds the repo root and only then imports the worker.
+    Passing ``pyannote_mp_worker.pyannote_proc_entrypoint`` as the target
+    would require that import to succeed in the parent, which is the bug.
+    """
+    try:
+        _ensure_worker_importable()
+        if args.get("import_probe"):
+            import importlib.util
+
+            spec = importlib.util.find_spec("pyannote_mp_worker")
+            q.put(
+                {
+                    "type": "result",
+                    "ok": spec is not None and bool(getattr(spec, "origin", None)),
+                    "probe": getattr(spec, "origin", None),
+                }
+            )
+            return
+        from pyannote_mp_worker import pyannote_proc_entrypoint
+
+        pyannote_proc_entrypoint(args, q)
+    except Exception as exc:
+        try:
+            q.put({"type": "result", "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+
+
 def run_pyannote_diarization(
     audio_path: Path,
     num_speakers: Optional[int] = None,
@@ -134,14 +185,14 @@ def run_pyannote_diarization(
         wav_path = _decode_to_mono_wav(audio_path, work_dir)
         ctx = mp.get_context("spawn")
         q = ctx.Queue()
-        from pyannote_mp_worker import pyannote_proc_entrypoint
+        _ensure_worker_importable()
 
         args = {
             "audio_path": str(wav_path),
             "num_speakers": int(num_speakers) if num_speakers else None,
             "device": device,
         }
-        proc = ctx.Process(target=pyannote_proc_entrypoint, args=(args, q))
+        proc = ctx.Process(target=_pyannote_child, args=(args, q))
         proc.start()
 
         deadline = time.time() + timeout_seconds
