@@ -33,8 +33,10 @@ from mic_writer import (
     MIC_CHECKPOINT_SECONDS,
     MIC_QUEUE_SECONDS,
     MIC_RING_SECONDS,
+    DiskWriteSuppressed,
     IncrementalWavWriter,
     SampleQueue,
+    recover_wav,
 )
 from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar
 from sidecar.recorder_support import (
@@ -167,6 +169,171 @@ def get_audio_device_index(device_name: str) -> Optional[int]:
     return None
 
 
+def _mono_int16(block) -> np.ndarray:
+    """One channel of int16 samples from a callback block or a recovered array."""
+    array = np.asarray(block)
+    if array.size == 0:
+        return np.zeros(0, dtype=np.int16)
+    if array.ndim == 2:
+        array = array[:, 0]
+    return np.ascontiguousarray(array, dtype=np.int16).reshape(-1)
+
+
+_ORPHAN_MIC_SUFFIX = ".mic.wav"
+_ORPHAN_SYS_SUFFIX = ".sys.wav"
+
+
+def recover_orphaned_captures(
+    tmp_dir: Path,
+    recordings_dir: Path,
+    *,
+    notify=None,
+) -> list[Path]:
+    """Move crashed mic/system WAVs from ``.tmp`` into ``Recordings``.
+
+    An orphan is deleted only after a playable file has been written. A file
+    that cannot be read stays where it is. ``notify`` is a non-modal callback
+    ``(path) -> None``; it must not open a dialog.
+    """
+    tmp_dir = Path(tmp_dir)
+    recordings_dir = Path(recordings_dir)
+    if not tmp_dir.is_dir():
+        return []
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    grouped: dict[str, dict[str, Path]] = {}
+    for path in sorted(tmp_dir.iterdir()):
+        if not path.is_file():
+            continue
+        name = path.name
+        if name.endswith(_ORPHAN_MIC_SUFFIX):
+            stem = name[: -len(_ORPHAN_MIC_SUFFIX)]
+            kind = "mic"
+        elif name.endswith(_ORPHAN_SYS_SUFFIX):
+            stem = name[: -len(_ORPHAN_SYS_SUFFIX)]
+            kind = "sys"
+        else:
+            continue
+        if not stem or stem in {".", ".."} or "/" in stem or stem.startswith("."):
+            continue
+        grouped.setdefault(stem, {})[kind] = path
+    recovered: list[Path] = []
+    for stem, files in sorted(grouped.items()):
+        dest = _recover_one_orphan(stem, files, tmp_dir, recordings_dir)
+        if dest is None:
+            continue
+        recovered.append(dest)
+        if notify is not None:
+            try:
+                notify(dest)
+            except Exception as exc:
+                print(f"Recovery notification failed: {exc}", file=sys.stderr)
+    return recovered
+
+
+def _recover_one_orphan(
+    stem: str,
+    files: dict[str, Path],
+    tmp_dir: Path,
+    recordings_dir: Path,
+) -> Optional[Path]:
+    loaded: dict[str, tuple[np.ndarray, int]] = {}
+    for kind, path in files.items():
+        try:
+            pcm, rate = recover_wav(path)
+        except (OSError, ValueError):
+            continue
+        if rate <= 0 or pcm.size == 0:
+            continue
+        loaded[kind] = (pcm, int(rate))
+    if not loaded:
+        return None
+    dest = _recovered_destination(recordings_dir, stem)
+    partial = dest.with_name(f".{dest.stem}.partial.wav")
+    produced = False
+    consumed: list[Path] = []
+    try:
+        if "mic" in loaded and "sys" in loaded:
+            produced = _merge_recovered_pair(
+                stem, loaded["mic"], loaded["sys"], tmp_dir, partial
+            )
+            if produced:
+                consumed = [files["mic"], files["sys"]]
+        if not produced and "mic" in loaded:
+            pcm, rate = loaded["mic"]
+            sf.write(str(partial), pcm, rate, subtype="PCM_16", format="WAV")
+            produced = partial.exists() and partial.stat().st_size > 44
+            if produced:
+                consumed = [files["mic"]]
+        if not produced and "sys" in loaded:
+            pcm, rate = loaded["sys"]
+            sf.write(str(partial), pcm, rate, subtype="PCM_16", format="WAV")
+            produced = partial.exists() and partial.stat().st_size > 44
+            if produced:
+                consumed = [files["sys"]]
+        if not produced:
+            return None
+        os.replace(partial, dest)
+    except Exception as exc:
+        print(f"Could not recover {stem}: {exc}", file=sys.stderr)
+        return None
+    finally:
+        if partial.exists():
+            partial.unlink()
+    if not dest.exists() or dest.stat().st_size <= 44:
+        return None
+    for path in consumed:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            print(f"Recovered {dest.name} but could not remove {path.name}: {exc}", file=sys.stderr)
+    return dest
+
+
+def _recovered_destination(recordings_dir: Path, stem: str) -> Path:
+    plain = recordings_dir / f"{stem}.wav"
+    if not plain.exists():
+        return plain
+    recovered = recordings_dir / f"{stem}-recovered.wav"
+    if not recovered.exists():
+        return recovered
+    return recordings_dir / f"{stem}-recovered-{time.time_ns()}.wav"
+
+
+def _merge_recovered_pair(
+    stem: str,
+    mic: tuple[np.ndarray, int],
+    system: tuple[np.ndarray, int],
+    tmp_dir: Path,
+    dest: Path,
+) -> bool:
+    """Merge recovered mic and system PCM. False leaves the caller on the mic fallback."""
+    mic_pcm, mic_rate = mic
+    sys_pcm, sys_rate = system
+    if mic_rate != sys_rate or mic_rate <= 0:
+        return False
+    mic_path = tmp_dir / f".{stem}.recover-mic.wav"
+    sys_path = tmp_dir / f".{stem}.recover-sys.wav"
+    try:
+        sf.write(str(mic_path), mic_pcm, mic_rate, subtype="PCM_16", format="WAV")
+        sf.write(str(sys_path), sys_pcm, sys_rate, subtype="PCM_16", format="WAV")
+        duration = max(mic_pcm.shape[0], sys_pcm.shape[0]) / float(mic_rate)
+        result = subprocess.run(
+            [AudioRecorder._FFMPEG, "-y",
+             "-i", str(mic_path), "-i", str(sys_path),
+             "-filter_complex", merge_filter(duration),
+             "-map", "[a]", "-c:a", "pcm_s16le", str(dest)],
+            capture_output=True, text=True,
+        )
+        return result.returncode == 0 and dest.exists() and dest.stat().st_size > 44
+    except Exception:
+        return False
+    finally:
+        for path in (mic_path, sys_path):
+            if path.exists():
+                path.unlink()
+
+
 class AudioRecorder:
     """Handles audio recording in a background thread."""
 
@@ -217,6 +384,7 @@ class AudioRecorder:
         self._mic_checkpoint_seconds = float(
             audio_cfg.get("mic_checkpoint_seconds", MIC_CHECKPOINT_SECONDS)
         )
+        self._mic_queue_seconds = float(audio_cfg.get("mic_queue_seconds", MIC_QUEUE_SECONDS))
         self._mic_queue = None
         self._mic_writer = None
         self._mic_writer_thread = None
@@ -225,6 +393,16 @@ class AudioRecorder:
         self._mic_disk_capture = False
         self._mic_dropped_blocks = 0
         self._ring_samples = 0
+        self._mic_io_lock = threading.Lock()
+        self._mic_ram_fallback = False
+        self._mic_writer_failed = False
+        self._mic_ram_remainder: list = []
+        self._mic_inflight = None
+        self._mic_inflight_mark = 0
+        self._mic_block_kept = False
+        self._mic_writer_close_when_done = False
+        self._mic_writer_join_timeout = 30.0
+        self._mic_writer_inflight_join_timeout = 5.0
 
     def _sys_proc_running(self) -> bool:
         return subprocess.run(
@@ -248,6 +426,13 @@ class AudioRecorder:
         self._mic_writer_stop.clear()
         self._mic_writer_abandon.clear()
         self._mic_disk_capture = False
+        self._mic_ram_fallback = False
+        self._mic_writer_failed = False
+        self._mic_ram_remainder = []
+        self._mic_inflight = None
+        self._mic_inflight_mark = 0
+        self._mic_block_kept = False
+        self._mic_writer_close_when_done = False
         self._mic_queue = None
         self._mic_writer = None
         self._capture_meta = {"schema_version": 1, "started_wall_time": time.time(),
@@ -310,12 +495,22 @@ class AudioRecorder:
             return None
         self.recording = False
 
-        # Stop mic. The writer thread already has the mic track on disk.
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-        self._finish_mic_writer()
+        # Stop mic. A writer failure must not skip the tap, the merge, or the archive.
+        try:
+            if self.stream:
+                self.stream.stop()
+                self.stream.close()
+                self.stream = None
+        except Exception as exc:
+            print(f"Mic stream stop failed: {exc}", file=sys.stderr)
+        try:
+            self._finish_mic_writer()
+        except Exception as exc:
+            print(f"Mic writer finish failed: {exc}", file=sys.stderr)
+        try:
+            self._materialize_mic_track()
+        except Exception as exc:
+            print(f"Mic track rebuild failed: {exc}", file=sys.stderr)
         mic_ok = False
         if (
             self._mic_disk_capture
@@ -333,12 +528,15 @@ class AudioRecorder:
 
         # Stop system tap via SIGINT (graceful teardown => valid WAV + tap freed).
         if self._sys_active:
-            subprocess.run(["pkill", "-INT", "-f", self._PROC_PATTERN])
-            for _ in range(60):  # up to ~6s for clean teardown
-                if not self._sys_proc_running():
-                    break
-                time.sleep(0.1)
-            time.sleep(0.3)
+            try:
+                subprocess.run(["pkill", "-INT", "-f", self._PROC_PATTERN])
+                for _ in range(60):  # up to ~6s for clean teardown
+                    if not self._sys_proc_running():
+                        break
+                    time.sleep(0.1)
+                time.sleep(0.3)
+            except Exception as exc:
+                print(f"System-audio tap stop failed: {exc}", file=sys.stderr)
         sys_ok = (self._sys_wav.exists() and self._sys_wav.stat().st_size > 1000)
 
         # Merge into a temp file, then atomically move into the watched dir so
@@ -434,7 +632,7 @@ class AudioRecorder:
         """Callback for the microphone input stream.
 
         Copies the block into a bounded queue and a short ring. Disk I/O
-        stays on the writer thread; a full queue is dropped, never waited on.
+        stays on the writer thread. A full queue keeps the block in RAM.
         """
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
@@ -445,21 +643,7 @@ class AudioRecorder:
                 self._mic_first_sample_monotonic = time.monotonic()
                 self._mic_first_sample_event.set()
             block = indata.copy()
-            mic_queue = getattr(self, "_mic_queue", None)
-            if mic_queue is not None:
-                try:
-                    mic_queue.put_nowait(block)
-                except queue.Full:
-                    self._mic_dropped_blocks = getattr(self, "_mic_dropped_blocks", 0) + 1
-                    discontinuities = self._capture_meta.get("discontinuities") if isinstance(
-                        getattr(self, "_capture_meta", None), dict
-                    ) else None
-                    if isinstance(discontinuities, list):
-                        discontinuities.append({
-                            "frame": self._mic_frames,
-                            "reason": "mic_queue_full",
-                            "status": str(status),
-                        })
+            self._enqueue_mic_block(block)
             self._keep_recent_block(block)
             adc = float(time_info.inputBufferAdcTime)
             gap = None if self._previous_adc_end is None else adc - self._previous_adc_end
@@ -487,10 +671,55 @@ class AudioRecorder:
             removed = self.audio_data.popleft()
             self._ring_samples -= int(np.asarray(removed).shape[0])
 
+    def _enqueue_mic_block(self, block) -> None:
+        """Queue one callback block, or keep it in RAM when the disk path cannot."""
+        mic_queue = getattr(self, "_mic_queue", None)
+        if mic_queue is None:
+            return
+        with self._mic_io_lock:
+            if self._mic_ram_fallback or self._mic_writer_failed:
+                if self._mic_ram_fallback and not self._mic_writer_failed:
+                    self._note_queue_full(block)
+                self._mic_ram_remainder.append(block)
+                return
+            try:
+                mic_queue.put_nowait(block)
+            except queue.Full:
+                self._mic_ram_fallback = True
+                self._note_queue_full(block)
+                self._mic_ram_remainder.append(block)
+
+    def _note_queue_full(self, block) -> None:
+        """Record one merged range for a run of queue overflows. The samples are kept."""
+        samples = int(np.asarray(block).shape[0])
+        self._mic_dropped_blocks = getattr(self, "_mic_dropped_blocks", 0) + 1
+        meta = getattr(self, "_capture_meta", None)
+        discontinuities = meta.get("discontinuities") if isinstance(meta, dict) else None
+        if not isinstance(discontinuities, list):
+            return
+        frame = int(getattr(self, "_mic_frames", 0) or 0)
+        if discontinuities:
+            last = discontinuities[-1]
+            if (
+                isinstance(last, dict)
+                and last.get("reason") == "mic_queue_full"
+                and int(last.get("end_frame", -1)) == frame
+            ):
+                last["end_frame"] = frame + samples
+                last["samples"] = int(last.get("samples", 0)) + samples
+                return
+        discontinuities.append({
+            "start_frame": frame,
+            "end_frame": frame + samples,
+            "samples": samples,
+            "reason": "mic_queue_full",
+            "kept": "ram",
+        })
+
     def _start_mic_writer(self) -> None:
         """Open the incremental mic WAV and start the thread that fills it."""
         try:
-            mic_queue = SampleQueue(max(1, int(self.sample_rate * MIC_QUEUE_SECONDS)))
+            mic_queue = SampleQueue(max(1, int(self.sample_rate * self._mic_queue_seconds)))
             writer = IncrementalWavWriter(
                 self._mic_wav,
                 self.sample_rate,
@@ -519,6 +748,20 @@ class AudioRecorder:
 
     def _mic_writer_loop(self) -> None:
         writer = self._mic_writer
+        try:
+            self._mic_writer_body(writer)
+        finally:
+            if writer is None:
+                return
+            try:
+                if self._mic_writer_abandon.is_set():
+                    writer.abort()
+                elif self._mic_writer_close_when_done:
+                    writer.close()
+            except Exception as exc:
+                print(f"Mic writer cleanup failed: {exc}", file=sys.stderr)
+
+    def _mic_writer_body(self, writer) -> None:
         mic_queue = self._mic_queue
         if writer is None or mic_queue is None:
             return
@@ -528,13 +771,15 @@ class AudioRecorder:
             try:
                 block = mic_queue.get(0.05)
             except queue.Empty:
-                if self._mic_writer_stop.is_set():
+                if self._mic_writer_stop.is_set() or self._mic_ram_fallback:
                     break
                 continue
             if self._mic_writer_abandon.is_set():
+                self._spill_block_locked(block)
                 return
-            writer.write(block)
-        if self._mic_writer_abandon.is_set():
+            if not self._write_queued_block(writer, block):
+                return
+        if self._mic_writer_abandon.is_set() or self._mic_writer_failed:
             return
         while True:
             try:
@@ -542,29 +787,211 @@ class AudioRecorder:
             except queue.Empty:
                 break
             if self._mic_writer_abandon.is_set():
+                self._spill_block_locked(block)
                 return
+            if not self._write_queued_block(writer, block):
+                return
+        try:
+            writer.flush()
+        except DiskWriteSuppressed:
+            return
+        except Exception as exc:
+            print(f"Mic checkpoint failed; keeping the rest in memory: {exc}", file=sys.stderr)
+            self._fail_disk_writer(writer, None)
+
+    def _write_queued_block(self, writer, block) -> bool:
+        """Write one queued block. False means the disk path has stopped."""
+        with self._mic_io_lock:
+            if self._mic_writer_failed:
+                self._mic_ram_remainder.append(block)
+                return True
+            self._mic_inflight = block
+            self._mic_inflight_mark = int(writer.samples_written)
+            self._mic_block_kept = False
+        try:
             writer.write(block)
-        writer.flush()
+            return True
+        except DiskWriteSuppressed as exc:
+            self._keep_suppressed_block(writer, block, exc.consumed)
+            with self._mic_io_lock:
+                self._mic_ram_fallback = True
+                self._append_queued_blocks_locked()
+            return False
+        except Exception as exc:
+            print(f"Mic writer failed; keeping the rest in memory: {exc}", file=sys.stderr)
+            self._fail_disk_writer(writer, block)
+            return False
+        finally:
+            with self._mic_io_lock:
+                self._mic_inflight = None
+
+    def _keep_suppressed_block(self, writer, block, consumed: bool) -> None:
+        with self._mic_io_lock:
+            pending = writer.take_pending()
+            inflight_n = int(np.asarray(block).shape[0]) if block is not None else 0
+            if pending is not None and len(pending):
+                if consumed and self._mic_block_kept and len(pending) >= inflight_n:
+                    older = pending[:-inflight_n]
+                    if len(older):
+                        self._mic_ram_remainder.insert(0, older)
+                elif not (consumed and self._mic_block_kept):
+                    self._mic_ram_remainder.insert(0, pending)
+            elif not self._mic_block_kept and block is not None:
+                self._mic_ram_remainder.insert(0, block)
+            self._mic_block_kept = False
+
+    def _spill_block_locked(self, block) -> None:
+        with self._mic_io_lock:
+            self._mic_ram_remainder.append(block)
+
+    def _fail_disk_writer(self, writer, block) -> None:
+        """Keep every sample the file does not already contain, then stop writing."""
+        with self._mic_io_lock:
+            self._mic_ram_fallback = True
+            self._mic_writer_failed = True
+            older: list = []
+            if writer is not None:
+                writer.suppress_disk = True
+                pending = writer.take_pending()
+                if pending is not None and len(pending):
+                    older.append(pending)
+                elif block is not None and int(writer.samples_written) == int(self._mic_inflight_mark):
+                    older.append(block)
+            elif block is not None:
+                older.append(block)
+            queued = self._take_queued_blocks_locked()
+            self._mic_ram_remainder = older + queued + self._mic_ram_remainder
+
+    def _take_queued_blocks_locked(self) -> list:
+        mic_queue = self._mic_queue
+        if mic_queue is None:
+            return []
+        drained = []
+        while True:
+            try:
+                drained.append(mic_queue.get(0))
+            except queue.Empty:
+                break
+        return drained
+
+    def _append_queued_blocks_locked(self) -> None:
+        queued = self._take_queued_blocks_locked()
+        if queued:
+            self._mic_ram_remainder.extend(queued)
+
+    def _handoff_mic_queue_to_ram(self) -> None:
+        """Move blocks the writer has not started onto the RAM remainder."""
+        with self._mic_io_lock:
+            self._mic_ram_fallback = True
+            drained = []
+            mic_queue = self._mic_queue
+            if mic_queue is not None:
+                while True:
+                    try:
+                        drained.append(mic_queue.get(0))
+                    except queue.Empty:
+                        break
+            if drained:
+                self._mic_ram_remainder = drained + self._mic_ram_remainder
+
+    def _steal_uncommitted_inflight(self) -> None:
+        """Copy the block stuck inside write() when it is not in the file yet."""
+        with self._mic_io_lock:
+            writer = self._mic_writer
+            block = self._mic_inflight
+            if writer is None or block is None:
+                return
+            if int(writer.samples_written) != int(self._mic_inflight_mark):
+                return
+            self._mic_ram_remainder.insert(0, block)
+            self._mic_block_kept = True
 
     def _finish_mic_writer(self) -> None:
-        """Drain the queue and close the WAV. A crash abandon does not drain."""
+        """Drain the queue and close the WAV. Never raises."""
+        try:
+            self._finish_mic_writer_impl()
+        except Exception as exc:
+            print(f"Mic writer finish failed: {exc}", file=sys.stderr)
+
+    def _finish_mic_writer_impl(self) -> None:
+        """Drain the queue and close the WAV.
+
+        The file handle is closed only after the writer thread has exited.
+        A thread that is still inside write() keeps the handle; its unwritten
+        blocks are handed to the RAM remainder instead.
+        """
+        writer = self._mic_writer
+        thread = self._mic_writer_thread
         if self._mic_writer_abandon.is_set():
-            thread = self._mic_writer_thread
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2)
-            writer = self._mic_writer
-            if writer is not None:
-                writer.abort()
+            if thread is not None and thread.is_alive():
+                if writer is not None:
+                    writer.suppress_disk = True
             return
-        if not self._mic_disk_capture and self._mic_writer is None:
+        if not self._mic_disk_capture and writer is None:
             return
         self._mic_writer_stop.set()
-        thread = self._mic_writer_thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=30)
-        writer = self._mic_writer
+        if thread is None or thread is threading.current_thread():
+            if writer is not None:
+                writer.close()
+            return
+        if not thread.is_alive():
+            if writer is not None:
+                writer.close()
+            return
+        thread.join(timeout=self._mic_writer_join_timeout)
+        if not thread.is_alive():
+            if writer is not None:
+                writer.close()
+            return
+        self._handoff_mic_queue_to_ram()
+        thread.join(timeout=self._mic_writer_inflight_join_timeout)
+        if not thread.is_alive():
+            if writer is not None:
+                writer.close()
+            return
+        self._steal_uncommitted_inflight()
         if writer is not None:
-            writer.close()
+            writer.suppress_disk = True
+        self._mic_writer_close_when_done = True
+
+    def _materialize_mic_track(self) -> None:
+        """Rewrite the mic WAV as the flushed prefix plus the RAM remainder."""
+        with self._mic_io_lock:
+            remainder = list(self._mic_ram_remainder)
+        if not remainder:
+            return
+        prefix = np.zeros((0, 1), dtype=np.int16)
+        rate = int(self.sample_rate)
+        path = self._mic_wav
+        if path is not None and path.exists() and path.stat().st_size > 44:
+            try:
+                loaded, loaded_rate = recover_wav(path)
+                if loaded_rate > 0:
+                    rate = int(loaded_rate)
+                prefix = loaded
+            except (OSError, ValueError) as exc:
+                print(f"Mic prefix unreadable; keeping the RAM remainder only: {exc}", file=sys.stderr)
+        parts = []
+        if prefix.size:
+            parts.append(prefix[:, 0] if prefix.ndim == 2 else np.reshape(prefix, -1))
+        for block in remainder:
+            mono = _mono_int16(block)
+            if mono.size:
+                parts.append(mono)
+        if not parts:
+            return
+        pcm = np.concatenate(parts)
+        if path is None:
+            return
+        temporary = path.with_name(f".{path.stem}.rebuild.wav")
+        try:
+            sf.write(str(temporary), pcm.reshape(-1, 1), rate, subtype="PCM_16", format="WAV")
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
     def abandon_mic_writer(self) -> None:
         """Simulate a crash: keep flushed checkpoints, drop the queued tail."""
@@ -617,6 +1044,25 @@ class MeetingRecorderApp(rumps.App):
         # Build menu
         self._build_menu()
         self._install_prompt_mark_shortcut()
+        self._recover_orphaned_recordings()
+
+    def _recover_orphaned_recordings(self) -> None:
+        """Play back crashed captures into Recordings without a modal dialog."""
+        try:
+            recover_orphaned_captures(
+                self.recorder.tmp_dir,
+                self.recordings_dir,
+                notify=self._notify_recovered_recording,
+            )
+        except Exception as exc:
+            print(f"Orphaned recording recovery failed: {exc}", file=sys.stderr)
+
+    def _notify_recovered_recording(self, path: Path) -> None:
+        rumps.notification(
+            title="MeetingRecorder",
+            subtitle="Aufnahme wiederhergestellt",
+            message=f"Unterbrochene Aufnahme gespeichert: {path.name}",
+        )
 
     def _build_menu(self):
         """Build the menu bar menu."""

@@ -17,8 +17,22 @@ from pathlib import Path
 import numpy as np
 
 MIC_RING_SECONDS = 120.0
-MIC_QUEUE_SECONDS = 3.0
+# Large enough that a short disk stall does not overflow during a normal meeting.
+# Overflow still keeps the timeline: the recorder spills those frames to RAM.
+MIC_QUEUE_SECONDS = 30.0
 MIC_CHECKPOINT_SECONDS = 1.0
+
+
+class DiskWriteSuppressed(Exception):
+    """The recorder asked the writer to stop touching the file.
+
+    ``consumed`` is true when this block was already appended to the open
+    checkpoint and must not be flushed after the handoff.
+    """
+
+    def __init__(self, consumed: bool = False):
+        super().__init__("mic disk write suppressed")
+        self.consumed = consumed
 
 
 def sample_count(block) -> int:
@@ -98,11 +112,16 @@ class IncrementalWavWriter:
         self._pending = bytearray()
         self._pending_samples = 0
         self._fh = self.path.open("wb")
+        self._closed = False
+        self.suppress_disk = False
+        self.publish_lock = None
         self._write_header(0)
         self._fh.flush()
         os.fsync(self._fh.fileno())
 
     def write(self, block) -> None:
+        if self.suppress_disk:
+            raise DiskWriteSuppressed(False)
         pcm = _pcm_bytes(block, self.channels)
         if not pcm:
             return
@@ -115,25 +134,79 @@ class IncrementalWavWriter:
     def flush(self) -> None:
         if not self._pending:
             return
-        self._fh.write(self._pending)
-        self.samples_written += self._pending_samples
+        payload = bytes(self._pending)
+        count = self._pending_samples
+        published = self._publish(payload, count)
+        if not published:
+            raise DiskWriteSuppressed(True)
+        try:
+            os.fsync(self._fh.fileno())
+        except OSError:
+            # The bytes are already in the file. Later audio must not be
+            # written here, and this checkpoint must not be copied into RAM.
+            raise
+
+    def _publish(self, payload: bytes, count: int) -> bool:
+        """Write one checkpoint. False when the recorder suppressed disk I/O."""
+
+        def publish() -> bool:
+            if self.suppress_disk or self._closed:
+                return False
+            self._fh.write(payload)
+            self.samples_written += count
+            self._pending.clear()
+            self._pending_samples = 0
+            self._patch_header()
+            self._fh.flush()
+            return True
+
+        lock = self.publish_lock
+        if lock is None:
+            return publish()
+        with lock:
+            return publish()
+
+    def take_pending(self) -> np.ndarray | None:
+        """Remove the open checkpoint and return it as PCM. Does not touch the file."""
+        if self._pending_samples <= 0 or not self._pending:
+            self._pending.clear()
+            self._pending_samples = 0
+            return None
+        raw = bytes(self._pending)
         self._pending.clear()
         self._pending_samples = 0
-        self._patch_header()
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        frame = self.channels * 2
+        usable = len(raw) - (len(raw) % frame)
+        if usable <= 0:
+            return None
+        pcm = np.frombuffer(raw[:usable], dtype="<i2").copy()
+        return pcm.reshape(-1, self.channels)
 
     def close(self) -> None:
-        self.flush()
-        if not self._fh.closed:
-            self._fh.close()
+        """Flush and close. Never raises; a second call is a no-op."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if not self.suppress_disk:
+                self.flush()
+        except Exception:
+            pass
+        self._close_handle()
 
     def abort(self) -> None:
-        """Close without flushing the open checkpoint. The last fsync remains."""
+        """Close without flushing the open checkpoint. Never raises."""
         self._pending.clear()
         self._pending_samples = 0
-        if not self._fh.closed:
-            self._fh.close()
+        self._closed = True
+        self._close_handle()
+
+    def _close_handle(self) -> None:
+        try:
+            if self._fh is not None and not self._fh.closed:
+                self._fh.close()
+        except Exception:
+            pass
 
     def _patch_header(self) -> None:
         data_bytes = self.samples_written * self.channels * 2
