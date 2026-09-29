@@ -178,6 +178,7 @@ except ImportError as e:
 
 try:
     from diarize import (
+        DIARIZATION_TIMEOUT_SECONDS,
         PYANNOTE_AVAILABLE,
         PYANNOTE_IMPORT_ERROR,
         fuse_host_cluster_with_channel_vad,
@@ -1245,6 +1246,16 @@ class TranscribeWatcher:
                     diarization_segments = self._run_diarization_safe(
                         mp3_path, num_speakers=num_speakers
                     )
+                    if diarization_segments:
+                        topo_name = getattr(topology, "topology", None)
+                        self.logger.info(
+                            "Using pyannote diarization prior: "
+                            f"{len(diarization_segments)} segments, "
+                            f"topology={topo_name}. This prior can change "
+                            "speaker labels versus voice-only Gemini, including "
+                            "on single-source recordings. Disable it with "
+                            "diarization.enabled: false."
+                        )
                     if (
                         diarization_segments
                         and channel_fusion
@@ -1922,7 +1933,7 @@ class TranscribeWatcher:
             )
             return None
         cfg = self.config.get("diarization", {}) or {}
-        timeout = int(cfg.get("timeout_seconds", 3600))
+        timeout = int(cfg.get("timeout_seconds", DIARIZATION_TIMEOUT_SECONDS))
         device = str(cfg.get("device", ""))
         try:
             return run_pyannote_diarization(
@@ -2548,7 +2559,14 @@ class TranscribeWatcher:
         try:
             from sidecar.live_store import apply_live_fill
 
-            meta = apply_live_fill(result, path, audio_duration)
+            meta = apply_live_fill(
+                result,
+                path,
+                audio_duration,
+                channel_lag_seconds=getattr(
+                    self, "_applied_channel_alignment_lag_seconds", None
+                ),
+            )
         except Exception as exc:
             self.logger.warning(f"Live transcript fill failed: {exc}")
             return None

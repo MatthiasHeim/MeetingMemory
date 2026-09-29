@@ -68,6 +68,21 @@ def test_each_tick_persists_once_and_a_direct_snapshot_does_not():
     assert engine.cards[0].clean_text == "Clean synthetic prompt."
 
 
+def test_live_json_is_owner_readable_only(tmp_path):
+    import os
+
+    path = tmp_path / "stem.live.json"
+    previous = os.umask(0)
+    try:
+        atomic_write_json(
+            path,
+            {"schema_version": 1, "recording_stem": "stem", "lines": [], "cards": []},
+        )
+    finally:
+        os.umask(previous)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_atomic_replace_is_always_a_complete_document(tmp_path):
     path = tmp_path / "stem.live.json"
     stop = threading.Event()

@@ -36,6 +36,12 @@ def _deps_available() -> tuple[bool, Optional[str]]:
 
 PYANNOTE_AVAILABLE, PYANNOTE_IMPORT_ERROR = _deps_available()
 
+# Single-source recordings now receive this prior, which can change speaker
+# labels. 15 minutes is long enough for a meeting and short enough that a
+# stuck worker cannot block the watcher for an hour. diarization.enabled: false
+# skips the prior entirely.
+DIARIZATION_TIMEOUT_SECONDS = 900
+
 
 def _fmt_ts(seconds: float) -> str:
     total = int(round(seconds))
@@ -155,7 +161,7 @@ def _pyannote_child(args, q) -> None:
 def run_pyannote_diarization(
     audio_path: Path,
     num_speakers: Optional[int] = None,
-    timeout_seconds: int = 3600,
+    timeout_seconds: int = DIARIZATION_TIMEOUT_SECONDS,
     device: str = "",
 ) -> Optional[list[dict]]:
     """Run local pyannote in a spawned worker and return speaker segments.

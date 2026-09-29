@@ -13,6 +13,25 @@ sys.path.insert(0, str(ROOT / "tools"))
 import diarize  # noqa: E402
 
 
+def test_diarization_timeout_default_is_fifteen_minutes():
+    import inspect
+
+    import transcribe_watcher as tw
+
+    assert diarize.DIARIZATION_TIMEOUT_SECONDS == 900
+    assert (
+        inspect.signature(diarize.run_pyannote_diarization).parameters["timeout_seconds"].default
+        == 900
+    )
+    assert "DIARIZATION_TIMEOUT_SECONDS" in inspect.getsource(
+        tw.TranscribeWatcher._run_diarization_safe
+    )
+    body = inspect.getsource(tw.TranscribeWatcher)
+    assert "Using pyannote diarization prior" in body
+    assert "diarization.enabled: false" in body
+    assert "single-source" in body
+
+
 def test_diarization_process_target_lives_in_tools_and_fixes_the_path():
     source = inspect.getsource(diarize.run_pyannote_diarization)
     assert "_pyannote_child" in source

@@ -54,6 +54,63 @@ def test_line_that_starts_on_the_last_stamp_but_runs_into_the_gap_is_inserted():
     assert meta["line_count"] == 1
 
 
+def test_missing_range_that_overlaps_final_lines_is_not_filled():
+    """Gemini can flag a span the final transcript already covers."""
+    full = "".join(
+        f"[{minute:02d}:{second:02d}] Speaker 1: synthetic {minute * 60 + second}.\n"
+        for minute in range(10)
+        for second in range(0, 60, 10)
+    )
+    unchanged, meta = fill_transcript_from_live(
+        full,
+        [{"start": 5, "end": 8, "speaker": "Remote", "text": "synthetic"}],
+        600,
+    )
+    assert unchanged == full
+    assert meta is None
+    live = [
+        {"start": second + 3, "end": second + 7, "speaker": "Remote", "text": f"synthetic live {second}"}
+        for second in range(100, 200, 10)
+    ]
+    filled, overlap = fill_transcript_from_live(full, live, 600, [[100, 200]])
+    assert filled == full
+    assert overlap is None
+    assert "[live]" not in filled
+
+
+def test_partial_tail_is_filled_and_alignment_lag_shifts_live_timestamps():
+    partial = "".join(
+        f"[{minute:02d}:{second:02d}] Speaker 1: synthetic.\n"
+        for minute in range(5)
+        for second in range(0, 60, 10)
+    )
+    live = [
+        {"start": second, "end": second + 5, "speaker": "Ich", "text": "synthetic live"}
+        for second in range(280, 600, 10)
+    ]
+    filled, meta = fill_transcript_from_live(partial, live, 600)
+    assert meta is not None
+    assert meta["line_count"] == filled.count("[live]")
+    assert filled.count("[live]") == 31
+    assert "[04:40] Speaker 1: synthetic." in filled
+    assert "[04:50] Ich: [live] synthetic live" in filled
+    assert "[09:50] Ich: [live] synthetic live" in filled
+    lagged, lagged_meta = fill_transcript_from_live(
+        "[01:00] Speaker 1: synthetic.\n",
+        [{"start": 100.0, "end": 110.0, "speaker": "Ich", "text": "synthetic shifted"}],
+        200,
+        channel_lag_seconds=20.0,
+    )
+    assert "[01:20] Ich: [live] synthetic shifted" in lagged
+    assert "[01:40]" not in lagged
+    assert lagged_meta["line_count"] == 1
+    again, second = fill_transcript_from_live(
+        filled, live, 600
+    )
+    assert again == filled
+    assert second is None
+
+
 def test_explicit_missing_range_is_filled_when_coverage_already_reaches_the_end():
     transcript = "[00:00] Host: synthetic start.\n[30:00] Host: synthetic end.\n"
     filled, meta = fill_transcript_from_live(

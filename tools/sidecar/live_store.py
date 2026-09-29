@@ -31,6 +31,9 @@ LIVE_SCHEMA_VERSION = 1
 # A live line this close to an existing final-transcript timestamp is the same
 # turn heard twice, not a gap that needs filling.
 _BOUNDARY_SLACK_SECONDS = 0.4
+# Consecutive final lines this close together already cover the span between
+# them. A missing-range that overlaps that span is not a hole.
+_COVERED_LINE_GAP_SECONDS = 30.0
 
 
 def live_json_path(recordings_root: str | Path, stem: str) -> Path:
@@ -39,15 +42,20 @@ def live_json_path(recordings_root: str | Path, stem: str) -> Path:
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Replace ``path`` with ``payload``. Readers never see a partial document."""
+    """Replace ``path`` with ``payload``. Readers never see a partial document.
+
+    The live session file is mode 0600. ``os.open`` still applies the process
+    umask, so the mode is set again after the bytes are written.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        os.chmod(path, 0o600)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -107,21 +115,35 @@ def fill_transcript_from_live(
     live_lines: Sequence[Any],
     audio_duration: float,
     missing_time_ranges: Sequence[Sequence[float]] | None = None,
+    channel_lag_seconds: float | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Insert live lines into uncovered ranges.
 
     A transcript that already reaches the coverage minimum, and has no explicit
-    missing ranges, is returned unchanged. Inserted lines are tagged ``[live]``.
+    missing ranges, is returned unchanged. Ranges that already contain final
+    lines are subtracted before any live line is inserted. Inserted lines are
+    tagged ``[live]``. ``channel_lag_seconds`` is the alignment lag applied to
+    the file Gemini transcribed: positive means the mic was late, so live
+    timestamps move earlier by that many seconds.
     """
     ranges = _missing_ranges(transcript, audio_duration, missing_time_ranges)
     if not ranges:
         return transcript, None
     existing = _existing_starts(transcript)
+    lag = _finite(channel_lag_seconds) or 0.0
     selected: list[dict[str, Any]] = []
     for item in live_lines or []:
         line = _coerce_live_line(item)
         if line is None:
             continue
+        if lag:
+            line["start"] -= lag
+            line["end"] -= lag
+            if line["end"] < 0:
+                continue
+            line["start"] = max(0.0, line["start"])
+            if line["end"] < line["start"]:
+                line["end"] = line["start"]
         if not _starts_in_ranges(line["start"], ranges):
             continue
         if _restates_existing(line, existing):
@@ -151,7 +173,12 @@ def fill_transcript_from_live(
     }
 
 
-def apply_live_fill(result: Any, live_path: Path, audio_duration: float) -> dict[str, Any] | None:
+def apply_live_fill(
+    result: Any,
+    live_path: Path,
+    audio_duration: float,
+    channel_lag_seconds: float | None = None,
+) -> dict[str, Any] | None:
     """Mutate a Gemini result when a partial transcript has live lines for its gaps."""
     payload = load_live_payload(Path(live_path))
     if payload is None:
@@ -161,6 +188,7 @@ def apply_live_fill(result: Any, live_path: Path, audio_duration: float) -> dict
         payload.get("lines") or [],
         audio_duration,
         missing_time_ranges=getattr(result, "missing_time_ranges", None) or [],
+        channel_lag_seconds=channel_lag_seconds,
     )
     if meta is None:
         return None
@@ -281,7 +309,44 @@ def _missing_ranges(
         report = validate_transcript(transcript or "", duration)
         if report.coverage_pct < COVERAGE_MIN_PCT:
             ranges.append((max(0.0, float(report.last_timestamp_sec)), duration))
-    return _merge_ranges(ranges)
+    return _subtract_ranges(_merge_ranges(ranges), _covered_intervals(transcript))
+
+
+def _covered_intervals(transcript: str) -> list[tuple[float, float]]:
+    """Spans between nearby final lines. Those spans already contain speech."""
+    starts = _existing_starts(transcript)
+    covered: list[tuple[float, float]] = []
+    for previous, nxt in zip(starts, starts[1:]):
+        if nxt > previous and nxt - previous <= _COVERED_LINE_GAP_SECONDS:
+            covered.append((previous, nxt))
+    return covered
+
+
+def _subtract_ranges(
+    ranges: Sequence[tuple[float, float]],
+    covered: Sequence[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Return the parts of ``ranges`` that do not overlap ``covered``."""
+    if not ranges:
+        return []
+    if not covered:
+        return list(ranges)
+    remaining: list[tuple[float, float]] = []
+    for start, end in ranges:
+        cursor = start
+        for covered_start, covered_end in covered:
+            if covered_end <= cursor:
+                continue
+            if covered_start >= end:
+                break
+            if covered_start > cursor:
+                remaining.append((cursor, min(covered_start, end)))
+            cursor = max(cursor, covered_end)
+            if cursor >= end:
+                break
+        if cursor < end - 1e-9:
+            remaining.append((cursor, end))
+    return _merge_ranges(remaining)
 
 
 def _merge_ranges(ranges: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
