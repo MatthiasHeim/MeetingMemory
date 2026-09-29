@@ -250,16 +250,27 @@ that file and does not stop the worker. A persist failure sets a status line
 and leaves recording running.
 
 The microphone is not held in RAM for the whole meeting. The PortAudio
-callback copies the block and `put_nowait`s it onto a queue of about three
-seconds. A `meeting-mic-writer` thread appends PCM and checkpoints the WAV
-header about once a second (`flush` and `fsync`). A full queue drops the
-block and records `mic_queue_full`; the callback never waits on disk. The
-callback also keeps a ring of about the last two minutes (`audio.mic_ring_seconds`,
-default 120) for the live tail. `stop()` still writes the merged 3-channel
-WAV the watcher expects (mic, system left, system right). A crash keeps
-every checkpointed second and loses at most the open checkpoint plus the
-queued tail. If the writer cannot open the file, `stop()` still falls back
-to the in-memory blocks.
+callback copies the block and `put_nowait`s it onto a queue of about thirty
+seconds (`audio.mic_queue_seconds`, default 30). A `meeting-mic-writer` thread
+appends PCM and checkpoints the WAV header about once a second (`flush` and
+`fsync`). A full queue does not drop the timeline: those blocks, and every
+block after them, stay in an in-memory list, and one merged `mic_queue_full`
+range is recorded. The callback never waits on disk. If a checkpoint raises
+(disk full, for example), the writer stops touching the file and the rest of
+the meeting stays in that list. `stop()` rebuilds the mic track as the flushed
+prefix plus that remainder, and a writer error does not skip stopping the
+system tap, the merge, the replace into Recordings, or the archive.
+`_finish_mic_writer` closes the WAV only after the writer thread has exited.
+The callback also keeps a ring of about the last two minutes
+(`audio.mic_ring_seconds`, default 120) for the live tail. `stop()` still
+writes the merged 3-channel WAV the watcher expects (mic, system left, system
+right). A crash keeps every checkpointed second and loses at most the open
+checkpoint plus the queued tail. On the next launch the menu app scans
+`~/Documents/MeetingRecorder/.tmp` for orphaned `<stem>.mic.wav` and
+`<stem>.sys.wav` files, recovers a playable WAV into Recordings, and posts a
+non-modal notification. An orphan that cannot be read is left in place. If
+the writer cannot open the file, `stop()` still falls back to the in-memory
+blocks.
 
 It sends those tails to `gemini-3.8-flash` on the pinned Gemini endpoint.
 An incoming line that overlaps a committed line of the same speaker by more
@@ -269,8 +280,15 @@ that has slid forward keeps the committed words and appends only the new
 aligned suffix. A short fragment is absorbed when a longer same-speaker
 hearing starts within two seconds and its text begins with that fragment.
 Any other line that starts more than half a second before the
-frontier is dropped. Offsets from Gemini are clamped to the tail, so a
-hallucinated timestamp cannot push the frontier past the audio. An unfinished
+frontier is dropped. Offsets within the tail are clip-relative. An offset
+past the length of the tail is read as a meeting time and kept only when it
+falls inside the window; anything else is rejected, not pinned to the end of
+the tail. When that answer leaves at least half a second of detected speech
+uncovered, each gap is sent again as a 15 second slice with a short prompt
+that asks for every word. A remark that is still missing is asked once more
+on a slice that starts where that answer stopped and, at the end of the clip,
+runs through the last sample. Only lines that land in those gaps are kept.
+An unfinished
 line at the edge of an open tail is held for one tick and then committed, so
 a long unpunctuated monologue is not left behind the frontier. A later tick
 can still upgrade that fragment. After Stop, the final tick is skipped when
@@ -281,19 +299,30 @@ retried up to three times per card. The audio callback is not on this path.
 
 When the watcher marks a transcript partial (coverage below the minimum) and
 `Recordings/<stem>.live.json` exists, it inserts live lines whose start falls
-in the missing ranges, including the tail after the last timestamp. A line
-that only repeats an existing timestamp is skipped. A line that starts within
-a fraction of a second of that timestamp and continues into the gap is
-inserted. Each inserted line is tagged `[live]`. The filled ranges and line
+in the missing ranges, including the tail after the last timestamp. Before
+that, spans between final lines that sit within 30 seconds of each other are
+subtracted, so a `missing_time_ranges` entry that overlaps speech already in
+the transcript does not duplicate it. A line that only repeats an existing
+timestamp is skipped. A line that starts within a fraction of a second of that
+timestamp and continues into the gap is inserted. When channel alignment
+actually shifted the mic, live timestamps are moved by the same
+`channel_alignment.lag_seconds` (positive lag means the mic was late, so the
+live clock moves earlier). Each inserted line is tagged `[live]`, and
+`partial` stays true. The filled ranges and line
 count are stored on `_meta.live_fill`. The same fill runs again just before
 the JSON is written, so a later speaker-reconcile pass cannot drop the tags;
 a second pass is idempotent. A transcript that already meets the coverage
 minimum is not modified. Escalation (one fresh single-call retry, then
 chunked retry when the audio is long enough) and the Telegram partial alert
 are unchanged. When lines were inserted, the alert adds: "Gaps were filled
-from the live transcript."
+from the live transcript." The live file is written with mode `0600`.
 
-Pyannote diarization is started from `tools/diarize.py`. launchd runs
+Pyannote diarization now also runs for single-source recordings. That is a
+behaviour change: the acoustic prior can change speaker labels compared with
+voice-only Gemini. The watcher logs when the prior is used. Set
+`diarization.enabled: false` to skip it. The worker timeout defaults to 900
+seconds (`diarization.timeout_seconds`), not an hour. Pyannote is started
+from `tools/diarize.py`. launchd runs
 `python tools/transcribe_watcher.py`, so `sys.path[0]` is `tools/` and a
 direct `import pyannote_mp_worker` fails (`No module named 'pyannote_mp_worker'`).
 The spawn target is `_pyannote_child` in `tools/diarize.py`. That child puts
