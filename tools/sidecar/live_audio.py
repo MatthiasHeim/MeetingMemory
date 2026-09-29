@@ -1,8 +1,9 @@
 """Mic and system-audio tails for the live sidecar.
 
-The microphone callback only appends copied blocks. This module reads those
-blocks from another thread by copying the list of references. It never takes a
-lock the callback would have to acquire, and it never writes audio.
+The microphone callback copies each block into a bounded queue and a short
+ring. A writer thread owns the WAV. This module reads the ring from another
+thread by copying the list of references. It never takes a lock the callback
+would have to acquire, and it never writes audio.
 """
 
 from __future__ import annotations

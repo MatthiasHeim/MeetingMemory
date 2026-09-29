@@ -168,11 +168,14 @@ def test_audio_callback_source_is_unchanged_and_a_slow_worker_cannot_delay_it():
     import meeting_recorder
 
     source = inspect.getsource(meeting_recorder.AudioRecorder._audio_callback)
-    assert "self.audio_data.append(indata.copy())" in source
+    assert "indata.copy()" in source
+    assert "put_nowait" in source
     assert "Lock" not in source
     assert "live" not in source.lower()
     assert "gemini" not in source.lower()
     assert "open(" not in source
+    assert "fsync" not in source
+    assert "soundfile" not in source
     start_source = inspect.getsource(meeting_recorder.MeetingRecorderApp._start_recording)
     assert "NSAlert" not in start_source
     assert "runModal" not in start_source

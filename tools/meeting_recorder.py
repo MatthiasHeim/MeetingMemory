@@ -10,11 +10,13 @@ Usage:
 """
 
 import os
+import queue
 import sys
 import time
 import shutil
 import threading
 import subprocess
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from types import SimpleNamespace
@@ -27,6 +29,13 @@ import soundfile as sf
 import rumps
 
 from capture_provenance import archive_capture, merge_filter
+from mic_writer import (
+    MIC_CHECKPOINT_SECONDS,
+    MIC_QUEUE_SECONDS,
+    MIC_RING_SECONDS,
+    IncrementalWavWriter,
+    SampleQueue,
+)
 from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar
 from sidecar.recorder_support import (
     CalendarRecordingContext,
@@ -37,6 +46,7 @@ from sidecar.recorder_support import (
     sidecar_metadata_from_calendar,
     write_jev_preference,
 )
+from sidecar.prompts import prompt_choice_label
 from sidecar.service import clip_for_stem, prompts_for_stem
 from sidecar.transcript import format_timestamp, recent_transcripts
 
@@ -201,6 +211,20 @@ class AudioRecorder:
         self._next_timing_sample = 0
         self._mic_first_sample_monotonic: float | None = None
         self._mic_first_sample_event = threading.Event()
+        # The callback keeps only this much mic audio for the live tail.
+        # The full track is the incremental WAV written off the callback.
+        self._mic_ring_seconds = float(audio_cfg.get("mic_ring_seconds", MIC_RING_SECONDS))
+        self._mic_checkpoint_seconds = float(
+            audio_cfg.get("mic_checkpoint_seconds", MIC_CHECKPOINT_SECONDS)
+        )
+        self._mic_queue = None
+        self._mic_writer = None
+        self._mic_writer_thread = None
+        self._mic_writer_stop = threading.Event()
+        self._mic_writer_abandon = threading.Event()
+        self._mic_disk_capture = False
+        self._mic_dropped_blocks = 0
+        self._ring_samples = 0
 
     def _sys_proc_running(self) -> bool:
         return subprocess.run(
@@ -214,11 +238,18 @@ class AudioRecorder:
 
         self.output_file = output_file
         self.audio_data = []
+        self._ring_samples = 0
+        self._mic_dropped_blocks = 0
         self._mic_frames = 0
         self._previous_adc_end = None
         self._next_timing_sample = 0
         self._mic_first_sample_monotonic = None
         self._mic_first_sample_event.clear()
+        self._mic_writer_stop.clear()
+        self._mic_writer_abandon.clear()
+        self._mic_disk_capture = False
+        self._mic_queue = None
+        self._mic_writer = None
         self._capture_meta = {"schema_version": 1, "started_wall_time": time.time(),
                               "started_monotonic": time.monotonic(),
                               "mic_sample_rate": self.sample_rate,
@@ -252,6 +283,8 @@ class AudioRecorder:
             print(f"Tap bundle not found ({self.tap_bundle}); mic-only.", file=sys.stderr)
 
         # 2) Microphone via sounddevice (this process holds the mic permission).
+        # The writer is open before the stream so the first callback can enqueue.
+        self._start_mic_writer()
         self.recording = True
         try:
             self.stream = sd.InputStream(
@@ -265,6 +298,8 @@ class AudioRecorder:
             return True
         except Exception as e:
             self.recording = False
+            self._mic_writer_abandon.set()
+            self._finish_mic_writer()
             if self._sys_active:
                 subprocess.run(["pkill", "-INT", "-f", self._PROC_PATTERN])
             raise RuntimeError(f"Failed to start mic recording: {e}")
@@ -275,13 +310,23 @@ class AudioRecorder:
             return None
         self.recording = False
 
-        # Stop mic, write mic.wav.
+        # Stop mic. The writer thread already has the mic track on disk.
         if self.stream:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+        self._finish_mic_writer()
         mic_ok = False
-        if self.audio_data:
+        if (
+            self._mic_disk_capture
+            and self._mic_wav is not None
+            and self._mic_wav.exists()
+            and self._mic_wav.stat().st_size > 1000
+        ):
+            mic_ok = True
+        elif self.audio_data:
+            # Writer never started (tests, or a disk-open failure). The ring
+            # still holds the capture, which is the previous stop() behaviour.
             arr = np.concatenate(self.audio_data, axis=0)
             sf.write(str(self._mic_wav), arr, self.sample_rate, subtype='PCM_16')
             mic_ok = self._mic_wav.exists() and self._mic_wav.stat().st_size > 1000
@@ -386,7 +431,11 @@ class AudioRecorder:
         return result
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """Callback for the microphone input stream."""
+        """Callback for the microphone input stream.
+
+        Copies the block into a bounded queue and a short ring. Disk I/O
+        stays on the writer thread; a full queue is dropped, never waited on.
+        """
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
         if self.recording:
@@ -395,7 +444,23 @@ class AudioRecorder:
             if self._mic_first_sample_monotonic is None:
                 self._mic_first_sample_monotonic = time.monotonic()
                 self._mic_first_sample_event.set()
-            self.audio_data.append(indata.copy())
+            block = indata.copy()
+            mic_queue = getattr(self, "_mic_queue", None)
+            if mic_queue is not None:
+                try:
+                    mic_queue.put_nowait(block)
+                except queue.Full:
+                    self._mic_dropped_blocks = getattr(self, "_mic_dropped_blocks", 0) + 1
+                    discontinuities = self._capture_meta.get("discontinuities") if isinstance(
+                        getattr(self, "_capture_meta", None), dict
+                    ) else None
+                    if isinstance(discontinuities, list):
+                        discontinuities.append({
+                            "frame": self._mic_frames,
+                            "reason": "mic_queue_full",
+                            "status": str(status),
+                        })
+            self._keep_recent_block(block)
             adc = float(time_info.inputBufferAdcTime)
             gap = None if self._previous_adc_end is None else adc - self._previous_adc_end
             if status or (gap is not None and abs(gap) > 0.005):
@@ -409,6 +474,102 @@ class AudioRecorder:
                 self._next_timing_sample = self._mic_frames + self.sample_rate
             self._previous_adc_end = adc + frames / self.sample_rate
             self._mic_frames += frames
+
+    def _keep_recent_block(self, block) -> None:
+        """Ring for the live tail. In memory only; the WAV writer owns the file."""
+        self.audio_data.append(block)
+        if not getattr(self, "_mic_disk_capture", False):
+            return
+        count = int(np.asarray(block).shape[0])
+        self._ring_samples += count
+        limit = int(self.sample_rate * self._mic_ring_seconds)
+        while len(self.audio_data) > 1 and self._ring_samples > limit:
+            removed = self.audio_data.popleft()
+            self._ring_samples -= int(np.asarray(removed).shape[0])
+
+    def _start_mic_writer(self) -> None:
+        """Open the incremental mic WAV and start the thread that fills it."""
+        try:
+            mic_queue = SampleQueue(max(1, int(self.sample_rate * MIC_QUEUE_SECONDS)))
+            writer = IncrementalWavWriter(
+                self._mic_wav,
+                self.sample_rate,
+                channels=1,
+                checkpoint_seconds=self._mic_checkpoint_seconds,
+            )
+        except Exception as exc:
+            print(
+                f"Durable mic writer unavailable; mic stays in memory until stop: {exc}",
+                file=sys.stderr,
+            )
+            self._mic_queue = None
+            self._mic_writer = None
+            self._mic_disk_capture = False
+            return
+        self._mic_queue = mic_queue
+        self._mic_writer = writer
+        self._mic_disk_capture = True
+        # popleft stays off the callback's critical path. The live snapshot
+        # only needs to copy the references.
+        self.audio_data = deque()
+        self._mic_writer_thread = threading.Thread(
+            target=self._mic_writer_loop, name="meeting-mic-writer", daemon=True
+        )
+        self._mic_writer_thread.start()
+
+    def _mic_writer_loop(self) -> None:
+        writer = self._mic_writer
+        mic_queue = self._mic_queue
+        if writer is None or mic_queue is None:
+            return
+        while True:
+            if self._mic_writer_abandon.is_set():
+                return
+            try:
+                block = mic_queue.get(0.05)
+            except queue.Empty:
+                if self._mic_writer_stop.is_set():
+                    break
+                continue
+            if self._mic_writer_abandon.is_set():
+                return
+            writer.write(block)
+        if self._mic_writer_abandon.is_set():
+            return
+        while True:
+            try:
+                block = mic_queue.get(0)
+            except queue.Empty:
+                break
+            if self._mic_writer_abandon.is_set():
+                return
+            writer.write(block)
+        writer.flush()
+
+    def _finish_mic_writer(self) -> None:
+        """Drain the queue and close the WAV. A crash abandon does not drain."""
+        if self._mic_writer_abandon.is_set():
+            thread = self._mic_writer_thread
+            if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=2)
+            writer = self._mic_writer
+            if writer is not None:
+                writer.abort()
+            return
+        if not self._mic_disk_capture and self._mic_writer is None:
+            return
+        self._mic_writer_stop.set()
+        thread = self._mic_writer_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=30)
+        writer = self._mic_writer
+        if writer is not None:
+            writer.close()
+
+    def abandon_mic_writer(self) -> None:
+        """Simulate a crash: keep flushed checkpoints, drop the queued tail."""
+        self._mic_writer_abandon.set()
+        self._finish_mic_writer()
 
     @property
     def is_recording(self) -> bool:
@@ -752,6 +913,8 @@ class MeetingRecorderApp(rumps.App):
                     api_key=self._gemini_api_key(),
                     copy_text=self._copy_to_clipboard,
                     on_unavailable=self._notify_live_unavailable,
+                    recordings_dir=self.recordings_dir,
+                    stem=self._recording_stem,
                 )
                 self._live_session.start()
             else:
@@ -1101,13 +1264,7 @@ class MeetingRecorderApp(rumps.App):
         """Let the user choose a marked or suggested prompt without showing its text."""
         choices: list[str] = []
         for number, prompt in enumerate(prompts, start=1):
-            if prompt.source == "mark":
-                label = f"Markierung bei {format_timestamp(prompt.mark_seconds or 0)}"
-                if prompt.association_label:
-                    label += f" — {prompt.association_label}"
-            else:
-                label = f"Vorschlag bei {format_timestamp(prompt.start_seconds)}"
-            choices.append(f"{number}. {label}")
+            choices.append(f"{number}. {prompt_choice_label(prompt)}")
         response = self._run_window(
             message="Welchen Prompt kopieren?\n\n" + "\n".join(choices),
             title="Prompts…",
