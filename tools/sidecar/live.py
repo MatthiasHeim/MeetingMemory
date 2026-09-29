@@ -662,6 +662,7 @@ class LiveEngine:
         clean_prompt: Cleaner | None = None,
         on_update: UpdateCallback | None = None,
         on_unavailable: Callable[[str], None] | None = None,
+        on_commit: Callable[[Sequence[LiveLine], Sequence[LiveCard]], None] | None = None,
         interval: float = LIVE_TICK_SECONDS,
         tail: float = LIVE_TAIL_SECONDS,
         prompt_threshold: float = OWNER_APPROVED_PROMPT_THRESHOLD,
@@ -675,6 +676,7 @@ class LiveEngine:
         self._clean_prompt = clean_prompt
         self._on_update = on_update
         self._on_unavailable = on_unavailable
+        self._on_commit = on_commit
         self.interval = interval
         self.tail = tail
         self.prompt_threshold = prompt_threshold
@@ -712,6 +714,9 @@ class LiveEngine:
             if self._stop.wait(self.interval):
                 break
             self._safe_tick()
+        # Committed lines are written at stop before the final transcription
+        # tick, which may be skipped once the system WAV is archived.
+        self._persist_tick(force=True)
         self._safe_tick(closed=True)
 
     def _ensure_runtime(self) -> None:
@@ -740,6 +745,21 @@ class LiveEngine:
             self.process_snapshot(snapshot)
         except Exception as exc:
             self._fail(exc)
+        finally:
+            # At most once per tick, on this worker, never on the audio callback.
+            self._persist_tick(force=closed)
+
+    def _persist_tick(self, *, force: bool = False) -> None:
+        if self._on_commit is None:
+            return
+        if not force and not self.lines and not self.cards:
+            return
+        try:
+            self._on_commit(tuple(self.lines), tuple(self.cards))
+        except Exception:
+            self.status = (
+                "Live-Sitzung konnte nicht gespeichert werden. Die Aufnahme läuft weiter."
+            )
 
     def process_snapshot(self, snapshot: TailSnapshot) -> list[LiveLine]:
         """Transcribe one tail, commit new lines, and refresh prompt cards."""
