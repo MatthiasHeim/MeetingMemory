@@ -489,6 +489,51 @@ def update_source_calendar_match(
         conn.close()
 
 
+PIPELINE_READY_FOR_FOLLOWUP = 'ready_for_followup'
+
+
+def mark_ready_for_followup(
+    source_id: int,
+    transcript_path: str | Path,
+    triggered_by: str,
+    prompt_suffix: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    """Hand a source off to the follow-up job (whoever runs it).
+
+    Sets ``metadata.pipeline_status = 'ready_for_followup'`` with a timestamp
+    and ``metadata.followup`` = {transcript_path, triggered_by, prompt_suffix?}.
+    `triggered_by` is 'watcher' when the watcher itself also starts the
+    follow-up (its run counts as the first attempt) or 'automations' when the
+    follow-up job owns the run. Merges into metadata; every other key is kept.
+    Raises when the row does not exist, so the caller can alert.
+    """
+    at = (now or datetime.now(timezone.utc)).isoformat(timespec='seconds')
+    followup: dict = {'transcript_path': str(transcript_path), 'triggered_by': triggered_by}
+    if prompt_suffix:
+        followup['prompt_suffix'] = prompt_suffix
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE sources SET metadata = COALESCE(metadata, '{}'::jsonb)
+                        || jsonb_build_object(
+                            'pipeline_status', %s::text,
+                            'pipeline_status_at', %s::text,
+                            'followup', %s::jsonb)
+                    WHERE id = %s
+                    """,
+                    (PIPELINE_READY_FOR_FOLLOWUP, at, json.dumps(followup), source_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(f"source {source_id} not found; cannot mark ready for follow-up")
+                logger.info("Marked source id=%s ready for follow-up (%s)", source_id, triggered_by)
+    finally:
+        conn.close()
+
+
 # ── CLI ───────────────────────────────────────────────────────────────
 
 def _main(argv: Optional[list[str]] = None) -> int:
