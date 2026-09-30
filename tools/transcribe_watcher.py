@@ -104,6 +104,7 @@ try:
         insert_source as _insightbase_insert_source,
         update_source_with_gemini as _insightbase_update_with_gemini,
         update_source_calendar_match as _insightbase_update_calendar,
+        mark_ready_for_followup as _insightbase_mark_ready,
     )
     NEON_INSERT_AVAILABLE = True
 except ImportError as e:
@@ -582,12 +583,53 @@ class AudioFileHandler(FileSystemEventHandler):
             self.queue.add(file_path)
 
 
+# ── Follow-up hand-off (meeting-pipeline spec, Phase 3) ─────────────────
+# `followup.mode` in config.yaml decides who runs /meeting-actions after a
+# transcript lands. In BOTH modes the watcher marks the source
+# `pipeline_status = 'ready_for_followup'` (see neon_insert.mark_ready_for_followup).
+#   watcher      today's behaviour: the watcher also starts headless Claude.
+#   automations  the lailix-automations `meeting-followup` job starts it; the
+#                watcher neither triggers Claude nor sends the "captured" ping.
+# Matthias flips the flag; nothing here changes it.
+FOLLOWUP_MODES = ("watcher", "automations")
+DEFAULT_FOLLOWUP_MODE = "watcher"
+
+# Defaults for the Claude/Brain settings that used to be hard-coded inline.
+# Override via config.yaml: claude_trigger.claude_path / claude_trigger.brain_repo /
+# notifications.telegram_notify_script.
+DEFAULT_CLAUDE_PATH = os.path.expanduser("~/.local/bin/claude")
+DEFAULT_BRAIN_REPO = os.path.expanduser("~/Repos/Brain")
+
+# Set once at watcher start from config (configure_notifier); read by the
+# static _telegram_notify_script so its zero-argument call sites stay unchanged.
+_notifier_settings: dict = {"script": None, "brain_repo": None}
+
+
+def followup_mode(config: dict) -> str:
+    """Return the configured follow-up mode; an unknown value is an error, not a guess."""
+    mode = ((config or {}).get("followup") or {}).get("mode", DEFAULT_FOLLOWUP_MODE)
+    if mode not in FOLLOWUP_MODES:
+        raise ValueError(
+            f"followup.mode must be one of {FOLLOWUP_MODES}, got {mode!r}"
+        )
+    return mode
+
+
+def configure_notifier(config: dict) -> None:
+    """Record the configured telegram_notify.py path and Brain repo (read-only lookup)."""
+    _notifier_settings["script"] = ((config or {}).get("notifications") or {}).get("telegram_notify_script")
+    _notifier_settings["brain_repo"] = ((config or {}).get("claude_trigger") or {}).get("brain_repo")
+
+
 class TranscribeWatcher:
     """Main watcher service that monitors folder and processes transcriptions."""
 
     def __init__(self, config: dict, logger: logging.Logger):
         self.config = config
         self.logger = logger
+        # Fail fast on a mistyped followup.mode instead of guessing a mode.
+        self.logger.info(f"Follow-up mode: {followup_mode(config)}")
+        configure_notifier(config)
 
         # Expand paths
         self.recordings_dir = expand_path(config['paths']['recordings'])
@@ -2206,8 +2248,7 @@ class TranscribeWatcher:
             claude_cfg = self.config.get("claude_trigger", {}) or {}
             runner = _coherence_cli_runner(
                 claude_path=cfg.get("claude_path")
-                or claude_cfg.get("claude_path",
-                                  "/Users/Matthias/.local/bin/claude"),
+                or claude_cfg.get("claude_path", DEFAULT_CLAUDE_PATH),
                 config_dir=(str(expand_path(cfg.get("config_dir")))
                             if cfg.get("config_dir")
                             else (str(expand_path(claude_cfg["config_dir"]))
@@ -2286,11 +2327,15 @@ class TranscribeWatcher:
         The canonical copy lives in the Brain repo; an older deploy expected
         ~/.claude/scripts. Hardcoding the latter silently disabled ALL pings
         (captured + failure alerts) once the script moved — checked both now so
-        a repo move can't break alerting unnoticed. Optional env override first.
+        a repo move can't break alerting unnoticed. Optional env override first,
+        then config.yaml `notifications.telegram_notify_script`, then the Brain
+        repo from `claude_trigger.brain_repo` (default ~/Repos/Brain).
         """
+        brain_repo = _notifier_settings.get("brain_repo") or DEFAULT_BRAIN_REPO
         candidates = [
             os.environ.get("TELEGRAM_NOTIFY_SCRIPT", ""),
-            os.path.expanduser("~/Repos/Brain/.claude/scripts/telegram_notify.py"),
+            os.path.expanduser(_notifier_settings.get("script") or ""),
+            os.path.join(os.path.expanduser(brain_repo), ".claude/scripts/telegram_notify.py"),
             os.path.expanduser("~/.claude/scripts/telegram_notify.py"),
         ]
         for c in candidates:
@@ -2305,7 +2350,13 @@ class TranscribeWatcher:
 
         Fires BEFORE the Claude session — user knows the row exists and the
         transcript is ready to be pulled into a session if needed. Best-effort.
+
+        Not sent in followup.mode 'automations': that Brain-side ping announces
+        a Claude session this watcher no longer starts.
         """
+        if self._followup_mode() == "automations":
+            self.logger.info("followup.mode=automations: skipping 'meeting captured' Telegram ping")
+            return
         notify_path = self._telegram_notify_script()
         if not notify_path:
             self.logger.warning(
@@ -2588,8 +2639,8 @@ class TranscribeWatcher:
             self.logger.debug("Claude trigger disabled, skipping")
             return
 
-        claude_path = claude_config.get('claude_path', '/Users/Matthias/.local/bin/claude')
-        brain_repo = claude_config.get('brain_repo', '/Users/Matthias/Repos/Brain')
+        claude_path = claude_config.get('claude_path', DEFAULT_CLAUDE_PATH)
+        brain_repo = claude_config.get('brain_repo', DEFAULT_BRAIN_REPO)
         command = claude_config.get('command', 'meeting-actions')
 
         source_id_arg = f" --source-id {source_id}" if source_id else ""
@@ -2597,9 +2648,24 @@ class TranscribeWatcher:
             f"Read .claude/commands/{command}.md and process transcript: "
             f"{transcript_path}{source_id_arg}"
         )
+        suffix = None
         if resolve_calendar:
             apply_cli = str(Path(__file__).resolve().parent / "apply_calendar_candidate.py")
-            prompt += "\n" + claude_prompt_suffix(source_id, apply_cli)
+            suffix = claude_prompt_suffix(source_id, apply_cli)
+            prompt += "\n" + suffix
+
+        # Hand-off first, in both modes: the follow-up job reads this record.
+        mode = self._followup_mode()
+        marked = self._mark_ready_for_followup(source_id, transcript_path, suffix, mode)
+        if mode == "automations":
+            if not marked:
+                self._notify_followup_not_queued(source_id, transcript_path)
+            else:
+                self.logger.info(
+                    f"followup.mode=automations: source {source_id} marked ready_for_followup; "
+                    "not starting Claude"
+                )
+            return
 
         # Log file for this Claude session
         log_dir = expand_path(self.config['paths']['logs'])
@@ -2661,6 +2727,53 @@ class TranscribeWatcher:
             ).start()
         except Exception as e:
             self.logger.error(f"Failed to trigger Claude: {e}")
+
+    def _followup_mode(self) -> str:
+        # getattr: unit tests build bare watchers via __new__ without a config.
+        return followup_mode(getattr(self, "config", None) or {})
+
+    def _mark_ready_for_followup(self, source_id: Optional[int], transcript_path: Path,
+                                 prompt_suffix: Optional[str], mode: str) -> bool:
+        """Set sources.metadata.pipeline_status='ready_for_followup'. Best-effort in
+        'watcher' mode (Claude is still started); its result decides alerting in
+        'automations' mode, where this is the only hand-off."""
+        if source_id is None:
+            self.logger.warning("No source row to mark ready_for_followup (seed failed)")
+            return False
+        if not NEON_INSERT_AVAILABLE:
+            self.logger.warning(
+                f"neon_insert unavailable ({_NEON_INSERT_IMPORT_ERROR}); "
+                f"cannot mark source {source_id} ready_for_followup"
+            )
+            return False
+        try:
+            _insightbase_mark_ready(
+                source_id, transcript_path, triggered_by=mode, prompt_suffix=prompt_suffix,
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Could not mark source {source_id} ready_for_followup: {e}")
+            return False
+
+    def _notify_followup_not_queued(self, source_id: Optional[int], transcript_path: Path) -> None:
+        """In 'automations' mode a failed hand-off means nobody will run the
+        follow-up: say so instead of letting the meeting go quiet."""
+        notify_path = self._telegram_notify_script()
+        if not notify_path:
+            self.logger.warning("telegram_notify.py not found; skipping follow-up-not-queued alert")
+            return
+        msg = (
+            f"⚠️ Meeting follow-up NOT queued (source {source_id})\n"
+            f"{Path(transcript_path).name}\n"
+            f"Could not mark ready_for_followup; run /meeting-actions by hand."
+        )
+        try:
+            subprocess.run(
+                [sys.executable, notify_path, "--category", "Meeting", msg],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            self.logger.warning(f"Follow-up-not-queued alert failed: {e}")
 
     def _monitor_claude_startup(self, proc: subprocess.Popen,
                                  log_file: Path,
