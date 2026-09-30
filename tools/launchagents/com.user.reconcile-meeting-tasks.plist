@@ -5,11 +5,12 @@
     <key>Label</key>
     <string>com.user.reconcile-meeting-tasks</string>
 
-    <!-- DETERMINISTIC job (pure Python, NO `claude -p`): gap-fills missing
-         Linear tasks for meetings whose fire-and-forget /meeting-actions
-         session died (e.g. the 2026-07-10 session-limit incident). Because it
-         never starts a Claude session it can never hit a session limit — that
-         is the whole point. See tools/reconcile_meeting_tasks.py. -->
+    <!-- DETERMINISTIC job (pure Python, NO `claude -p`, NO Linear writes):
+         reports meetings that have no sources.metadata.task_decisions record
+         (the /meeting-actions agent never ran, e.g. the 2026-07-10
+         session-limit incident) as one Telegram line per sweep. Since
+         2026-09-30 it no longer creates tickets. See
+         tools/reconcile_meeting_tasks.py. -->
     <key>ProgramArguments</key>
     <array>
         <string>/Users/Matthias/Repos/MeetingMemory/venv/bin/python</string>
