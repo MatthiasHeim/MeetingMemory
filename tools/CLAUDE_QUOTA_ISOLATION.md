@@ -98,5 +98,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.transcribewatch
 
 The reconciliation sweep (`reconcile_meeting_tasks.py`) is the deterministic
 backstop that **does not need any of this** — it never starts a Claude session,
-so it can never hit a session limit. Quota isolation reduces how often the
-primary (Claude) path fails; the sweep guarantees tasks land even when it does.
+so it can never hit a session limit. Since 2026-09-30 it no longer creates
+tickets: it reports meetings with no `task_decisions` record via one Telegram
+line. Quota isolation reduces how often the primary (Claude) path fails; the
+sweep makes sure a failure is noticed.

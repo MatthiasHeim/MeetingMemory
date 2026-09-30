@@ -1,66 +1,66 @@
 #!/usr/bin/env python3
 """
-reconcile_meeting_tasks — deterministic Linear-task gap-fill for MeetingMemory.
+reconcile_meeting_tasks: decision-record check for MeetingMemory (backstop).
 
-WHY THIS EXISTS (2026-07-10 incident)
-─────────────────────────────────────
+WHY THIS EXISTS (2026-07-10 incident, reshaped 2026-09-30)
+──────────────────────────────────────────────────────────
 The transcription→insight→action pipeline splits work between a deterministic
 watcher (tools/transcribe_watcher.py) and a fire-and-forget headless Claude
 session (`claude -p /meeting-actions`). The watcher seeds the InsightBase
-`sources` row and Gemini-derived fields; the Claude session owns the LLM-only
-downstream — insight extraction, **Linear task creation**, follow-up email
-drafts, ClientContext refresh, Telegram.
+`sources` row; the Claude session owns the LLM-only downstream, including every
+Linear ticket consequence of the meeting.
 
-On 2026-07-10 every headless Claude session died on its first line
-("You've hit your session limit"). For the Philipp meeting (source 463) insight
-extraction had already landed, but the Claude session that owns task creation
-never ran — and because that trigger is fire-and-forget with NO retry, every
-Linear task for that meeting was silently dropped.
+On 2026-07-10 every headless Claude session died on its first line ("You've hit
+your session limit") and the tickets of that meeting were silently dropped. This
+job was built as the backstop and, until 2026-09-30, created a Linear ticket for
+every `type='action'` insight of a meeting that had none.
 
-This job is the deterministic backstop for exactly that failure mode. It is
-PURE PYTHON — it never starts a Claude/LLM session, so it can never hit a
-session limit. It reads InsightBase directly and creates any missing Linear
-tasks through Brain's existing `linear_client.py`.
+That design failed the other way round on 2026-09-29 (source 1121): a
+commitment stored as an opportunity insight never became a ticket, and meetings
+whose decisions are only updates/closes of existing tickets have zero
+`transcript:<sid>:*` tickets, so the sweep would have created duplicates
+(LAI-770 to 772). Insights are memory, tickets are work: deriving one from the
+other turns every labelling mistake into a missed or an extra task. See
+Brain `Areas/lailix-internal/docs/specs/2026-09-30-meeting-pipeline-boundaries.md`.
+
+The /meeting-actions agent now decides every ticket consequence and records it
+in `sources.metadata.task_decisions` (Brain `meeting_task_decisions.py`),
+including an explicit "none". A missing record is the mechanical signal that the
+agent never ran.
 
 WHAT IT DOES
 ────────────
-For each `sources` row from the last ~48h (``--window-hours``) that has at
-least one active ``insights`` row of ``type='action'`` but ZERO Linear issues
-referencing that meeting (source_id pattern ``transcript:<source_id>:*``),
-create one Linear task per action insight.
+PURE PYTHON, read-only: it never starts a Claude/LLM session and NEVER creates,
+updates or closes a Linear issue. For each `sources` row from the last ~48h
+(``--window-hours``) that has at least one active ``insights`` row of
+``type='action'`` (the same selection as before; the window is not widened):
 
-Gate is at the MEETING level, not per-insight: if the meeting already has ≥1
-task, we assume /meeting-actions succeeded (or was manually backfilled) and
-skip the whole meeting. This deliberately avoids duplicating a
-partially-successful run — the tradeoff the design accepts is that a meeting
-whose first sweep crashed mid-way is not re-topped-up on a later run (a single
-sweep creates all of a meeting's tasks in one pass, so this only bites on a
-crash between two insights of the same meeting).
+  * `metadata ? 'task_decisions'`  → skipped, nothing reported.
+  * no record, but the meeting already has ≥1 `transcript:<sid>:*` Linear
+    ticket → skipped. That is a meeting from before the record existed whose
+    agent run succeeded; reporting it would page for every pre-cutover meeting.
+  * no record and no ticket → REPORTED: logged, and ONE Telegram line per sweep
+    lists every such meeting with the command to re-run.
 
-IDEMPOTENCY
-───────────
-Two independent layers:
-  1. Meeting-level gate — a meeting with any ``transcript:<sid>:*`` task is
-     skipped. A prior sweep's own tasks (``transcript:<sid>:recon-<insight_id>``)
-     satisfy this, so a second run is a no-op.
-  2. linear_client upserts on ``source_id`` (``upsert_by_source_id``), so even
-     if the gate is bypassed the same insight never spawns a duplicate issue.
+Reporting is the whole job. Re-running the agent is a human (or, later, the
+lailix-automations `meeting-followup` job) action.
 
 SCOPE (what it intentionally does NOT do)
 ─────────────────────────────────────────
-Only Linear tasks. It does NOT extract insights (that still needs the LLM
-path), draft emails, refresh ClientContext, or send Telegram. Its single job
-is to guarantee that action insights which already exist in InsightBase are
-reflected as Linear tasks.
+No ticket writes of any kind. It does not extract insights, draft emails or
+refresh ClientContext. The Linear gate read (`linear_client.query`) stays
+read-only; a failed gate read aborts the sweep instead of reporting meetings
+that may in fact have tickets.
 
 Environment:
-  INSIGHTBASE_DATABASE_URL — Postgres DSN for InsightBase (via neon_insert).
-  LINEAR_API_KEY           — read by Brain's linear_client (env or Brain/.env).
+  INSIGHTBASE_DATABASE_URL: Postgres DSN for InsightBase (via neon_insert).
+  LINEAR_API_KEY: read by Brain's linear_client (env or Brain/.env), reads only.
+  TELEGRAM_NOTIFY_SCRIPT: optional override for Brain's telegram_notify.py.
 
 CLI:
-    python3 reconcile_meeting_tasks.py                 # reconcile last 48h
+    python3 reconcile_meeting_tasks.py                 # sweep last 48h, report
     python3 reconcile_meeting_tasks.py --window-hours 72
-    python3 reconcile_meeting_tasks.py --dry-run       # show, create nothing
+    python3 reconcile_meeting_tasks.py --dry-run       # print, send nothing
     python3 reconcile_meeting_tasks.py --verbose
 """
 
@@ -69,12 +69,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # ── Paths / constants ─────────────────────────────────────────────────
 
@@ -82,13 +83,10 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-# Brain owns the Linear client (single source of truth for Linear writes) and
-# the audit log. Add its scripts dir to the path so we can import them.
+# Brain owns the Linear client (read-only here) and the audit log. Add its scripts dir to the path so we can import them.
 BRAIN_SCRIPTS_DIR = Path("/Users/Matthias/Repos/Brain/.claude/scripts")
 if str(BRAIN_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(BRAIN_SCRIPTS_DIR))
-
-LINEAR_CLIENT_PATH = BRAIN_SCRIPTS_DIR / "linear_client.py"
 
 DEFAULT_WINDOW_HOURS = 48
 DEFAULT_STATE_FILE = (
@@ -98,11 +96,8 @@ DEFAULT_STATE_FILE = (
 # Skill name used for brain_audit events.
 AUDIT_SKILL = "meeting-actions-reconcile"
 
-# Linear task defaults — mirror /meeting-actions Step 5 conventions.
+# The gate read looks for meeting tickets by this label (read-only).
 TASK_SOURCE = "meeting-action"
-TASK_STATE = "Triage"          # automation-created → Triage inbox for human accept/decline
-TASK_PRIORITY = "medium"       # /meeting-actions default priority
-EXTERNAL_OWNER_LABEL = "external-owner"
 
 # How many recent meeting-action issues to pull when building the "already has
 # tasks" gate snapshot. We only reconcile meetings from the last ~48h, so any
@@ -110,9 +105,6 @@ EXTERNAL_OWNER_LABEL = "external-owner"
 # 250 is Linear's hard per-page `first:` cap — asking for more is a GraphQL
 # "Argument Validation Error".
 DEFAULT_LINEAR_FETCH_LIMIT = 250
-
-# Assignees treated as "Matthias" (no external-owner label). Lowercased.
-_SELF_NAMES = {"matthias", "matthias heim", "matthi", "mättu"}
 
 logger = logging.getLogger("reconcile_meeting_tasks")
 
@@ -137,13 +129,16 @@ class Meeting:
     company: Optional[str]
     started_at: Optional[datetime]
     actions: list[ActionInsight] = field(default_factory=list)
+    # True when sources.metadata carries a `task_decisions` record.
+    has_decision_record: bool = False
 
 
 # ── InsightBase reads ─────────────────────────────────────────────────
 
 def fetch_meetings_with_actions(conn, window_hours: int) -> list[Meeting]:
     """Return meetings from the last `window_hours` that have ≥1 active action
-    insight, each with its action insights attached.
+    insight, each with its action insights attached and whether the meeting
+    already carries a `task_decisions` record.
 
     Window is measured on the meeting time (`started_at`, falling back to the
     row's `created_at` when a recording has no parsed start time).
@@ -155,7 +150,8 @@ def fetch_meetings_with_actions(conn, window_hours: int) -> list[Meeting]:
             SELECT
                 s.id, s.title, s.company, s.started_at,
                 i.id, i.title, i.content, i.assignee, i.due_date,
-                i.confidence, i.source_quote
+                i.confidence, i.source_quote,
+                COALESCE(s.metadata ? 'task_decisions', false)
             FROM sources s
             JOIN insights i ON i.source_id = s.id
             WHERE COALESCE(s.started_at, s.created_at)
@@ -170,12 +166,14 @@ def fetch_meetings_with_actions(conn, window_hours: int) -> list[Meeting]:
             (
                 sid, s_title, company, started_at,
                 iid, i_title, content, assignee, due_date, confidence, quote,
+                has_record,
             ) = row
             m = meetings.get(sid)
             if m is None:
                 m = Meeting(
                     source_id=sid, title=s_title, company=company,
                     started_at=started_at,
+                    has_decision_record=bool(has_record),
                 )
                 meetings[sid] = m
             m.actions.append(
@@ -213,87 +211,24 @@ def parse_meeting_source_id(task_source_id: str) -> Optional[str]:
     return None
 
 
-def _is_external_owner(assignee: Optional[str]) -> bool:
-    """True if the action's owner is someone other than Matthias."""
-    if not assignee:
-        return False
-    return assignee.strip().lower() not in _SELF_NAMES
-
-
-def _truncate(text: str, limit: int) -> str:
-    text = (text or "").strip()
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
-def build_task_spec(meeting: Meeting, action: ActionInsight) -> dict:
-    """Build the linear_client `--create-from-json` spec for one action insight.
-
-    Pure function — no I/O — so it is trivially unit-testable.
-    """
-    due = action.due_date.isoformat() if action.due_date else None
-    started = (
-        meeting.started_at.date().isoformat() if meeting.started_at else "unknown date"
-    )
-
-    body_lines = [action.content.strip() if action.content else ""]
-    body_lines.append("")
-    body_lines.append(f"**Owner:** {action.assignee or 'unassigned'}")
-    if action.source_quote:
-        body_lines.append(f"**Source quote:** “{action.source_quote.strip()}”")
-    body_lines.append("")
-    body_lines.append(
-        "_Auto-created by the deterministic reconciliation sweep "
-        "(reconcile_meeting_tasks.py) — the meeting's /meeting-actions Claude "
-        "session did not create Linear tasks._"
-    )
-    body_lines.append(
-        f"_Meeting: {meeting.title or 'untitled'} "
-        f"(InsightBase source {meeting.source_id}, {started}). "
-        f"Insight {action.insight_id}, confidence {action.confidence}._"
-    )
-
-    spec: dict = {
-        "source": TASK_SOURCE,
-        "source_id": f"{meeting_task_prefix(meeting.source_id)}recon-{action.insight_id}",
-        "title": _truncate(action.title, 250),
-        "body": "\n".join(body_lines).strip() + "\n",
-        "priority": TASK_PRIORITY,
-        "state": TASK_STATE,
-    }
-    if meeting.company:
-        spec["client"] = meeting.company
-    if due:
-        spec["due"] = due
-    if _is_external_owner(action.assignee):
-        # Mirror /meeting-actions convention: still create the task, but flag
-        # it so it never auto-closes on Matthias's behalf.
-        spec["labels"] = [EXTERNAL_OWNER_LABEL]
-    return spec
-
-
 # ── Linear gateway ────────────────────────────────────────────────────
 
 class LinearGateway:
-    """Reads the "already has tasks" gate from Linear and creates tasks.
+    """Reads the "already has tickets" gate from Linear. Read-only: this class
+    has no write path, so the sweep cannot create tickets even by accident.
 
     Reads go through the imported `linear_client` module (reuses its meta
-    parser); writes go through the `linear_client.py --create-from-json -`
-    CLI, matching the contract every other writer in this system uses.
+    parser).
     """
 
-    def __init__(
-        self,
-        client_path: Path = LINEAR_CLIENT_PATH,
-        fetch_limit: int = DEFAULT_LINEAR_FETCH_LIMIT,
-    ):
-        self.client_path = Path(client_path)
+    def __init__(self, fetch_limit: int = DEFAULT_LINEAR_FETCH_LIMIT):
         self.fetch_limit = fetch_limit
 
     def source_ids_with_tasks(self) -> set[str]:
         """Set of InsightBase source ids that already have ≥1 Linear task.
 
         Raises on failure — a failed gate read must ABORT the sweep rather than
-        silently create duplicate tasks.
+        report meetings that may in fact have tickets.
         """
         import linear_client as lc
 
@@ -313,24 +248,76 @@ class LinearGateway:
                 found.add(sid)
         return found
 
-    def create_task(self, spec: dict) -> dict:
-        """Create/upsert one Linear task; return {issue_id, identifier, url, created}."""
-        proc = subprocess.run(
-            [sys.executable, str(self.client_path), "--create-from-json", "-"],
-            input=json.dumps(spec),
-            capture_output=True,
-            text=True,
-            timeout=60,
+
+# ── State file ────────────────────────────────────────────────────────
+
+def _load_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_state(path: Path, state: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not write state file %s: %s", path, e)
+
+
+# ── Telegram ──────────────────────────────────────────────────────────
+
+def _telegram_notify_script() -> Optional[str]:
+    """Resolve Brain's telegram_notify.py (same lookup order as the watcher).
+
+    Phase 3 of the meeting-pipeline spec removes this dependency.
+    """
+    candidates = [
+        os.environ.get("TELEGRAM_NOTIFY_SCRIPT", ""),
+        str(BRAIN_SCRIPTS_DIR / "telegram_notify.py"),
+        os.path.expanduser("~/.claude/scripts/telegram_notify.py"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def send_telegram(message: str) -> None:
+    """Send one Telegram line through Brain's telegram_notify.py.
+
+    Raises if the script is missing or exits non-zero, so the sweep counts a
+    lost alert as an error instead of pretending it was delivered. Tests inject
+    a fake `notify` instead of calling this.
+    """
+    script = _telegram_notify_script()
+    if not script:
+        raise RuntimeError("telegram_notify.py not found in any known location")
+    proc = subprocess.run(
+        [sys.executable, script, "--category", "Meeting", message],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"telegram_notify exited {proc.returncode}: "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"linear_client exited {proc.returncode}: "
-                f"{proc.stderr.strip() or proc.stdout.strip()}"
-            )
-        out = proc.stdout.strip()
-        # The client prints the JSON result on the last line.
-        last = out.splitlines()[-1] if out else "{}"
-        return json.loads(last)
+
+
+def format_report(unrecorded: list[Meeting]) -> str:
+    """One line naming every meeting without a decision record."""
+    if len(unrecorded) == 1:
+        m = unrecorded[0]
+        return (
+            f"Meeting {m.title or 'untitled'} (source {m.source_id}) has no ticket "
+            f"decisions — re-run /meeting-actions --source-id {m.source_id}"
+        )
+    listing = ", ".join(f"{m.title or 'untitled'} (source {m.source_id})" for m in unrecorded)
+    return (
+        f"{len(unrecorded)} meetings have no ticket decisions: {listing} — "
+        "re-run /meeting-actions --source-id N for each"
+    )
 
 
 # ── State file ────────────────────────────────────────────────────────
@@ -361,9 +348,12 @@ def reconcile(
     audit=None,
     state_path: Optional[Path] = None,
     now: Optional[datetime] = None,
+    notify: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    """Core sweep. Returns a summary dict. Injected `conn`/`gateway`/`audit`
-    keep this unit-testable without a real DB or Linear."""
+    """Core sweep. Returns a summary dict. Injected `conn`/`gateway`/`audit`/
+    `notify` keep this unit-testable without a real DB, Linear or Telegram.
+    Nothing here writes to Linear."""
+    notify = notify or send_telegram
     now = now or datetime.now(timezone.utc)
     meetings = fetch_meetings_with_actions(conn, window_hours)
     logger.info(
@@ -371,76 +361,57 @@ def reconcile(
         len(meetings), window_hours,
     )
 
-    # Snapshot the gate BEFORE creating anything.
+    # Snapshot the legacy gate (meetings from before the record existed).
     existing = gateway.source_ids_with_tasks()
 
     summary = {
         "window_hours": window_hours,
         "dry_run": dry_run,
         "meetings_with_actions": len(meetings),
+        "meetings_skipped_decision_record": 0,
         "meetings_skipped_existing_tasks": 0,
-        "meetings_reconciled": 0,
-        "action_insights_seen": 0,
-        "tasks_created": 0,
-        "tasks_upserted_existing": 0,
+        "meetings_unrecorded": 0,
+        "telegram_sent": False,
         "errors": 0,
-        "reconciled": [],  # per-meeting detail
+        "unrecorded": [],  # per-meeting detail
     }
 
+    unrecorded: list[Meeting] = []
     for m in meetings:
-        summary["action_insights_seen"] += len(m.actions)
+        if m.has_decision_record:
+            summary["meetings_skipped_decision_record"] += 1
+            logger.info("Skip meeting %s (%s): has task_decisions record",
+                        m.source_id, m.title or "untitled")
+            continue
         if str(m.source_id) in existing:
             summary["meetings_skipped_existing_tasks"] += 1
             logger.info(
-                "Skip meeting %s (%s): already has ≥1 Linear task",
-                m.source_id, m.title or "untitled",
+                "Skip meeting %s (%s): no record but already has ≥1 Linear ticket "
+                "(pre-record meeting)", m.source_id, m.title or "untitled",
             )
             continue
-
-        logger.info(
-            "Reconciling meeting %s (%s): %d action insight(s)%s",
-            m.source_id, m.title or "untitled", len(m.actions),
-            " [dry-run]" if dry_run else "",
+        logger.warning(
+            "Meeting %s (%s) has no ticket decisions — re-run /meeting-actions "
+            "--source-id %s", m.source_id, m.title or "untitled", m.source_id,
         )
-        created_here: list[dict] = []
-        for a in m.actions:
-            spec = build_task_spec(m, a)
-            if dry_run:
-                logger.info("  would create: %s → %s", spec["source_id"], spec["title"])
-                created_here.append({"source_id": spec["source_id"], "title": spec["title"]})
-                continue
+        unrecorded.append(m)
+        summary["unrecorded"].append(
+            {"source_id": m.source_id, "title": m.title, "company": m.company,
+             "action_insights": len(m.actions)}
+        )
+    summary["meetings_unrecorded"] = len(unrecorded)
+
+    if unrecorded:
+        line = format_report(unrecorded)
+        if dry_run:
+            logger.info("[dry-run] would send Telegram: %s", line)
+        else:
             try:
-                res = gateway.create_task(spec)
-                if res.get("created"):
-                    summary["tasks_created"] += 1
-                else:
-                    summary["tasks_upserted_existing"] += 1
-                logger.info(
-                    "  %s %s → %s",
-                    "created" if res.get("created") else "updated",
-                    res.get("identifier", "?"), spec["title"],
-                )
-                created_here.append(
-                    {
-                        "source_id": spec["source_id"],
-                        "identifier": res.get("identifier"),
-                        "url": res.get("url"),
-                        "created": res.get("created"),
-                    }
-                )
-            except Exception as e:  # noqa: BLE001 — one bad insight must not abort the run
+                notify(line)
+                summary["telegram_sent"] = True
+            except Exception as e:  # noqa: BLE001 — a lost alert is an error, not a crash
                 summary["errors"] += 1
-                logger.error("  failed to create task for insight %s: %s", a.insight_id, e)
-
-        summary["meetings_reconciled"] += 1
-        summary["reconciled"].append(
-            {
-                "source_id": m.source_id,
-                "title": m.title,
-                "company": m.company,
-                "tasks": created_here,
-            }
-        )
+                logger.error("Telegram report failed: %s", e)
 
     _finalize(summary, now, dry_run, audit, state_path)
     return summary
@@ -451,15 +422,12 @@ def _finalize(summary, now, dry_run, audit, state_path):
     if state_path is not None and not dry_run:
         state = _load_state(state_path)
         state["last_run_utc"] = now.isoformat()
-        state["last_summary"] = {
-            k: v for k, v in summary.items() if k != "reconciled"
-        }
-        reconciled_map = state.setdefault("reconciled_sources", {})
-        for entry in summary["reconciled"]:
-            reconciled_map[str(entry["source_id"])] = {
-                "reconciled_utc": now.isoformat(),
+        state["last_summary"] = {k: v for k, v in summary.items() if k != "unrecorded"}
+        reported = state.setdefault("reported_sources", {})
+        for entry in summary["unrecorded"]:
+            reported[str(entry["source_id"])] = {
+                "reported_utc": now.isoformat(),
                 "title": entry["title"],
-                "tasks": [t.get("identifier") for t in entry["tasks"] if t.get("identifier")],
             }
         _save_state(state_path, state)
 
@@ -467,9 +435,9 @@ def _finalize(summary, now, dry_run, audit, state_path):
         details = (
             f"window={summary['window_hours']}h "
             f"meetings={summary['meetings_with_actions']} "
-            f"reconciled={summary['meetings_reconciled']} "
-            f"skipped={summary['meetings_skipped_existing_tasks']} "
-            f"tasks_created={summary['tasks_created']} "
+            f"unrecorded={summary['meetings_unrecorded']} "
+            f"skipped_record={summary['meetings_skipped_decision_record']} "
+            f"skipped_tickets={summary['meetings_skipped_existing_tasks']} "
             f"errors={summary['errors']}"
             + (" [dry-run]" if dry_run else "")
         )
@@ -481,7 +449,7 @@ def _finalize(summary, now, dry_run, audit, state_path):
                 details=details,
                 status=status,
                 context=json.dumps(
-                    {k: v for k, v in summary.items() if k != "reconciled"}
+                    {k: v for k, v in summary.items() if k != "unrecorded"}
                 ),
             )
         except Exception as e:  # noqa: BLE001
@@ -502,8 +470,9 @@ def _build_audit():
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Deterministically gap-fill missing Linear tasks for "
-        "recently-transcribed meetings whose /meeting-actions session failed."
+        description="Report recently-transcribed meetings that have no "
+        "task_decisions record (the /meeting-actions agent never ran). "
+        "Read-only: never creates Linear tickets."
     )
     parser.add_argument(
         "--window-hours", type=int, default=DEFAULT_WINDOW_HOURS,
@@ -511,11 +480,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Report what would be created without touching Linear or state.",
+        help="Print what would be reported; send no Telegram, write no state.",
     )
     parser.add_argument(
         "--linear-fetch-limit", type=int, default=DEFAULT_LINEAR_FETCH_LIMIT,
-        help="How many recent meeting-action issues to scan for the gate.",
+        help="How many recent meeting-action issues to scan for the legacy gate.",
     )
     parser.add_argument(
         "--state-file", type=Path, default=DEFAULT_STATE_FILE,
@@ -534,7 +503,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     from neon_insert import _get_conn
 
     gateway = LinearGateway(fetch_limit=args.linear_fetch_limit)
-    audit = _build_audit()
+    audit = None if args.dry_run else _build_audit()  # dry-run writes nothing
 
     conn = _get_conn()
     try:
@@ -550,7 +519,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         conn.close()
 
     print(json.dumps({k: v for k, v in summary.items()}, indent=2, ensure_ascii=False, default=str))
-    # Non-zero exit if any task failed, so launchd/monitoring notices.
+    # Non-zero exit if the report could not be delivered, so launchd notices.
     return 1 if summary["errors"] else 0
 
 

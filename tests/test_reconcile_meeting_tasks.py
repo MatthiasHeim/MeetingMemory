@@ -1,19 +1,20 @@
-"""Tests for the deterministic Linear-task reconciliation sweep.
+"""Tests for the meeting decision-record backstop.
 
-The sweep (tools/reconcile_meeting_tasks.py) is the backstop for the 2026-07-10
-incident: every fire-and-forget `claude -p /meeting-actions` session died on a
-session limit, so meetings that had action insights in InsightBase never got
-their Linear tasks. This sweep gap-fills them deterministically (pure Python,
-no Claude session).
+The sweep (tools/reconcile_meeting_tasks.py) began as the 2026-07-10 backstop
+that created Linear tickets from action insights. Since 2026-09-30 it only
+checks `sources.metadata.task_decisions` (written by the /meeting-actions
+agent): a meeting with a record is skipped, a meeting without one is reported
+by one Telegram line, and the sweep never writes to Linear.
 
-These tests exercise the pure spec-builder and the orchestration with injected
-fakes for the DB connection and the Linear gateway — no real DB or Linear.
+These tests exercise the orchestration with injected fakes for the DB
+connection, the Linear gate and the notifier: no real DB, Linear or Telegram.
 """
 
 from __future__ import annotations
 
+import json
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -57,14 +58,11 @@ class _FakeConn:
 
 
 class _FakeGateway:
-    """Stateful fake: source_ids_with_tasks() reflects both preset existing
-    tasks AND anything created_task() has produced so far, so a second
-    reconcile() over the same gateway exercises real idempotency."""
+    """Read-only fake. It deliberately has NO create_task: any attempt by the
+    sweep to create a ticket raises AttributeError and fails the test."""
 
-    def __init__(self, existing=None, fail_insight_ids=None):
+    def __init__(self, existing=None):
         self._existing = {str(x) for x in (existing or [])}
-        self.fail_insight_ids = {str(x) for x in (fail_insight_ids or [])}
-        self.created: list[dict] = []
         self.gate_calls = 0
         self.raise_on_gate = False
 
@@ -72,23 +70,18 @@ class _FakeGateway:
         self.gate_calls += 1
         if self.raise_on_gate:
             raise RuntimeError("linear gate unreachable")
-        derived = set(self._existing)
-        for spec in self.created:
-            sid = rc.parse_meeting_source_id(spec["source_id"])
-            if sid:
-                derived.add(sid)
-        return derived
+        return set(self._existing)
 
-    def create_task(self, spec):
-        iid = spec["source_id"].rsplit("recon-", 1)[-1]
-        if iid in self.fail_insight_ids:
-            raise RuntimeError("linear create failed")
-        self.created.append(spec)
-        return {
-            "identifier": f"LAI-{len(self.created)}",
-            "url": f"https://linear.app/x/{len(self.created)}",
-            "created": True,
-        }
+
+class _FakeNotify:
+    def __init__(self, fail=False):
+        self.lines: list[str] = []
+        self.fail = fail
+
+    def __call__(self, line):
+        if self.fail:
+            raise RuntimeError("telegram down")
+        self.lines.append(line)
 
 
 class _FakeAudit:
@@ -106,10 +99,10 @@ class _FakeAudit:
 def _row(sid, iid, *, title="Meeting", company="BlueCare",
          started=datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc),
          i_title="Do the thing", content="Context here", assignee="Matthias Heim",
-         due=None, confidence="high", quote="I'll do it"):
+         due=None, confidence="high", quote="I'll do it", record=False):
     """Build one JOIN row in the exact column order the sweep's SELECT emits."""
     return (sid, title, company, started, iid, i_title, content, assignee, due,
-            confidence, quote)
+            confidence, quote, record)
 
 
 # ── pure helpers ───────────────────────────────────────────────────────
@@ -122,149 +115,143 @@ def test_parse_meeting_source_id():
     assert rc.parse_meeting_source_id("transcript:") is None
 
 
-def test_build_task_spec_basic():
-    m = rc.Meeting(source_id=466, title="Confluence rollout", company="BlueCare",
-                   started_at=datetime(2026, 7, 10, 16, 34, tzinfo=timezone.utc))
-    a = rc.ActionInsight(insight_id=4501, title="Send the plugin note",
-                         content="Matthias sends the note to Stefan.",
-                         assignee="Matthias Heim", due_date=date(2026, 7, 11),
-                         confidence="high", source_quote="I'll send it")
-    spec = rc.build_task_spec(m, a)
-    assert spec["source"] == "meeting-action"
-    assert spec["source_id"] == "transcript:466:recon-4501"
-    assert spec["title"] == "Send the plugin note"
-    assert spec["state"] == "Triage"
-    assert spec["priority"] == "medium"
-    assert spec["client"] == "BlueCare"
-    assert spec["due"] == "2026-07-11"
-    assert "labels" not in spec  # Matthias-owned → no external-owner label
-    assert "source 466" in spec["body"]
-    assert "4501" in spec["body"]
-
-
-def test_build_task_spec_external_owner_labeled():
-    m = rc.Meeting(source_id=466, title="x", company=None, started_at=None)
-    a = rc.ActionInsight(insight_id=9, title="Stefan rolls out plugins",
-                         content="", assignee="Stefan", due_date=None,
-                         confidence="medium", source_quote=None)
-    spec = rc.build_task_spec(m, a)
-    assert spec["labels"] == ["external-owner"]
-    assert "client" not in spec   # no company
-    assert "due" not in spec      # no due date
-
-
-def test_build_task_spec_truncates_title():
-    m = rc.Meeting(source_id=1, title=None, company=None, started_at=None)
-    long = "x" * 400
-    a = rc.ActionInsight(insight_id=1, title=long, content="", assignee=None,
-                         due_date=None, confidence="low", source_quote=None)
-    spec = rc.build_task_spec(m, a)
-    assert len(spec["title"]) <= 250
-
-
-def test_is_external_owner():
-    assert rc._is_external_owner("Stefan") is True
-    assert rc._is_external_owner("Matthias") is False
-    assert rc._is_external_owner("Matthias Heim") is False
-    assert rc._is_external_owner(None) is False
-    assert rc._is_external_owner("") is False
-
-
 # ── orchestration ──────────────────────────────────────────────────────
 
-def test_reconcile_creates_one_task_per_action_for_ungated_meeting():
-    rows = [_row(466, 4501, i_title="A"), _row(466, 4502, i_title="B")]
-    conn = _FakeConn(rows)
-    gw = _FakeGateway(existing=[])
-    summary = rc.reconcile(conn, gw, window_hours=48, now=datetime(2026, 7, 11, tzinfo=timezone.utc))
+NOW = datetime(2026, 7, 11, 18, 30, tzinfo=timezone.utc)
+
+
+def test_meeting_with_decision_record_is_skipped_and_not_reported():
+    conn = _FakeConn([_row(466, 4501, record=True), _row(466, 4502, record=True)])
+    notify = _FakeNotify()
+    summary = rc.reconcile(conn, _FakeGateway(), window_hours=48, notify=notify, now=NOW)
     assert summary["meetings_with_actions"] == 1
-    assert summary["meetings_reconciled"] == 1
-    assert summary["meetings_skipped_existing_tasks"] == 0
-    assert summary["tasks_created"] == 2
-    assert summary["errors"] == 0
-    assert {s["source_id"] for s in gw.created} == {
-        "transcript:466:recon-4501", "transcript:466:recon-4502"}
+    assert summary["meetings_skipped_decision_record"] == 1
+    assert summary["meetings_unrecorded"] == 0
+    assert notify.lines == []
+    assert summary["telegram_sent"] is False
 
 
-def test_reconcile_skips_meeting_that_already_has_tasks():
-    """The meeting-level gate: source 463 already has LAI-376..379."""
-    rows = [_row(463, 4329)]
-    conn = _FakeConn(rows)
-    gw = _FakeGateway(existing=["463"])
-    summary = rc.reconcile(conn, gw, window_hours=48)
+def test_meeting_without_record_is_reported_and_creates_no_ticket():
+    """Record absent → reported. _FakeGateway has no create_task, so a single
+    Linear create call from the sweep would raise and fail this test."""
+    conn = _FakeConn([_row(466, 4501, title="BlueCare Retainer"), _row(466, 4502)])
+    gw = _FakeGateway()
+    notify = _FakeNotify()
+    summary = rc.reconcile(conn, gw, window_hours=48, notify=notify, now=NOW)
+    assert summary["meetings_unrecorded"] == 1
+    assert summary["unrecorded"][0]["source_id"] == 466
+    assert notify.lines == [
+        "Meeting BlueCare Retainer (source 466) has no ticket decisions — "
+        "re-run /meeting-actions --source-id 466"
+    ]
+    assert summary["telegram_sent"] is True
+    assert not hasattr(gw, "create_task")
+    assert not hasattr(rc, "build_task_spec")
+
+
+def test_two_sided_mixed_batch_sends_one_line_listing_only_unrecorded():
+    conn = _FakeConn([
+        _row(466, 1, title="Has record", record=True),
+        _row(467, 2, title="No record A"),
+        _row(468, 3, title="No record B"),
+    ])
+    notify = _FakeNotify()
+    summary = rc.reconcile(conn, _FakeGateway(), window_hours=48, notify=notify, now=NOW)
+    assert summary["meetings_skipped_decision_record"] == 1
+    assert summary["meetings_unrecorded"] == 2
+    assert len(notify.lines) == 1  # ONE line per sweep
+    line = notify.lines[0]
+    assert "No record A (source 467)" in line and "No record B (source 468)" in line
+    assert "Has record" not in line
+    assert "\n" not in line
+
+
+def test_legacy_meeting_with_tickets_but_no_record_is_not_reported():
+    """Meetings from before the record existed: agent ran, tickets exist."""
+    conn = _FakeConn([_row(463, 4329)])
+    notify = _FakeNotify()
+    summary = rc.reconcile(conn, _FakeGateway(existing=["463"]), window_hours=48,
+                           notify=notify, now=NOW)
     assert summary["meetings_skipped_existing_tasks"] == 1
-    assert summary["meetings_reconciled"] == 0
-    assert summary["tasks_created"] == 0
-    assert gw.created == []
+    assert summary["meetings_unrecorded"] == 0
+    assert notify.lines == []
 
 
-def test_reconcile_is_idempotent_across_runs():
-    rows = [_row(466, 4501), _row(466, 4502)]
-    gw = _FakeGateway(existing=[])
-    first = rc.reconcile(_FakeConn(rows), gw, window_hours=48)
-    assert first["tasks_created"] == 2
-    # Second run over the same gateway: its gate now reports 466 has tasks.
-    second = rc.reconcile(_FakeConn(rows), gw, window_hours=48)
-    assert second["meetings_skipped_existing_tasks"] == 1
-    assert second["tasks_created"] == 0
-    assert len(gw.created) == 2  # no new tasks
+def test_record_wins_over_gate_even_without_tickets():
+    """update/close/none-only meetings have a record and zero tickets: skipped."""
+    conn = _FakeConn([_row(1121, 8387, record=True)])
+    notify = _FakeNotify()
+    summary = rc.reconcile(conn, _FakeGateway(existing=[]), window_hours=48,
+                           notify=notify, now=NOW)
+    assert summary["meetings_skipped_decision_record"] == 1
+    assert notify.lines == []
 
 
-def test_reconcile_dry_run_creates_nothing(tmp_path):
-    rows = [_row(466, 4501)]
-    gw = _FakeGateway(existing=[])
+def test_no_meetings_sends_nothing():
+    notify = _FakeNotify()
+    summary = rc.reconcile(_FakeConn([]), _FakeGateway(), window_hours=48,
+                           notify=notify, now=NOW)
+    assert summary["meetings_with_actions"] == 0
+    assert notify.lines == []
+
+
+def test_dry_run_reports_in_summary_but_sends_and_persists_nothing(tmp_path):
     state = tmp_path / "state.json"
-    summary = rc.reconcile(_FakeConn(rows), gw, window_hours=48,
-                           dry_run=True, state_path=state)
+    notify = _FakeNotify()
+    summary = rc.reconcile(_FakeConn([_row(466, 4501)]), _FakeGateway(),
+                           window_hours=48, dry_run=True, state_path=state,
+                           notify=notify, now=NOW)
     assert summary["dry_run"] is True
-    assert summary["meetings_reconciled"] == 1
-    assert summary["tasks_created"] == 0
-    assert gw.created == []
-    assert not state.exists()  # dry-run must not persist state
+    assert summary["meetings_unrecorded"] == 1
+    assert summary["telegram_sent"] is False
+    assert notify.lines == []
+    assert not state.exists()
 
 
-def test_reconcile_one_failing_insight_counts_error_and_continues():
-    rows = [_row(466, 4501), _row(466, 4502)]
-    gw = _FakeGateway(existing=[], fail_insight_ids=[4501])
-    summary = rc.reconcile(_FakeConn(rows), gw, window_hours=48)
+def test_notify_failure_counts_as_error_not_crash():
+    notify = _FakeNotify(fail=True)
+    summary = rc.reconcile(_FakeConn([_row(466, 4501)]), _FakeGateway(),
+                           window_hours=48, notify=notify, now=NOW)
     assert summary["errors"] == 1
-    assert summary["tasks_created"] == 1  # 4502 still created
-    assert summary["meetings_reconciled"] == 1
+    assert summary["telegram_sent"] is False
+    assert summary["meetings_unrecorded"] == 1
 
 
-def test_reconcile_aborts_when_gate_read_fails():
-    rows = [_row(466, 4501)]
-    gw = _FakeGateway(existing=[])
+def test_aborts_when_gate_read_fails_and_reports_nothing():
+    gw = _FakeGateway()
     gw.raise_on_gate = True
+    notify = _FakeNotify()
     with pytest.raises(RuntimeError):
-        rc.reconcile(_FakeConn(rows), gw, window_hours=48)
-    assert gw.created == []  # never created anything on a failed gate read
+        rc.reconcile(_FakeConn([_row(466, 4501)]), gw, window_hours=48, notify=notify)
+    assert notify.lines == []
 
 
-def test_reconcile_writes_state_file(tmp_path):
-    rows = [_row(466, 4501)]
-    gw = _FakeGateway(existing=[])
+def test_writes_state_file_with_reported_sources(tmp_path):
     state = tmp_path / "reconcile_state.json"
-    now = datetime(2026, 7, 11, 18, 30, tzinfo=timezone.utc)
-    rc.reconcile(_FakeConn(rows), gw, window_hours=48, state_path=state, now=now)
-    import json
+    rc.reconcile(_FakeConn([_row(466, 4501)]), _FakeGateway(), window_hours=48,
+                 state_path=state, notify=_FakeNotify(), now=NOW)
     data = json.loads(state.read_text())
-    assert data["last_run_utc"] == now.isoformat()
-    assert "466" in data["reconciled_sources"]
-    assert data["last_summary"]["tasks_created"] == 1
+    assert data["last_run_utc"] == NOW.isoformat()
+    assert "466" in data["reported_sources"]
+    assert data["last_summary"]["meetings_unrecorded"] == 1
 
 
-def test_reconcile_audits_run(tmp_path):
-    rows = [_row(466, 4501), _row(466, 4502)]
-    gw = _FakeGateway(existing=[], fail_insight_ids=[4502])
+def test_audits_run_with_error_status_when_notify_fails():
     audit = _FakeAudit()
-    rc.reconcile(_FakeConn(rows), gw, window_hours=48, audit=audit)
+    rc.reconcile(_FakeConn([_row(466, 4501)]), _FakeGateway(), window_hours=48,
+                 audit=audit, notify=_FakeNotify(fail=True), now=NOW)
     assert len(audit.events) == 1
     ev = audit.events[0]
     assert ev["skill"] == rc.AUDIT_SKILL
     assert ev["event_type"] == "run"
-    assert ev["status"] == "error"  # one insight failed
-    assert "tasks_created=1" in ev["details"]
+    assert ev["status"] == "error"
+    assert "unrecorded=1" in ev["details"]
+
+
+def test_send_telegram_raises_when_script_missing(monkeypatch):
+    monkeypatch.setattr(rc, "_telegram_notify_script", lambda: None)
+    with pytest.raises(RuntimeError):
+        rc.send_telegram("x")
 
 
 def test_fetch_meetings_groups_actions_by_source():
@@ -275,8 +262,10 @@ def test_fetch_meetings_groups_actions_by_source():
     assert set(by_id) == {466, 467}
     assert len(by_id[466].actions) == 2
     assert len(by_id[467].actions) == 1
+    assert by_id[466].has_decision_record is False
     # window param is threaded into the query
     assert conn.last_cursor.executed[0][1] == (48,)
+    assert "task_decisions" in conn.last_cursor.executed[0][0]
 
 
 # ── gate read (source_ids_with_tasks) with a fake linear_client ─────────
@@ -301,3 +290,11 @@ def test_gateway_source_ids_with_tasks_parses_meta(monkeypatch):
 
     gw = rc.LinearGateway(fetch_limit=250)
     assert gw.source_ids_with_tasks() == {"463", "466"}
+
+
+def test_fetch_meetings_reads_decision_record_flag():
+    meetings = rc.fetch_meetings_with_actions(
+        _FakeConn([_row(466, 1, record=True), _row(467, 2, record=False)]), 48)
+    by_id = {m.source_id: m for m in meetings}
+    assert by_id[466].has_decision_record is True
+    assert by_id[467].has_decision_record is False
