@@ -96,13 +96,12 @@ class _FakeAudit:
         return len(self.events)
 
 
-def _row(sid, iid, *, title="Meeting", company="BlueCare",
-         started=datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc),
-         i_title="Do the thing", content="Context here", assignee="Matthias Heim",
-         due=None, confidence="high", quote="I'll do it", record=False):
-    """Build one JOIN row in the exact column order the sweep's SELECT emits."""
-    return (sid, title, company, started, iid, i_title, content, assignee, due,
-            confidence, quote, record)
+def _row(sid, _iid=None, *, title="Meeting", company="BlueCare",
+         started=datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc), record=False, **_ignored):
+    """One meeting row in the exact column order the sweep's SELECT emits.
+    `_iid` and extra kwargs are accepted so a meeting can be written with or
+    without insights: the sweep no longer reads insights at all."""
+    return (sid, title, company, started, record)
 
 
 # ── pure helpers ───────────────────────────────────────────────────────
@@ -121,10 +120,10 @@ NOW = datetime(2026, 7, 11, 18, 30, tzinfo=timezone.utc)
 
 
 def test_meeting_with_decision_record_is_skipped_and_not_reported():
-    conn = _FakeConn([_row(466, 4501, record=True), _row(466, 4502, record=True)])
+    conn = _FakeConn([_row(466, record=True)])
     notify = _FakeNotify()
     summary = rc.reconcile(conn, _FakeGateway(), window_hours=48, notify=notify, now=NOW)
-    assert summary["meetings_with_actions"] == 1
+    assert summary["meetings_in_window"] == 1
     assert summary["meetings_skipped_decision_record"] == 1
     assert summary["meetings_unrecorded"] == 0
     assert notify.lines == []
@@ -134,7 +133,7 @@ def test_meeting_with_decision_record_is_skipped_and_not_reported():
 def test_meeting_without_record_is_reported_and_creates_no_ticket():
     """Record absent → reported. _FakeGateway has no create_task, so a single
     Linear create call from the sweep would raise and fail this test."""
-    conn = _FakeConn([_row(466, 4501, title="BlueCare Retainer"), _row(466, 4502)])
+    conn = _FakeConn([_row(466, title="BlueCare Retainer")])
     gw = _FakeGateway()
     notify = _FakeNotify()
     summary = rc.reconcile(conn, gw, window_hours=48, notify=notify, now=NOW)
@@ -191,7 +190,7 @@ def test_no_meetings_sends_nothing():
     notify = _FakeNotify()
     summary = rc.reconcile(_FakeConn([]), _FakeGateway(), window_hours=48,
                            notify=notify, now=NOW)
-    assert summary["meetings_with_actions"] == 0
+    assert summary["meetings_in_window"] == 0
     assert notify.lines == []
 
 
@@ -254,18 +253,39 @@ def test_send_telegram_raises_when_script_missing(monkeypatch):
         rc.send_telegram("x")
 
 
-def test_fetch_meetings_groups_actions_by_source():
-    rows = [_row(466, 1), _row(466, 2), _row(467, 3)]
-    conn = _FakeConn(rows)
-    meetings = rc.fetch_meetings_with_actions(conn, 48)
+def test_fetch_meetings_returns_one_row_per_meeting_with_record_flag():
+    conn = _FakeConn([_row(466, title="A"), _row(467, title="B", record=True)])
+    meetings = rc.fetch_meetings(conn, 48)
     by_id = {m.source_id: m for m in meetings}
     assert set(by_id) == {466, 467}
-    assert len(by_id[466].actions) == 2
-    assert len(by_id[467].actions) == 1
     assert by_id[466].has_decision_record is False
-    # window param is threaded into the query
-    assert conn.last_cursor.executed[0][1] == (48,)
-    assert "task_decisions" in conn.last_cursor.executed[0][0]
+    assert by_id[467].has_decision_record is True
+    sql, params = conn.last_cursor.executed[0]
+    assert params == (48,)
+    assert "task_decisions" in sql
+    assert "source_type = 'meeting'" in sql and "origin = 'noscribe'" in sql
+    assert "insights" not in sql  # action insights are no longer consulted
+
+
+def test_meeting_with_zero_insights_and_no_record_is_reported():
+    """The agent died before extracting anything: no insight rows exist."""
+    notify = _FakeNotify()
+    summary = rc.reconcile(_FakeConn([_row(1130, title="Died early")]), _FakeGateway(),
+                           window_hours=48, notify=notify, now=NOW)
+    assert summary["meetings_unrecorded"] == 1
+    assert notify.lines == [
+        "Meeting Died early (source 1130) has no ticket decisions — "
+        "re-run /meeting-actions --source-id 1130"
+    ]
+
+
+def test_meeting_with_zero_insights_but_a_record_is_skipped():
+    """An explicit `none` decision on a meeting with no insights is fine."""
+    notify = _FakeNotify()
+    summary = rc.reconcile(_FakeConn([_row(1131, record=True)]), _FakeGateway(),
+                           window_hours=48, notify=notify, now=NOW)
+    assert summary["meetings_skipped_decision_record"] == 1
+    assert notify.lines == []
 
 
 # ── gate read (source_ids_with_tasks) with a fake linear_client ─────────
@@ -293,7 +313,7 @@ def test_gateway_source_ids_with_tasks_parses_meta(monkeypatch):
 
 
 def test_fetch_meetings_reads_decision_record_flag():
-    meetings = rc.fetch_meetings_with_actions(
+    meetings = rc.fetch_meetings(
         _FakeConn([_row(466, 1, record=True), _row(467, 2, record=False)]), 48)
     by_id = {m.source_id: m for m in meetings}
     assert by_id[466].has_decision_record is True

@@ -31,9 +31,9 @@ agent never ran.
 WHAT IT DOES
 ────────────
 PURE PYTHON, read-only: it never starts a Claude/LLM session and NEVER creates,
-updates or closes a Linear issue. For each `sources` row from the last ~48h
-(``--window-hours``) that has at least one active ``insights`` row of
-``type='action'`` (the same selection as before; the window is not widened):
+updates or closes a Linear issue. For every `sources` row with
+source_type='meeting' and origin='noscribe' (the watcher's meetings) from the
+last ~48h (``--window-hours``), whether or not it has any insights:
 
   * `metadata ? 'task_decisions'`  → skipped, nothing reported.
   * no record, but the meeting already has ≥1 `transcript:<sid>:*` Linear
@@ -48,7 +48,7 @@ lailix-automations `meeting-followup` job) action.
 SCOPE (what it intentionally does NOT do)
 ─────────────────────────────────────────
 No ticket writes of any kind. It does not extract insights, draft emails or
-refresh ClientContext. The Linear gate read (`linear_client.query`) stays
+refresh ClientContext. It does not read insights at all. The Linear gate read (`linear_client.query`) stays
 read-only; a failed gate read aborts the sweep instead of reporting meetings
 that may in fact have tickets.
 
@@ -72,8 +72,8 @@ import logging
 import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -112,82 +112,47 @@ logger = logging.getLogger("reconcile_meeting_tasks")
 # ── Data model ────────────────────────────────────────────────────────
 
 @dataclass
-class ActionInsight:
-    insight_id: int
-    title: str
-    content: str
-    assignee: Optional[str]
-    due_date: Optional[date]
-    confidence: str
-    source_quote: Optional[str]
-
-
-@dataclass
 class Meeting:
     source_id: int
     title: Optional[str]
     company: Optional[str]
     started_at: Optional[datetime]
-    actions: list[ActionInsight] = field(default_factory=list)
     # True when sources.metadata carries a `task_decisions` record.
     has_decision_record: bool = False
 
 
 # ── InsightBase reads ─────────────────────────────────────────────────
 
-def fetch_meetings_with_actions(conn, window_hours: int) -> list[Meeting]:
-    """Return meetings from the last `window_hours` that have ≥1 active action
-    insight, each with its action insights attached and whether the meeting
-    already carries a `task_decisions` record.
+def fetch_meetings(conn, window_hours: int) -> list[Meeting]:
+    """Return every recorded meeting from the last `window_hours`, with whether
+    it already carries a `task_decisions` record.
 
-    Window is measured on the meeting time (`started_at`, falling back to the
-    row's `created_at` when a recording has no parsed start time).
+    A meeting is a `sources` row with source_type='meeting' and origin='noscribe'
+    (what the watcher seeds; Teams/Gmail/Gemini-origin meeting rows never go
+    through /meeting-actions from the watcher). Insights are deliberately not
+    consulted: a meeting where the agent died before extracting anything, or
+    stored its commitments under other insight types, must still be reported.
+    Window is measured on `started_at`, falling back to `created_at`.
     """
-    meetings: dict[int, Meeting] = {}
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT
-                s.id, s.title, s.company, s.started_at,
-                i.id, i.title, i.content, i.assignee, i.due_date,
-                i.confidence, i.source_quote,
-                COALESCE(s.metadata ? 'task_decisions', false)
+            SELECT s.id, s.title, s.company, s.started_at,
+                   COALESCE(s.metadata ? 'task_decisions', false)
             FROM sources s
-            JOIN insights i ON i.source_id = s.id
-            WHERE COALESCE(s.started_at, s.created_at)
+            WHERE s.source_type = 'meeting'
+              AND s.origin = 'noscribe'
+              AND COALESCE(s.started_at, s.created_at)
                   >= now() - make_interval(hours => %s)
-              AND i.type = 'action'
-              AND COALESCE(i.lifecycle_status, 'active') = 'active'
-            ORDER BY s.id, i.id;
+            ORDER BY s.id;
             """,
             (window_hours,),
         )
-        for row in cur.fetchall():
-            (
-                sid, s_title, company, started_at,
-                iid, i_title, content, assignee, due_date, confidence, quote,
-                has_record,
-            ) = row
-            m = meetings.get(sid)
-            if m is None:
-                m = Meeting(
-                    source_id=sid, title=s_title, company=company,
-                    started_at=started_at,
-                    has_decision_record=bool(has_record),
-                )
-                meetings[sid] = m
-            m.actions.append(
-                ActionInsight(
-                    insight_id=iid,
-                    title=i_title,
-                    content=content,
-                    assignee=assignee,
-                    due_date=due_date,
-                    confidence=confidence,
-                    source_quote=quote,
-                )
-            )
-    return list(meetings.values())
+        return [
+            Meeting(source_id=sid, title=title, company=company,
+                    started_at=started_at, has_decision_record=bool(has_record))
+            for sid, title, company, started_at, has_record in cur.fetchall()
+        ]
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────
@@ -355,9 +320,9 @@ def reconcile(
     Nothing here writes to Linear."""
     notify = notify or send_telegram
     now = now or datetime.now(timezone.utc)
-    meetings = fetch_meetings_with_actions(conn, window_hours)
+    meetings = fetch_meetings(conn, window_hours)
     logger.info(
-        "Found %d meeting(s) in the last %dh with action insights",
+        "Found %d meeting(s) in the last %dh",
         len(meetings), window_hours,
     )
 
@@ -367,7 +332,7 @@ def reconcile(
     summary = {
         "window_hours": window_hours,
         "dry_run": dry_run,
-        "meetings_with_actions": len(meetings),
+        "meetings_in_window": len(meetings),
         "meetings_skipped_decision_record": 0,
         "meetings_skipped_existing_tasks": 0,
         "meetings_unrecorded": 0,
@@ -397,7 +362,7 @@ def reconcile(
         unrecorded.append(m)
         summary["unrecorded"].append(
             {"source_id": m.source_id, "title": m.title, "company": m.company,
-             "action_insights": len(m.actions)}
+             "started_at": m.started_at}
         )
     summary["meetings_unrecorded"] = len(unrecorded)
 
@@ -434,7 +399,7 @@ def _finalize(summary, now, dry_run, audit, state_path):
     if audit is not None:
         details = (
             f"window={summary['window_hours']}h "
-            f"meetings={summary['meetings_with_actions']} "
+            f"meetings={summary['meetings_in_window']} "
             f"unrecorded={summary['meetings_unrecorded']} "
             f"skipped_record={summary['meetings_skipped_decision_record']} "
             f"skipped_tickets={summary['meetings_skipped_existing_tasks']} "
