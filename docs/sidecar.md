@@ -214,8 +214,11 @@ applied.
 A small floating panel opens when recording starts. It is an `NSPanel` with the
 non-activating style mask, floating level, and `orderFrontRegardless`, so it
 stays on top, does not become key on open, and does not run a modal loop. The
-menu stays usable. Closing the panel does not stop recording. Stopping the
-recording leaves the panel open until it is closed.
+menu stays usable. The close button only hides the panel (the window delegate
+refuses the close and orders it out; the window is never released on close);
+**Live-Fenster anzeigen** in the menu brings it back, also after Stop. Hiding
+it does not stop recording or the worker, and the panel keeps rendering while
+hidden. A new Start closes the previous panel for good.
 
 The panel shows:
 
