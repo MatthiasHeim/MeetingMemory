@@ -1,8 +1,9 @@
 """Mic and system-audio tails for the live sidecar.
 
-The microphone callback only appends copied blocks. This module reads those
-blocks from another thread by copying the list of references. It never takes a
-lock the callback would have to acquire, and it never writes audio.
+The microphone callback copies each block into a bounded queue and a short
+ring. A writer thread owns the WAV. This module reads the ring from another
+thread by copying the list of references. It never takes a lock the callback
+would have to acquire, and it never writes audio.
 """
 
 from __future__ import annotations
@@ -15,13 +16,25 @@ import numpy as np
 
 
 def copy_chunk_references(chunks: list) -> list:
-    """Copy the list of mic blocks. Each block is already an immutable copy."""
-    for _ in range(3):
+    """Copy the list of mic blocks. Each block is already an immutable copy.
+
+    The callback may append and pop the ring while this runs. A torn snapshot
+    is usable; an exception is not, because it would kill the live tick.
+    """
+    if chunks is None:
+        return []
+    for _ in range(6):
         try:
             return list(chunks)
         except RuntimeError:
             continue
-    return list(chunks)
+    snapshot: list = []
+    try:
+        for item in chunks:
+            snapshot.append(item)
+    except RuntimeError:
+        return snapshot
+    return snapshot
 
 
 def _mono_samples(chunk) -> np.ndarray:

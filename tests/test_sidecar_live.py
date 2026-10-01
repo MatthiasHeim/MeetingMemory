@@ -168,11 +168,16 @@ def test_audio_callback_source_is_unchanged_and_a_slow_worker_cannot_delay_it():
     import meeting_recorder
 
     source = inspect.getsource(meeting_recorder.AudioRecorder._audio_callback)
-    assert "self.audio_data.append(indata.copy())" in source
+    enqueue = inspect.getsource(meeting_recorder.AudioRecorder._enqueue_mic_block)
+    assert "indata.copy()" in source
+    assert "_enqueue_mic_block" in source
+    assert "put_nowait" in enqueue
     assert "Lock" not in source
     assert "live" not in source.lower()
     assert "gemini" not in source.lower()
     assert "open(" not in source
+    assert "fsync" not in source
+    assert "soundfile" not in source
     start_source = inspect.getsource(meeting_recorder.MeetingRecorderApp._start_recording)
     assert "NSAlert" not in start_source
     assert "runModal" not in start_source
@@ -664,7 +669,7 @@ def test_mic_tail_walks_backward_and_stops():
     assert min(chunks.touched) >= chunks.n - 2
 
 
-def test_hallucinated_offset_is_clamped_to_the_tail():
+def test_hallucinated_offset_is_rejected_instead_of_pinned_to_the_tail():
     from sidecar.live import _absolute_lines
 
     lines = _absolute_lines(
@@ -672,8 +677,166 @@ def test_hallucinated_offset_is_clamped_to_the_tail():
         10.0,
         70.0,
     )
-    assert lines[0].start == pytest.approx(70.0)
-    assert lines[0].end == pytest.approx(70.0)
+    assert lines == []
+
+
+def test_meeting_clock_offsets_are_rebased_into_the_window():
+    from sidecar.live import LiveLine, _absolute_lines, commit_new_lines
+
+    raw = [
+        {"speaker": "Ich", "text": "alpha", "start_offset": 90, "end_offset": 100},
+        {"speaker": "Ich", "text": "beta", "start_offset": 105, "end_offset": 115},
+    ]
+    incoming = _absolute_lines(raw, 60.0, 120.0)
+    assert [(line.start, line.end, line.text) for line in incoming] == [
+        (90.0, 100.0, "alpha"),
+        (105.0, 115.0, "beta"),
+    ]
+    committed = [LiveLine(40.0, 70.0, "Ich", "earlier")]
+    all_lines, added, _revised = commit_new_lines(committed, incoming)
+    assert [line.text for line in added] == ["alpha", "beta"]
+    assert max(line.end for line in all_lines) == pytest.approx(115.0)
+
+
+def test_empty_answer_on_a_loud_tail_keeps_the_gap_and_rebases_meeting_clock():
+    """The meeting prompt can return no lines while speech is still in the tail.
+
+    The second ask is clip-relative in the prompt, but a meeting-clock offset
+    must still land on the gap instead of being pinned to the window edge.
+    """
+    from sidecar.live import LiveEngine, TailSnapshot, speech_intervals
+
+    rate = 16000
+    tone = np.zeros(rate * 2, dtype=np.int16)
+    tone[int(0.2 * rate) : int(1.2 * rate)] = 8000
+    found = speech_intervals(tone, rate)
+    assert found and found[0][0] < 0.4 and found[0][1] > 1.0
+    assert speech_intervals(np.zeros(rate, dtype=np.int16), rate) == []
+
+    calls = {"primary": 0, "gap": 0}
+
+    class SplitTranscriber:
+        def transcribe_tails(self, *_args):
+            calls["primary"] += 1
+            return []
+
+        def transcribe_gaps(self, *_args):
+            calls["gap"] += 1
+            return [
+                {
+                    "speaker": "Ich",
+                    "text": "synthetic",
+                    "start_offset": 100.3,
+                    "end_offset": 101.0,
+                }
+            ]
+
+    engine = LiveEngine(snapshot=lambda _tail: None, transcriber=SplitTranscriber())
+    added = engine.process_snapshot(
+        TailSnapshot(tone, rate, None, rate, 100.0, 102.0, closed=True)
+    )
+    assert calls == {"primary": 1, "gap": 1}
+    assert [(line.start, line.end) for line in added] == [(100.3, 101.0)]
+
+    class CoveredTranscriber:
+        def transcribe_tails(self, *_args):
+            return [
+                {"speaker": "Ich", "text": "synthetic", "start_offset": 0.2, "end_offset": 1.2}
+            ]
+
+        def transcribe_gaps(self, *_args):
+            raise AssertionError("covered speech must not be sent again")
+
+    engine = LiveEngine(snapshot=lambda _tail: None, transcriber=CoveredTranscriber())
+    covered = engine.process_snapshot(
+        TailSnapshot(tone, rate, None, rate, 0.0, 2.0, closed=True)
+    )
+    assert [(line.start, line.end) for line in covered] == [(0.2, 1.2)]
+
+    class SilentTranscriber:
+        def transcribe_tails(self, *_args):
+            return []
+
+        def transcribe_gaps(self, *_args):
+            raise AssertionError("silence must not be sent again")
+
+    engine = LiveEngine(snapshot=lambda _tail: None, transcriber=SilentTranscriber())
+    assert engine.process_snapshot(
+        TailSnapshot(np.zeros(rate * 2, dtype=np.int16), rate, None, rate, 0.0, 2.0, closed=True)
+    ) == []
+
+
+def test_gap_slices_cover_late_speech_without_resending_the_minute():
+    from sidecar.live import _offsets_from_slice, gap_slices
+
+    slices = gap_slices([(40.5, 41.2), (52.6, 53.5), (55.3, 56.2)], 60.0)
+    assert slices
+    assert all(end - start <= 17.1 for start, end in slices)
+    assert slices[-1][1] == pytest.approx(60.0)
+    assert any(start <= 40.5 <= end for start, end in slices)
+    assert gap_slices([(0.2, 1.2)], 2.0) == [(0.0, 2.0)]
+    shifted = _offsets_from_slice(
+        [{"speaker": "Ich", "text": "synthetic", "start_offset": 2.0, "end_offset": 3.0}],
+        45.0,
+        15.0,
+    )
+    assert shifted[0]["start_offset"] == pytest.approx(47.0)
+    meeting = _offsets_from_slice(
+        [{"speaker": "Ich", "text": "synthetic", "start_offset": 160.0, "end_offset": 162.0}],
+        45.0,
+        15.0,
+    )
+    assert meeting[0]["start_offset"] == pytest.approx(160.0)
+    from sidecar.live import LiveLine, supplement_uncovered_lines
+
+    primary = [LiveLine(117.0, 127.0, "Ich", "synthetic")]
+    extra = [
+        LiveLine(159.9, 166.8, "Ich", "synthetic"),
+        LiveLine(172.7, 174.8, "Ich", "synthetic"),
+        LiveLine(10.0, 12.0, "Ich", "synthetic"),
+    ]
+    gaps = [(155.4, 156.2), (167.5, 168.6), (170.2, 171.3)]
+    kept = supplement_uncovered_lines(primary, extra, gaps)
+    assert [(line.start, line.end) for line in kept] == [
+        (117.0, 127.0),
+        (159.9, 166.8),
+        (172.7, 174.8),
+    ]
+    from sidecar.live import followup_slices
+
+    follow = followup_slices([(55.0, 56.2)], 49.5, 60.0)
+    assert follow == [(50.0, 60.0)]
+
+
+def test_ring_snapshot_survives_a_mutating_deque():
+    from collections import deque
+
+    from sidecar.live_audio import copy_chunk_references
+
+    chunks = deque(range(3750))
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def mutate() -> None:
+        value = 0
+        while not stop.is_set():
+            chunks.append(value)
+            chunks.popleft()
+            value += 1
+
+    thread = threading.Thread(target=mutate)
+    thread.start()
+    try:
+        for _ in range(2000):
+            try:
+                copy_chunk_references(chunks)
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                break
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+    assert errors == []
 
 
 def test_closed_tick_skips_gemini_when_the_system_wav_is_gone():

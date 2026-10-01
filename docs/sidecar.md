@@ -3,10 +3,12 @@
 Status on 2026-09-28: Slice 1 is the finished-transcript clerk. Slice 2 adds a
 live side window and removes the start dialog. `gemini-3.8-flash` is the only
 Gemini model for judging, live transcription, and clean prompts. The recorder
-starts capture before optional sidecar or calendar work. The audio callback is
-unchanged. The watcher change from slice 1 is one additive final-JSON metadata
-field for an alignment lag; WAV capture, transcription decisions, and all other
-output stay unchanged.
+starts capture before optional sidecar or calendar work. The microphone
+callback copies each block into a bounded queue and a two-minute ring; a
+writer thread checkpoints the mic WAV. It does not write the file itself.
+The watcher still adds one alignment-lag field, and a partial transcript can
+gain `[live]` lines from the saved live session. A complete transcript is
+left as Gemini wrote it.
 
 ## Use
 
@@ -67,9 +69,11 @@ The rumps menu bar app adds these actions:
   other windows.
 - **Prompts…** similarly selects a finished transcript, evaluates marked and
   suggested prompt cards on a background thread, then asks which card to copy.
-  The clipboard receives the clean prompt. The verbatim lines stay on the card.
-  This item is also disabled while recording; prompt cards are on the live
-  panel. The same activation rule applies when the dialog is allowed.
+  Cards saved in `Recordings/<stem>.live.json` are offered after those, labelled
+  **Live bei …**, without another Gemini clean pass. The clipboard receives the
+  clean prompt. The verbatim lines stay on the card. This item is also disabled
+  while recording; prompt cards are on the live panel. The same activation rule
+  applies when the dialog is allowed.
 - **List Audio Devices** is disabled while recording. Outside a recording it
   activates the app and then shows the device list. It never uses a modal
   during capture.
@@ -225,15 +229,48 @@ The panel shows:
 - a topic field and **Clip kopieren**, which runs the existing clip selection
   (including the sparse-topic rule) on the live lines and copies verbatim text
 
-The live worker is a daemon thread. About every 20 seconds it copies references
-to the in-memory mic blocks and reads the tail of the system-audio WAV (the
-last 60 seconds of each, taken at the same moment). The mic tail is walked from
-the newest block and stops once those 60 seconds are in hand; the recorder's
-frame count supplies the clock, so the older blocks are not concatenated.
-Gemini clients and the calibration-file read are created on that worker's
-first tick. Start only opens the panel. If the session cannot start (for
-example a missing Gemini key), a non-modal notification says so and recording
+The live worker is a daemon thread named `meeting-sidecar-live`. About every
+20 seconds it copies references to the in-memory mic ring and reads the tail
+of the system-audio WAV (the last 60 seconds of each, taken at the same
+moment). The mic tail is walked from the newest block and stops once those
+60 seconds are in hand; the recorder's frame count supplies the clock, so
+dropping older blocks from the ring does not move the timestamps. Gemini
+clients and the calibration-file read are created on that worker's first
+tick. Start only opens the panel. If the session cannot start (for example a
+missing Gemini key), a non-modal notification says so and recording
 continues. A new Start closes the previous panel.
+
+Each tick, after the transcription attempt, the worker atomically replaces
+`Recordings/<stem>.live.json` (write a temp file, then `os.replace`). It
+does this at most once per tick, and once more when Stop asks the worker to
+finish, including the lines and cards committed so far. The file holds
+committed lines (`start`, `end`, `speaker`, `text`) and prompt cards (clean
+text, verbatim lines, time range). Closing the side window does not clear
+that file and does not stop the worker. A persist failure sets a status line
+and leaves recording running.
+
+The microphone is not held in RAM for the whole meeting. The PortAudio
+callback copies the block and `put_nowait`s it onto a queue of about thirty
+seconds (`audio.mic_queue_seconds`, default 30). A `meeting-mic-writer` thread
+appends PCM and checkpoints the WAV header about once a second (`flush` and
+`fsync`). A full queue does not drop the timeline: those blocks, and every
+block after them, stay in an in-memory list, and one merged `mic_queue_full`
+range is recorded. The callback never waits on disk. If a checkpoint raises
+(disk full, for example), the writer stops touching the file and the rest of
+the meeting stays in that list. `stop()` rebuilds the mic track as the flushed
+prefix plus that remainder, and a writer error does not skip stopping the
+system tap, the merge, the replace into Recordings, or the archive.
+`_finish_mic_writer` closes the WAV only after the writer thread has exited.
+The callback also keeps a ring of about the last two minutes
+(`audio.mic_ring_seconds`, default 120) for the live tail. `stop()` still
+writes the merged 3-channel WAV the watcher expects (mic, system left, system
+right). A crash keeps every checkpointed second and loses at most the open
+checkpoint plus the queued tail. On the next launch the menu app scans
+`~/Documents/MeetingRecorder/.tmp` for orphaned `<stem>.mic.wav` and
+`<stem>.sys.wav` files, recovers a playable WAV into Recordings, and posts a
+non-modal notification. An orphan that cannot be read is left in place. If
+the writer cannot open the file, `stop()` still falls back to the in-memory
+blocks.
 
 It sends those tails to `gemini-3.8-flash` on the pinned Gemini endpoint.
 An incoming line that overlaps a committed line of the same speaker by more
@@ -243,8 +280,15 @@ that has slid forward keeps the committed words and appends only the new
 aligned suffix. A short fragment is absorbed when a longer same-speaker
 hearing starts within two seconds and its text begins with that fragment.
 Any other line that starts more than half a second before the
-frontier is dropped. Offsets from Gemini are clamped to the tail, so a
-hallucinated timestamp cannot push the frontier past the audio. An unfinished
+frontier is dropped. Offsets within the tail are clip-relative. An offset
+past the length of the tail is read as a meeting time and kept only when it
+falls inside the window; anything else is rejected, not pinned to the end of
+the tail. When that answer leaves at least half a second of detected speech
+uncovered, each gap is sent again as a 15 second slice with a short prompt
+that asks for every word. A remark that is still missing is asked once more
+on a slice that starts where that answer stopped and, at the end of the clip,
+runs through the last sample. Only lines that land in those gaps are kept.
+An unfinished
 line at the edge of an open tail is held for one tick and then committed, so
 a long unpunctuated monologue is not left behind the frontier. A later tick
 can still upgrade that fragment. After Stop, the final tick is skipped when
@@ -252,6 +296,37 @@ the system WAV has already been archived. A transcription or prompt failure
 shows a status line in the panel and does not stop or delay capture. A clean
 prompt is reused only when the cleaned text is non-empty; an empty result is
 retried up to three times per card. The audio callback is not on this path.
+
+When the watcher marks a transcript partial (coverage below the minimum) and
+`Recordings/<stem>.live.json` exists, it inserts live lines whose start falls
+in the missing ranges, including the tail after the last timestamp. Before
+that, spans between final lines that sit within 30 seconds of each other are
+subtracted, so a `missing_time_ranges` entry that overlaps speech already in
+the transcript does not duplicate it. A line that only repeats an existing
+timestamp is skipped. A line that starts within a fraction of a second of that
+timestamp and continues into the gap is inserted. When channel alignment
+actually shifted the mic, live timestamps are moved by the same
+`channel_alignment.lag_seconds` (positive lag means the mic was late, so the
+live clock moves earlier). Each inserted line is tagged `[live]`, and
+`partial` stays true. The filled ranges and line
+count are stored on `_meta.live_fill`. The same fill runs again just before
+the JSON is written, so a later speaker-reconcile pass cannot drop the tags;
+a second pass is idempotent. A transcript that already meets the coverage
+minimum is not modified. Escalation (one fresh single-call retry, then
+chunked retry when the audio is long enough) and the Telegram partial alert
+are unchanged. When lines were inserted, the alert adds: "Gaps were filled
+from the live transcript." The live file is written with mode `0600`.
+
+Pyannote diarization now also runs for single-source recordings. That is a
+behaviour change: the acoustic prior can change speaker labels compared with
+voice-only Gemini. The watcher logs when the prior is used. Set
+`diarization.enabled: false` to skip it. The worker timeout defaults to 900
+seconds (`diarization.timeout_seconds`), not an hour. Pyannote is started
+from `tools/diarize.py`. launchd runs
+`python tools/transcribe_watcher.py`, so `sys.path[0]` is `tools/` and a
+direct `import pyannote_mp_worker` fails (`No module named 'pyannote_mp_worker'`).
+The spawn target is `_pyannote_child` in `tools/diarize.py`. That child puts
+the repository root on `sys.path` and then imports `pyannote_mp_worker.py`.
 
 Prompt detection uses the broadened judge question: Swiss German and Hochdeutsch
 indirect instructions (“ich würd em Claude säge, er söll …”, “mir müessted em
@@ -285,11 +360,12 @@ this directory is a worktree).
 
 The automated suite covers the preference gate (jev true authorises Jev without
 an external acknowledgement), the endpoint pin, regular-sidecar authority,
-text-free Jev audit, capture-first sidecar failure, no modal on start, an
-unchanged audio callback, a crashing or slow live worker, monotonic mark
-offsets, alignment mapping, and a scripted concurrent mark-plus-clip run
-without opening an audio device. The global hotkey and the real panel still
-need an attended macOS session. Before merge:
+text-free Jev audit, capture-first sidecar failure, no modal on start, a
+non-blocking mic callback with a crash-recoverable WAV, a crashing or slow
+live worker, monotonic mark offsets, alignment mapping, persisted live
+sessions, partial-transcript live fill, and a scripted concurrent
+mark-plus-clip run without opening an audio device. The global hotkey and the
+real panel still need an attended macOS session. Before merge:
 
 1. Start recording from the menu. Confirm there is no dialog, Stop is available
    immediately, and the side window appears without taking focus. Type in the
@@ -301,12 +377,14 @@ need an attended macOS session. Before merge:
 3. Speak for about a minute. Confirm Hochdeutsch lines show up within about
    half a minute, and that a failed network status line does not stop the
    recording. Stop, confirm the panel stays open, then close it yourself.
+   `Recordings/<stem>.live.json` is still there after the window is closed.
 4. During or after the recording, type a topic and press **Clip kopieren**.
    Confirm the clipboard is verbatim transcript text with the fixed header.
 5. Dictate an indirect instruction (“ich würde Claude sagen, er soll …”).
    Confirm a card appears, **Kopieren** pastes a clean prompt in the spoken language, and the
    verbatim lines are visible under it. Run **Prompts…** on the finished
-   transcript and confirm that path also copies the clean prompt.
+   transcript and confirm that path copies the clean prompt and also offers
+   any card saved in the live file.
 6. Mark once from the menu and once with `⌃⌥⌘P`. Confirm both numeric marks
    and the first-mic offset in the sidecar.
 7. Temporarily make the sidecar directory unwritable; confirm recording still

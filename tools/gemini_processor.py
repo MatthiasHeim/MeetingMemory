@@ -361,6 +361,8 @@ class GeminiResult:
     # visible in the on-disk JSON regardless of which attempt was accepted.
     validation_report: Optional[dict] = None
     partial: bool = False
+    # Set when a partial transcript's gaps were filled from Recordings/<stem>.live.json.
+    live_fill: Optional[dict] = None
 
     # Raw response for debugging
     raw_response: Optional[dict] = None
@@ -413,6 +415,8 @@ class GeminiResult:
         }
         if self.validation_report is not None:
             out["_meta"]["validation"] = self.validation_report
+        if self.live_fill:
+            out["_meta"]["live_fill"] = self.live_fill
         if self.speaker_verification_log is not None:
             out["speaker_verification"] = self.speaker_verification_log
         if self.speaker_coherence_log is not None:
