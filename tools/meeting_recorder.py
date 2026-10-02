@@ -463,6 +463,7 @@ class MeetingRecorderApp(rumps.App):
         self._prompt_mark_item = rumps.MenuItem("Prompt markieren", callback=None)
         self._clip_item = rumps.MenuItem("Clip…", callback=self.copy_clip)
         self._prompts_item = rumps.MenuItem("Prompts…", callback=self.copy_prompt)
+        self._live_panel_item = rumps.MenuItem("Live-Fenster anzeigen", callback=self.show_live_panel)
         self._devices_item = rumps.MenuItem("List Audio Devices", callback=self.list_devices)
         self._jev_pref_item = rumps.MenuItem("Jev verwenden", callback=self.toggle_jev_preference)
         self.menu = [
@@ -470,6 +471,7 @@ class MeetingRecorderApp(rumps.App):
             self._prompt_mark_item,
             self._clip_item,
             self._prompts_item,
+            self._live_panel_item,
             None,  # Separator
             rumps.MenuItem("Open Recordings Folder", callback=self.open_recordings),
             rumps.MenuItem("Open Transcripts Folder", callback=self.open_transcripts),
@@ -791,6 +793,17 @@ class MeetingRecorderApp(rumps.App):
             reveal()
         except Exception as exc:
             print(f"Could not show the live panel: {exc}", file=sys.stderr)
+
+    def show_live_panel(self, _sender=None) -> None:
+        """Menu action: bring back a hidden live panel."""
+        session = getattr(self, "_live_session", None)
+        if getattr(session, "panel", None) is None:
+            self._notify_from_worker(
+                subtitle="Kein Live-Fenster",
+                message="Das Live-Fenster erscheint mit der nächsten Aufnahme.",
+            )
+            return
+        self._reveal_live_panel()
 
     def _run_window(self, **kwargs):
         """Modal text prompt. Never while recording; activate the app first otherwise."""

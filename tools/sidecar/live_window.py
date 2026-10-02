@@ -1,8 +1,9 @@
 """Floating non-activating side window for the live sidecar.
 
 The panel stays above other windows, does not become key when it appears, and
-is never shown with a modal loop. Closing it does not stop recording. Stopping
-the recording does not close the panel.
+is never shown with a modal loop. The close button only hides it; the menu item
+"Live-Fenster anzeigen" brings it back. Hiding it does not stop recording.
+Stopping the recording does not close the panel.
 """
 
 from __future__ import annotations
@@ -89,6 +90,12 @@ class _PanelTarget(NSObject):
         if self.panel is not None:
             self.panel.copy_card(int(sender.tag()))
 
+    def windowShouldClose_(self, _sender) -> bool:
+        """The title-bar close button hides the panel instead of destroying it."""
+        if self.panel is not None:
+            self.panel.hide()
+        return False
+
 
 class LivePanel:
     """Small NSPanel. Updates are marshalled to the main thread."""
@@ -128,6 +135,17 @@ class LivePanel:
 
         _dispatch_main(hide)
 
+    def hide(self) -> None:
+        """Hide the panel so it can be shown again. Rendering continues."""
+        panel = self.panel
+        if panel is None or self._closed:
+            return
+
+        def order_out() -> None:
+            panel.orderOut_(None)
+
+        _dispatch_main(order_out)
+
     def order_front(self) -> None:
         """Show the panel again without activating the app or running a modal."""
         panel = self.panel
@@ -160,6 +178,7 @@ class LivePanel:
         panel.setBecomesKeyOnlyIfNeeded_(True)
         panel.setWorksWhenModal_(False)
         panel.setCollectionBehavior_(panel_collection_behavior(appkit))
+        panel.setReleasedWhenClosed_(False)
         screen = appkit.NSScreen.mainScreen()
         if screen is not None:
             visible = screen.visibleFrame()
@@ -184,6 +203,7 @@ class LivePanel:
         self.topic_field.setPlaceholderString_("Thema")
         self._target = _PanelTarget.alloc().init()
         self._target.panel = self
+        panel.setDelegate_(self._target)
         button = appkit.NSButton.alloc().initWithFrame_(NSMakeRect(inner_width - 130, 12, 118, 28))
         button.setTitle_("Clip kopieren")
         button.setBezelStyle_(_constant(appkit, "NSBezelStyleRounded", "NSRoundedBezelStyle", 1))

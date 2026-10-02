@@ -284,6 +284,74 @@ def test_panel_show_does_not_run_modal_or_become_key():
             panel.panel.close()
 
 
+def test_panel_close_button_hides_and_menu_brings_it_back(monkeypatch):
+    from sidecar import live_window
+
+    monkeypatch.setattr(live_window, "_dispatch_main", lambda callback: callback())
+    panel = LivePanel(on_copy_clip=lambda _topic: None, on_copy_card=lambda _text: None)
+    try:
+        panel.show()
+        window = panel.panel
+        assert window.isVisible()
+        assert window.isReleasedWhenClosed() is False
+        assert window.delegate() is panel._target
+        window.performClose_(None)
+        assert panel.panel is window
+        assert not window.isVisible()
+        panel.order_front()
+        assert window.isVisible()
+        assert window.isKeyWindow() is False
+        panel.close()
+        panel.order_front()
+        assert not window.isVisible()
+    finally:
+        if panel.panel is not None:
+            panel.panel.orderOut_(None)
+            panel.panel.close()
+
+
+def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
+    import importlib
+    import types
+
+    notes: list[str] = []
+    fake_rumps = types.ModuleType("rumps")
+    fake_rumps.App = object
+    fake_rumps.MenuItem = object
+    fake_rumps.notification = lambda **kwargs: notes.append(kwargs.get("message", ""))
+    fake_rumps.alert = lambda **_kwargs: notes.append("alert")
+    fake_rumps.Window = object
+    previous = sys.modules.get("meeting_recorder")
+    monkeypatch.setitem(sys.modules, "rumps", fake_rumps)
+    monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
+    sys.modules.pop("meeting_recorder", None)
+    try:
+        recorder_module = importlib.import_module("meeting_recorder")
+        app = recorder_module.MeetingRecorderApp.__new__(recorder_module.MeetingRecorderApp)
+        app.config = {}
+        app._dispatch_ui = lambda callback: callback()
+        shown: list[str] = []
+
+        class Panel:
+            def order_front(self):
+                shown.append("front")
+
+        app._live_session = SimpleNamespace(panel=Panel())
+        app.show_live_panel()
+        assert shown == ["front"]
+        assert notes == []
+
+        app._live_session = None
+        app.show_live_panel()
+        assert shown == ["front"]
+        assert notes == ["Das Live-Fenster erscheint mit der nächsten Aufnahme."]
+    finally:
+        if previous is not None:
+            sys.modules["meeting_recorder"] = previous
+        else:
+            sys.modules.pop("meeting_recorder", None)
+
+
 def test_live_transcriber_sends_audio_to_the_pinned_endpoint():
     seen = {}
 
