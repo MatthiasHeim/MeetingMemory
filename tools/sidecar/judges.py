@@ -1,4 +1,4 @@
-"""Judge interface and its Gemini/Jev implementations.
+"""Judge interface and its Gemini/local Decider implementations.
 
 The judge only supplies calibrated-looking probabilities. Selection, threshold
 policy, cache reuse, and all clipboard actions stay deterministic in code.
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlparse
 
+from .decider_policy import DECIDER_MODEL
 from .cache import ProbabilityCache, line_fingerprint
 from .gate import append_jev_audit_record, judge_backend_for, load_recording_sidecar
 from .transcript import TranscriptLine
@@ -571,7 +572,7 @@ def _extract_jev_probability(value: Any) -> float:
     if isinstance(value, (int, float)):
         return _bounded_probability(value, question_id="Jev answer")
     if isinstance(value, Mapping):
-        for key in ("probability", "value", "yes_probability", "true_probability"):
+        for key in ("noul", "probability", "value", "yes_probability", "true_probability"):
             if key in value:
                 return _bounded_probability(value[key], question_id="Jev answer")
         distribution = value.get("distribution")
@@ -579,13 +580,13 @@ def _extract_jev_probability(value: Any) -> float:
             for key in (True, "true", "yes"):
                 if key in distribution:
                     return _bounded_probability(distribution[key], question_id="Jev answer")
-    raise JudgeError("Jev returned an answer without a yes probability")
+    raise JudgeError("Decider returned an answer without a yes probability")
 
 
-class JevJudge:
-    """Optional audited Jev adapter. Construction is guarded by ``create_judge``."""
+class DeciderJudge:
+    """Audited local Decider adapter (the legacy Jev name is an alias). Construction is guarded by ``create_judge``."""
 
-    backend = "jev"
+    backend = "decider"
 
     def __init__(
         self,
@@ -594,23 +595,21 @@ class JevJudge:
         recordings_root: str | Path | None = None,
         helper_path: str | Path | None = None,
         python: str | None = None,
-        timeout_seconds: float = 30,
-        model: str = "~typesafe/jev-latest",
+        timeout_seconds: float = 120,
+        model: str = DECIDER_MODEL,
         audit_root: str | Path | None = None,
     ):
-        # The service already checks this, but the adapter must not be a
-        # bypassable public OpenRouter entry point. This rejects an
-        # unresolved/malformed attendance field before locating the helper.
+        # Preserve the per-recording switch even though this route is now local.
         judge_backend_for(stem, "jev", recordings_root=recordings_root)
         self.stem = stem
         self.recordings_root = recordings_root
         self.model = model
-        self.helper_path = Path(helper_path or Path.home() / ".claude" / "skills" / "jev" / "scripts" / "jev_decide.py")
+        self.helper_path = Path(helper_path or Path.home() / ".agents" / "skills" / "decider" / "scripts" / "decider_decide.py")
         self.python = python or os.environ.get("PYTHON", "python3")
         self.timeout_seconds = timeout_seconds
         self.audit_root = audit_root
         if not self.helper_path.is_file():
-            raise JudgeError(f"Jev helper not found: {self.helper_path}")
+            raise JudgeError(f"Decider helper not found: {self.helper_path}")
 
     def _call(self, body: dict[str, Any]) -> dict[str, Any]:
         # Recheck immediately before a request in case the sidecar policy was
@@ -620,8 +619,7 @@ class JevJudge:
             self.python,
             str(self.helper_path),
             "--classification",
-            "internal",
-            "--external-processing-approved",
+            "confidential",
             "--model",
             self.model,
             "--request",
@@ -640,15 +638,15 @@ class JevJudge:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise JudgeError(f"Jev helper failed: {type(exc).__name__}") from exc
+            raise JudgeError(f"Decider helper failed: {type(exc).__name__}") from exc
         if process.returncode:
-            raise JudgeError("Jev helper rejected the gated request")
+            raise JudgeError("Decider helper rejected the gated request")
         try:
             output = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
-            raise JudgeError("Jev helper returned invalid JSON") from exc
+            raise JudgeError("Decider helper returned invalid JSON") from exc
         if not isinstance(output, dict):
-            raise JudgeError("Jev helper returned a non-object answer")
+            raise JudgeError("Decider helper returned a non-object answer")
         return output
 
     def judge(
@@ -661,9 +659,8 @@ class JevJudge:
         normalised = normalise_questions(questions)
         if not lines:
             return {question_id: [] for question_id in normalised}
-        # The helper's classification remains the fixed internal/approved
-        # contract expected by the shared Jev skill.  Local policy facts are
-        # captured separately before any request, without recording text.
+        # The helper pins loopback, disables proxies/redirects and has no cloud fallback.
+        # Policy metadata is captured before requests, without recording text.
         judge_backend_for(self.stem, "jev", recordings_root=self.recordings_root)
         record = load_recording_sidecar(self.stem, self.recordings_root)
         try:
@@ -674,9 +671,11 @@ class JevJudge:
                 audit_root=self.audit_root,
             )
         except (OSError, ValueError) as exc:
-            raise JudgeError("Jev audit record could not be written") from exc
+            raise JudgeError("Decider audit record could not be written") from exc
         values = {question_id: [] for question_id in normalised}
-        for position, line in enumerate(lines):
+
+        def score_line(position):
+            line = lines[position]
             previous = lines[max(0, position - context) : position]
             body = {
                 "state": {
@@ -695,9 +694,20 @@ class JevJudge:
             answers = self._call(body)
             for question_id in normalised:
                 if question_id not in answers:
-                    raise JudgeError(f"Jev omitted answer {question_id!r}")
-                values[question_id].append(_extract_jev_probability(answers[question_id]))
+                    raise JudgeError(f"Decider omitted answer {question_id!r}")
+            return {key: _extract_jev_probability(answers[key]) for key in normalised}
+
+        # Bounded concurrency lets the MLX scheduler batch similar-length inputs.
+        # executor.map preserves transcript order even if replies finish out of order.
+        with ThreadPoolExecutor(max_workers=min(4, len(lines))) as pool:
+            for scores in pool.map(score_line, range(len(lines))):
+                for key in normalised:
+                    values[key].append(scores[key])
         return values
+
+
+# Existing CLI integrations remain valid; this alias cannot contact Jev.
+JevJudge = DeciderJudge
 
 
 class CachedJudge:

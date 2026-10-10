@@ -203,7 +203,7 @@ def test_jev_sidecar_authority_rejects_symlinks_environment_and_wrong_transcript
         judge_backend_for(STEM, "jev")
 
 
-def test_jev_audit_is_text_free_and_helper_contract_stays_internal(tmp_path, monkeypatch):
+def test_decider_audit_is_text_free_and_helper_contract_is_local_confidential(tmp_path, monkeypatch):
     initialise_recording_sidecar(
         STEM,
         jev=True,
@@ -217,7 +217,7 @@ def test_jev_audit_is_text_free_and_helper_contract_stays_internal(tmp_path, mon
         commands.append(command)
         return SimpleNamespace(
             returncode=0,
-            stdout=json.dumps({"q": {"probability": 0.8}}),
+            stdout=json.dumps({"q": {"type": "noul", "noul": 0.8}}),
             stderr="",
         )
 
@@ -231,18 +231,20 @@ def test_jev_audit_is_text_free_and_helper_contract_stays_internal(tmp_path, mon
     lines = (_line(0, 1, "synthetic alpha"), _line(1, 2, "synthetic beta"))
     assert judge.judge(lines, {"q": "synthetic criterion"})["q"] == [0.8, 0.8]
 
-    assert all(command[command.index("--classification") + 1] == "internal" for command in commands)
-    assert all("--external-processing-approved" in command for command in commands)
-    entry = json.loads((tmp_path / "audit" / "jev-audit.jsonl").read_text(encoding="utf-8"))
+    assert all(command[command.index("--classification") + 1] == "confidential" for command in commands)
+    assert all("--external-processing-approved" not in command for command in commands)
+    entry = json.loads((tmp_path / "audit" / "decider-audit.jsonl").read_text(encoding="utf-8"))
     assert entry == {
-        "schema_version": 1,
+        "schema_version": 2,
+        "provider": "local-mlx",
+        "model": "pplx-decider-v1.1-27b",
         "stem": STEM,
         "external_attendees": True,
         "jev_external_acknowledged": True,
         "timestamp": entry["timestamp"],
         "request_count": 2,
     }
-    audit_text = (tmp_path / "audit" / "jev-audit.jsonl").read_text(encoding="utf-8")
+    audit_text = (tmp_path / "audit" / "decider-audit.jsonl").read_text(encoding="utf-8")
     assert "synthetic alpha" not in audit_text and "synthetic criterion" not in audit_text
 
 

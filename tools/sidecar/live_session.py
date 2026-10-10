@@ -9,13 +9,14 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .calibration_policy import OWNER_APPROVED_MODEL, OWNER_APPROVED_PROMPT_THRESHOLD
-from .judges import GeminiJudge
+from .judges import DeciderJudge, GeminiJudge, Judge
 from .live import (
     GeminiLiveTranscriber,
     LiveEngine,
     snapshot_recording_tails,
 )
 from .live import default_clean_prompt
+from .decider_policy import DECIDER_PROMPT_THRESHOLD, clip_thresholds
 from .prompts import PromptCalibrationError, calibrated_prompt_threshold
 from .selection import select_clip
 
@@ -31,7 +32,9 @@ class RecordingLiveSession:
         copy_text: Callable[[str], None],
         open_window: bool = True,
         transcriber: GeminiLiveTranscriber | None = None,
-        judge: GeminiJudge | None = None,
+        judge: Judge | None = None,
+        decision_stem: str | None = None,
+        recordings_root=None,
         prompt_threshold: float | None = None,
         on_unavailable: Callable[[str], None] | None = None,
     ):
@@ -40,6 +43,10 @@ class RecordingLiveSession:
         self._open_window = open_window
         self.panel = None
         self._api_key = api_key
+        self._judge_factory = (
+            (lambda: DeciderJudge(stem=decision_stem, recordings_root=recordings_root))
+            if decision_stem else (lambda: _maybe_judge(api_key))
+        )
         # Clients and the calibration read happen on the worker's first tick.
         # Building them here used to block Start for about half a second.
         self.engine = LiveEngine(
@@ -49,8 +56,10 @@ class RecordingLiveSession:
             if transcriber is not None
             else (lambda: GeminiLiveTranscriber(api_key=api_key)),
             judge=judge,
-            judge_factory=None if judge is not None else (lambda: _maybe_judge(api_key)),
-            threshold_factory=None if prompt_threshold is not None else _live_prompt_threshold,
+            judge_factory=None if judge is not None else self._judge_factory,
+            threshold_factory=None if prompt_threshold is not None else (
+                (lambda: DECIDER_PROMPT_THRESHOLD) if decision_stem else _live_prompt_threshold
+            ),
             clean_prompt=default_clean_prompt(api_key),
             on_update=self._on_update,
             on_unavailable=on_unavailable,
@@ -97,7 +106,9 @@ class RecordingLiveSession:
         try:
             judge = self._clip_judge or self.engine._judge
             if judge is None:
-                judge = GeminiJudge(api_key=self._api_key, model=OWNER_APPROVED_MODEL)
+                judge = self._judge_factory()
+                if judge is None:
+                    raise RuntimeError("Decision model unavailable")
                 self._clip_judge = judge
             clip = select_clip(
                 lines,
@@ -111,6 +122,7 @@ class RecordingLiveSession:
                         )
                     },
                 )["relevant"],
+                **clip_thresholds(judge.backend),
             )
             self._copy_text(clip.text)
             message = (

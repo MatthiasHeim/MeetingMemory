@@ -220,10 +220,12 @@ def select_clip(
     *,
     widen: bool = False,
     timestamps: bool = True,
+    seed_threshold: float | None = None,
+    grow_threshold: float | None = None,
 ) -> ClipResult:
     """Select and render a verbatim clip. No model is allowed to rewrite text."""
-    seed = WIDE_SEED_THRESHOLD if widen else DEFAULT_SEED_THRESHOLD
-    grow = WIDE_GROW_THRESHOLD if widen else DEFAULT_GROW_THRESHOLD
+    seed = (WIDE_SEED_THRESHOLD if widen else DEFAULT_SEED_THRESHOLD) if seed_threshold is None else seed_threshold
+    grow = (WIDE_GROW_THRESHOLD if widen else DEFAULT_GROW_THRESHOLD) if grow_threshold is None else grow_threshold
     keep = _selected_mask(probabilities, lines, seed_threshold=seed, grow_threshold=grow)
     indices = tuple(index for index, included in enumerate(keep) if included and not is_filler(lines[index]))
     selected = tuple(lines[index] for index in indices)

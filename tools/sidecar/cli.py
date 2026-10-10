@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     clip.add_argument("--stem", required=True, help="recorder filename stem")
     clip.add_argument("--topic", required=True, help="free-text meeting topic")
     clip.add_argument("--widen", action="store_true", help="lower clip seed/grow thresholds one calibrated step")
-    clip.add_argument("--judge", choices=("gemini", "jev"), default="gemini")
+    clip.add_argument("--judge", choices=("gemini", "decider", "jev"), default="gemini")
     clip.add_argument(
         "--model", choices=(OWNER_APPROVED_MODEL,), default=OWNER_APPROVED_MODEL,
         help="the single owner-approved Gemini judge",
@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     prompts = subcommands.add_parser("prompts", help="marked and suggested dictated prompts")
     prompts.add_argument("--stem", required=True, help="recorder filename stem")
-    prompts.add_argument("--judge", choices=("gemini", "jev"), default="gemini")
+    prompts.add_argument("--judge", choices=("gemini", "decider", "jev"), default="gemini")
     prompts.add_argument(
         "--model", choices=(OWNER_APPROVED_MODEL,), default=OWNER_APPROVED_MODEL,
         help="the single owner-approved Gemini judge",

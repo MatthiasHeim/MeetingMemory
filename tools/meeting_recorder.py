@@ -27,7 +27,7 @@ import soundfile as sf
 import rumps
 
 from capture_provenance import archive_capture, merge_filter
-from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar
+from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar, load_recording_sidecar
 from sidecar.recorder_support import (
     CalendarRecordingContext,
     append_prompt_mark,
@@ -465,7 +465,7 @@ class MeetingRecorderApp(rumps.App):
         self._prompts_item = rumps.MenuItem("Prompts…", callback=self.copy_prompt)
         self._live_panel_item = rumps.MenuItem("Live-Fenster anzeigen", callback=self.show_live_panel)
         self._devices_item = rumps.MenuItem("List Audio Devices", callback=self.list_devices)
-        self._jev_pref_item = rumps.MenuItem("Jev verwenden", callback=self.toggle_jev_preference)
+        self._jev_pref_item = rumps.MenuItem("Decider lokal verwenden", callback=self.toggle_jev_preference)
         self.menu = [
             self._start_stop_item,
             self._prompt_mark_item,
@@ -559,7 +559,7 @@ class MeetingRecorderApp(rumps.App):
 
         The existing resolver keys its lookup from the timestamped filename;
         it does not need a completed transcript. Any lookup failure is an
-        unresolved meeting and is persisted fail-closed for the Jev gate.
+        unresolved meeting and is persisted fail-closed for the Decider gate.
         """
         try:
             from calendar_resolve import resolve
@@ -568,7 +568,7 @@ class MeetingRecorderApp(rumps.App):
                 resolve(output_file.with_suffix(".json"), timeout_seconds=timeout_seconds)
             )
         except Exception as exc:
-            print(f"Calendar lookup unavailable for Jev gate: {exc}", file=sys.stderr)
+            print(f"Calendar lookup unavailable for Decider gate: {exc}", file=sys.stderr)
             return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
 
     def _jev_preference(self) -> bool:
@@ -582,17 +582,17 @@ class MeetingRecorderApp(rumps.App):
         try:
             item.state = 1 if self._jev_preference() else 0
         except Exception as exc:
-            print(f"Could not show Jev preference state: {exc}", file=sys.stderr)
+            print(f"Could not show Decider preference state: {exc}", file=sys.stderr)
 
     def toggle_jev_preference(self, sender):
-        """Flip the Jev switch. This is not shown when a recording starts."""
+        """Flip the local Decider switch. This is not shown when a recording starts."""
         enabled = not self._jev_preference()
         try:
             write_jev_preference(self.config_path, enabled)
         except Exception as exc:
             rumps.notification(
                 title="MeetingRecorder",
-                subtitle="Jev verwenden",
+                subtitle="Decider lokal verwenden",
                 message=f"Die Einstellung konnte nicht gespeichert werden: {exc}",
             )
             return
@@ -660,8 +660,8 @@ class MeetingRecorderApp(rumps.App):
             self._sidecar_write_failed(timestamp, exc)
 
     def _sidecar_write_failed(self, stem: str, exc: Exception) -> None:
-        """Keep recording and permanently force Gemini after any write failure."""
-        print(f"Sidecar write failed for {stem}; Jev forced off: {exc}", file=sys.stderr)
+        """Keep recording and disable the optional decision route after any write failure."""
+        print(f"Sidecar write failed for {stem}; Decider forced off: {exc}", file=sys.stderr)
         failures = getattr(self, "_sidecar_write_failed_stems", None)
         if failures is None:
             failures = set()
@@ -681,7 +681,7 @@ class MeetingRecorderApp(rumps.App):
         try:
             self._notify_from_worker(
                 subtitle="Sidecar nicht gespeichert",
-                message="Die Aufnahme läuft weiter; Jev bleibt ausgeschaltet.",
+                message="Die Aufnahme läuft weiter; Decider bleibt ausgeschaltet.",
             )
         except Exception as notify_exc:
             print(f"Sidecar failure notification failed: {notify_exc}", file=sys.stderr)
@@ -754,6 +754,8 @@ class MeetingRecorderApp(rumps.App):
                     api_key=self._gemini_api_key(),
                     copy_text=self._copy_to_clipboard,
                     on_unavailable=self._notify_live_unavailable,
+                    decision_stem=self._recording_stem if self._jev_preference() else None,
+                    recordings_root=self.recordings_dir,
                 )
                 self._live_session.start()
             else:
@@ -1054,6 +1056,9 @@ class MeetingRecorderApp(rumps.App):
                     topic,
                     transcripts_root=self.transcripts_dir,
                     recordings_root=self.recordings_dir,
+                    requested_judge=("decider" if self._jev_preference() and load_recording_sidecar(
+                        transcript.stem, self.recordings_dir
+                    ).jev else None),
                     gemini_api_key=self._gemini_api_key(),
                 )
                 self._copy_to_clipboard(clip.text)
@@ -1092,6 +1097,9 @@ class MeetingRecorderApp(rumps.App):
                     transcript.stem,
                     transcripts_root=self.transcripts_dir,
                     recordings_root=self.recordings_dir,
+                    requested_judge=("decider" if self._jev_preference() and load_recording_sidecar(
+                        transcript.stem, self.recordings_dir
+                    ).jev else None),
                     gemini_api_key=self._gemini_api_key(),
                 )
             except Exception as exc:
