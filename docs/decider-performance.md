@@ -1,11 +1,107 @@
 # Decider latency: diagnosis and measurement plan
 
-2026-10-11. Static inspection and saved measurements only. No inference requests,
-runtime changes, service restarts, downloads, or power-setting changes were made
-for this assessment. New benchmarks await an explicit coordination message that
-the Qwen historical-email and workflow grading has finished.
+2026-10-11. Initial static assessment followed by an explicitly cleared, bounded
+benchmark of the unchanged service. Qwen grading and film rendering had finished.
+No runtime changes, service restarts, model downloads, power-setting changes or
+live-recorder behavior changes were made.
 
-## What the existing timings establish
+## Measured follow-up: warm service, 12 identical requests
+
+**On this Mac, isolated requests with complete meeting context took a median
+1.77 seconds for relevance and 1.98 seconds for prompt detection.** Four concurrent
+callers raised those medians to 6.11 and 6.42 seconds without a consistent gain in
+total completion time. Prioritize protecting interactive work from bulk queueing;
+this experiment provides no reason to increase concurrency or batch limits.
+
+| Request class | Tokens per decision | Sequential median (observed range) | Four-caller median (observed range) |
+| --- | --- | --- | --- |
+| Short classification | 244–251 | 0.89 s (0.77–1.21) | 4.03 s (1.61–9.00) |
+| Meeting relevance | 428–611 | 1.77 s (1.19–2.28) | 6.11 s (1.46–8.26) |
+| Meeting prompt detection | 551–665 | 1.98 s (1.58–3.17) | 6.42 s (3.33–9.79) |
+| All 12 fixtures | 244–665 | 1.61 s (0.77–3.17) | 6.11 s (1.46–9.79) |
+
+Each class has four unique fixtures, repeated twice per condition: **8 observations
+per class/condition, 24 per condition, 48 measured decisions total**. Three separate
+warmup calls took 1.89, 1.33 and 1.58 seconds. Ranges are observed minima/maxima;
+the sample is too small to characterize tail percentiles or normal-day variability.
+
+| Pass order | Median request | Total for 12 decisions | GPU-worker batches |
+| --- | ---: | ---: | ---: |
+| Sequential 1 | 1.58 s | 18.86 s | 12 |
+| Four callers 1 | 5.36 s | 17.61 s | 8 |
+| Four callers 2 | 8.15 s | 21.36 s | 7 |
+| Sequential 2 | 1.83 s | 20.59 s | 12 |
+
+The second pair reverses the condition order to limit simple warmup/order effects.
+Fixture order is identical throughout. The two concurrent passes finished in
+38.97 seconds combined versus 39.45 seconds sequentially: **only 1.2% less total
+time**, well within the observed pass-to-pass variation. Four callers increased
+individual waiting while doing essentially the same overall work. A real recorder
+burst needs all its line scores; its card latency is not the latency of one line.
+These direct loopback measurements exclude helper-process startup, recorder cadence,
+audio transcription, prompt rewriting and complete card/clip generation.
+
+### Numerical equivalence: decisions held, strict probability gate failed
+
+Both sequential passes returned identical probabilities for every fixture.
+Concurrency produced numerical differences in **6 of 12 fixtures**. The largest
+absolute difference was **0.0077283** (0.773 percentage points); both concurrent
+passes also differed from each other on some inputs and formed different batches.
+No binary winner at 0.5 or applicable configured threshold decision changed in this
+sample. The deliberately included prompt near 0.92 stayed at 0.9180676 in every
+pass; one relevance example ranged from 0.1026111 to 0.1084585, remaining above 0.10.
+
+The predeclared 1e-5 numerical gate therefore **failed for concurrency**, despite
+all sampled decisions agreeing. Same weights and inputs do not guarantee identical
+probabilities across the current batch schedules. Padding/batch shape is a plausible
+cause, not proven by this experiment. Do not label further batching or cache changes
+universally output-preserving on this evidence. Complete clips/cards were not replayed.
+
+### Conditions and limits
+
+- The last initialized recording had its completed WAV and an archived stop record;
+  no audio tap was running. A recording/temp-file change guard checked before every
+  submission. There was no recording activity during the run. The app has no status
+  API; accessibility inspection of its background Python menu app timed out, so
+  the check used capture processes and completion files.
+- LM Studio reported no loaded model before, during and after the run. Decider kept
+  the same service PID. Its completed-decision counter increased by exactly **51**,
+  matching the 48 measured calls and 3 warmups. There is no evidence of extra Decider
+  inference in this interval. Other desktop applications remained running.
+- The Mac was on AC power; `pmset` reported no recorded thermal or performance
+  warning. This is not a GPU-utilization or sustained thermal measurement.
+- System memory was still unsettled: swap usage fell from 26.17 to 18.87 GiB and
+  compressor occupancy from 25.71 to 13.55 GiB. Cumulative counters increased by
+  2.74 GiB of swap-ins and 8.15 GiB of swap-outs over the run. These are whole-system
+  observations, not amounts attributable to Decider. No current MLX/Metal peak or
+  OS physical-footprint sample was collected; the small ordinary RSS reading does
+  not represent total model memory. The earlier 35.9 GiB footprint remains historical.
+- Server worker wall time was 17.44/19.18 seconds in the sequential passes and
+  17.47/21.09 seconds in the concurrent passes. It closely tracked total processing,
+  but includes collation and probability materialization, not just GPU execution.
+  Exact per-request queue-versus-compute decomposition is still unavailable.
+- The manifest uses four saved short cases, two English and two Swiss German
+  relevance cases at request-length quartiles, and four Swiss German prompt cases
+  covering request-length quartiles and the nearest saved probability to 0.92.
+  Every meeting request retains all six recorded preceding lines. This is a small
+  exploratory matched timing sample, not a population sample or new accuracy test.
+
+**Measured recommendation:** first design admission control that reserves prompt
+capacity for live work and limits background submissions. Do not globally change
+the recorder's existing concurrency on this sample: its whole-burst completion time
+showed no consistent advantage, and batching changes probabilities. Before any
+scheduler/precision-sensitive rollout, investigate batch-shape repeatability with
+fixed input tensors and cases near thresholds in a separately coordinated experiment.
+Exact caching and helper reuse remain secondary candidates with unmeasured benefits.
+No optimization was rolled out.
+
+[Sanitized observations and exact probability comparisons](decider-latency-2026-10-11.json)
+contain hashes, fixture IDs and numeric results, with no meeting text. The
+[replay script](../tools/decider_latency_baseline.py) prepared a frozen private
+manifest under `~/.local/share/agent-skill-state/decider/latency-2026-10-11/`.
+It executed at 09:25–09:27 UTC (11:25–11:27 Europe/Zurich).
+
+## What the earlier timings establish
 
 **The 12–16 second figures measure context-rich requests with four concurrent
 clients, including queueing. They do not establish isolated interactive latency.**
@@ -96,7 +192,7 @@ Reducing history, shortening/rephrasing questions, skipping the six overlap
 decisions, changing polling windows, weakening precision/model, or moving to a
 cloud model are separate quality/behavior changes, not claimed optimizations here.
 
-## Comparable benchmark, after the coordination signal
+## Broader comparison plan (only the bounded baseline above was run)
 
 **Freeze the baseline:** `pplx-decider-v1.1-27b`, MLX 4-bit revision
 `66383f28b37637658b02b8e82b1029598b138642`, temperature
@@ -171,4 +267,5 @@ queue-versus-compute breakdown, not a promised speedup factor.
   Decider footprint snapshot saved at 2026-10-10 21:50:34 UTC.
 
 No production behavior changed. Functional suites from the migration were not
-rerun because this work only adds documentation.
+rerun; this follow-up exercised the existing service through a standalone replay
+script, with 51 valid responses and metadata/hash checks.

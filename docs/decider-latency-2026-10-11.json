@@ -1,0 +1,1367 @@
+{
+  "schema_version": 1,
+  "scope": "Exploratory matched latency sample: 12 fixtures, 48 measured decisions, 3 separate warmups; not an accuracy benchmark.",
+  "started_utc": "2026-10-11T09:25:39.209547+00:00",
+  "finished_utc": "2026-10-11T09:27:04.541333+00:00",
+  "model": "pplx-decider-v1.1-27b",
+  "revision": "66383f28b37637658b02b8e82b1029598b138642",
+  "manifest_sha256": "009d82fb02000ab84cecabb7cd3078c67d5484c3e1f52ed46083501b8156faf6",
+  "manifest_metadata": {
+    "model": "pplx-decider-v1.1-27b",
+    "revision": "66383f28b37637658b02b8e82b1029598b138642",
+    "fixtures": [
+      {
+        "id": "prompt_en",
+        "category": "short",
+        "source": "acceptance",
+        "source_index": 0,
+        "request_sha256": "430063b37201e6683f116c982cfb2b8488bda4bc392f077a4f53a6f2589aedb6"
+      },
+      {
+        "id": "A-344",
+        "category": "relevance",
+        "source": "A",
+        "source_index": 344,
+        "request_sha256": "2578b0d7c50ec28bae04daf8f79ac675c07229392ac48740df6831789e4a8216"
+      },
+      {
+        "id": "C-54",
+        "category": "prompt",
+        "source": "C",
+        "source_index": 54,
+        "request_sha256": "8113193e31745d7feab2ed6b403057a794e7728fcdbfd9bd0417106b2cc5214e"
+      },
+      {
+        "id": "prompt_swiss",
+        "category": "short",
+        "source": "acceptance",
+        "source_index": 2,
+        "request_sha256": "6a3d756c9b12a988b38437d96c2c3a7708ff3808d3df3acf90003f8fe13a841d"
+      },
+      {
+        "id": "A-287",
+        "category": "relevance",
+        "source": "A",
+        "source_index": 287,
+        "request_sha256": "21d480f950b84eded71f1637ca0b921313ffe4ff91183e86aae6347eee5e1a68"
+      },
+      {
+        "id": "C-62",
+        "category": "prompt",
+        "source": "C",
+        "source_index": 62,
+        "request_sha256": "c3253a60f79368cea94319c0ce34b1b4d57d5339b42cbb12ff6384650a5369b2"
+      },
+      {
+        "id": "chatter",
+        "category": "short",
+        "source": "acceptance",
+        "source_index": 6,
+        "request_sha256": "c62ea341693fea53287a1bf44e4e07ca4684dd37e66122f72588594bbf4b2b70"
+      },
+      {
+        "id": "B-311",
+        "category": "relevance",
+        "source": "B",
+        "source_index": 311,
+        "request_sha256": "7f42864418393a91279a6fcf20739b4569f2654622061e559191bd6f51d45246"
+      },
+      {
+        "id": "C-10",
+        "category": "prompt",
+        "source": "C",
+        "source_index": 10,
+        "request_sha256": "c170c7984460e358701b88ffc25af4b02b130afa5f731e9070364c7bae0cb598"
+      },
+      {
+        "id": "swiss_chatter",
+        "category": "short",
+        "source": "acceptance",
+        "source_index": 9,
+        "request_sha256": "3e1e39ecda99628f45dbd9caadb1093ec17c054c8ffe74a9a2db51247312b84e"
+      },
+      {
+        "id": "B-151",
+        "category": "relevance",
+        "source": "B",
+        "source_index": 151,
+        "request_sha256": "1a20dd1727aed7502c8961a655a5267d9c7163778be1954271303067672fe379"
+      },
+      {
+        "id": "C-119",
+        "category": "prompt",
+        "source": "C",
+        "source_index": 119,
+        "request_sha256": "c850abe69491ed709e3306b7d746ce528c0b5710c74b23b238dc71f314821d69"
+      }
+    ],
+    "source_hashes": {
+      "server.py": "258f06d567eb3dc11bcdd6ca2c32950741a8e8b86859626cc04562f9f7f8a804",
+      "decider_mlx.py": "6b3f05e0515743442a8489508b8ef147cbef03a89a0bc180f099bc5917438688",
+      "config.json": "42b69f35566ba49569cb6472b8a01bd94f8029c49f71ec173ab8a0e4e0df27c9",
+      "decision_config.json": "68d4a4c704a0c42837f749b0287bd80f70d186ed3be4dc6a90802e78223925e8",
+      "tokenizer.json": "6f32ce20dc35f57a7f9ad1eac03525bd7d30f9df8cea6507e958279cc3657706",
+      "tokenizer_config.json": "09564f0b57b433b55d536630be3044b4183dbe04d0cbc7b1e9b1154db3671b0b",
+      "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "installed_packages": [
+      "annotated_doc-0.0.5.dist-info",
+      "annotated_types-0.8.0.dist-info",
+      "anyio-4.15.1.dist-info",
+      "certifi-2026.7.22.dist-info",
+      "cffi-2.1.1.dist-info",
+      "charset_normalizer-3.5.2.dist-info",
+      "click-8.5.0.dist-info",
+      "cryptography-50.0.2.dist-info",
+      "fastapi-0.142.2.dist-info",
+      "filelock-4.1.0.dist-info",
+      "fsspec-2026.9.0.dist-info",
+      "h11-0.16.0.dist-info",
+      "hf_xet-1.7.0.dist-info",
+      "httpcore-1.0.9.dist-info",
+      "httpx-0.28.1.dist-info",
+      "huggingface_hub-1.33.0.dist-info",
+      "idna-3.20.dist-info",
+      "jinja2-3.1.6.dist-info",
+      "llguidance-1.9.1.dist-info",
+      "markdown_it_py-4.2.0.dist-info",
+      "markupsafe-3.0.4.dist-info",
+      "mdurl-0.1.2.dist-info",
+      "miniaudio-1.71.dist-info",
+      "mlx-0.32.3.dist-info",
+      "mlx_audio-0.5.8.dist-info",
+      "mlx_metal-0.32.3.dist-info",
+      "mlx_vlm-0.7.6.dist-info",
+      "numpy-2.5.3.dist-info",
+      "opencv_python-5.0.0.93.dist-info",
+      "opentelemetry_api-1.45.1.dist-info",
+      "packaging-26.3.dist-info",
+      "pillow-12.3.0.dist-info",
+      "pycparser-3.11.dist-info",
+      "pydantic-2.14.0.dist-info",
+      "pydantic_core-2.50.0.dist-info",
+      "pygments-2.21.0.dist-info",
+      "python_multipart-0.0.32.dist-info",
+      "pyyaml-6.0.3.dist-info",
+      "regex-2026.9.29.dist-info",
+      "requests-2.34.2.dist-info",
+      "rich-15.0.0.dist-info",
+      "safetensors-0.8.0.dist-info",
+      "scipy-1.18.1.dist-info",
+      "sentencepiece-0.2.2.dist-info",
+      "shellingham-1.5.4.dist-info",
+      "sounddevice-0.5.6.dist-info",
+      "starlette-1.7.0.dist-info",
+      "tokenizers-0.23.3.dist-info",
+      "tqdm-4.70.1.dist-info",
+      "transformers-5.19.0.dist-info",
+      "typer-0.27.3.dist-info",
+      "typing_extensions-4.16.0.dist-info",
+      "typing_inspection-0.4.4.dist-info",
+      "urllib3-2.8.0.dist-info",
+      "uvicorn-0.54.0.dist-info",
+      "websockets-17.2.dist-info"
+    ],
+    "selection": "Four saved short cases; A/B recorded context at request-byte quartiles 25/75; C quartiles 25/50/75 plus closest saved probability to .92; all real cases retain six prior lines.",
+    "pass_order": [
+      "sequential-1",
+      "concurrent-1",
+      "concurrent-2",
+      "sequential-2"
+    ],
+    "warmup": "First short, relevance and prompt fixture, once each, separately reported",
+    "thresholds": {
+      "prompt": 0.92,
+      "clip_seed": 0.1,
+      "clip_grow": 0.025,
+      "wide_seed": 0.05,
+      "wide_grow": 0.01
+    }
+  },
+  "summary": {
+    "categories": {
+      "all": {
+        "1": {
+          "n": 24,
+          "median_s": 1.6056280415068613,
+          "min_s": 0.7709625839779619,
+          "max_s": 3.1679766250017565
+        },
+        "4": {
+          "n": 24,
+          "median_s": 6.1132309999957215,
+          "min_s": 1.4638212909922004,
+          "max_s": 9.790785458986647
+        }
+      },
+      "short": {
+        "1": {
+          "n": 8,
+          "median_s": 0.8946534380083904,
+          "min_s": 0.7709625839779619,
+          "max_s": 1.2060341659816913
+        },
+        "4": {
+          "n": 8,
+          "median_s": 4.031558729504468,
+          "min_s": 1.6111685000068974,
+          "max_s": 9.001934625004651
+        }
+      },
+      "relevance": {
+        "1": {
+          "n": 8,
+          "median_s": 1.7652471879991936,
+          "min_s": 1.193092583998805,
+          "max_s": 2.2761924999940675
+        },
+        "4": {
+          "n": 8,
+          "median_s": 6.1132309999957215,
+          "min_s": 1.4638212909922004,
+          "max_s": 8.264237374998629
+        }
+      },
+      "prompt": {
+        "1": {
+          "n": 8,
+          "median_s": 1.9841465214994969,
+          "min_s": 1.578586624993477,
+          "max_s": 3.1679766250017565
+        },
+        "4": {
+          "n": 8,
+          "median_s": 6.42081722948933,
+          "min_s": 3.329276208009105,
+          "max_s": 9.790785458986647
+        }
+      }
+    },
+    "passes": [
+      {
+        "name": "sequential-1",
+        "n": 12,
+        "wall_s": 18.856610957998782,
+        "median_s": 1.5800527710089227,
+        "decisions_per_s": 0.6363815866344594
+      },
+      {
+        "name": "concurrent-1",
+        "n": 12,
+        "wall_s": 17.611336333997315,
+        "median_s": 5.359404333503335,
+        "decisions_per_s": 0.6813792986756453
+      },
+      {
+        "name": "concurrent-2",
+        "n": 12,
+        "wall_s": 21.358901291008806,
+        "median_s": 8.146843208494829,
+        "decisions_per_s": 0.5618266518723738
+      },
+      {
+        "name": "sequential-2",
+        "n": 12,
+        "wall_s": 20.589961584017146,
+        "median_s": 1.8331863755011,
+        "decisions_per_s": 0.5828082753352458
+      }
+    ],
+    "equivalence": {
+      "per_fixture": [
+        {
+          "id": "prompt_en",
+          "tokens": 246,
+          "probabilities_by_pass": [
+            0.9989702207312985,
+            0.9990901286462541,
+            0.9990901286462541,
+            0.9989702207312985
+          ],
+          "max_probability_spread": 0.00011990791495564146,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "A-344",
+          "tokens": 428,
+          "probabilities_by_pass": [
+            0.3498760461807251,
+            0.3498760461807251,
+            0.3498760461807251,
+            0.3498760461807251
+          ],
+          "max_probability_spread": 0.0,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "C-54",
+          "tokens": 551,
+          "probabilities_by_pass": [
+            0.114596506115638,
+            0.114596506115638,
+            0.114596506115638,
+            0.114596506115638
+          ],
+          "max_probability_spread": 0.0,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "prompt_swiss",
+          "tokens": 251,
+          "probabilities_by_pass": [
+            0.9992897125784146,
+            0.9992443467381292,
+            0.9992443467381292,
+            0.9992897125784146
+          ],
+          "max_probability_spread": 4.5365840285360726e-05,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "A-287",
+          "tokens": 596,
+          "probabilities_by_pass": [
+            0.10261113120160154,
+            0.10845848594729644,
+            0.10845848594729644,
+            0.10261113120160154
+          ],
+          "max_probability_spread": 0.005847354745694908,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "C-62",
+          "tokens": 572,
+          "probabilities_by_pass": [
+            0.09174939716609129,
+            0.09174939716609129,
+            0.09174939716609129,
+            0.09174939716609129
+          ],
+          "max_probability_spread": 0.0,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "chatter",
+          "tokens": 244,
+          "probabilities_by_pass": [
+            0.01860881400140665,
+            0.01860881400140665,
+            0.01860881400140665,
+            0.01860881400140665
+          ],
+          "max_probability_spread": 0.0,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "B-311",
+          "tokens": 517,
+          "probabilities_by_pass": [
+            0.010740218422929416,
+            0.011418872587319565,
+            0.010740218422929416,
+            0.010740218422929416
+          ],
+          "max_probability_spread": 0.0006786541643901481,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0006786541643901481,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "C-10",
+          "tokens": 631,
+          "probabilities_by_pass": [
+            0.8577580963228998,
+            0.8500297918924627,
+            0.8577580963228998,
+            0.8577580963228998
+          ],
+          "max_probability_spread": 0.0077283044304370385,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0077283044304370385,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "swiss_chatter",
+          "tokens": 249,
+          "probabilities_by_pass": [
+            0.0031345577160250973,
+            0.0031345577160250973,
+            0.0031345577160250973,
+            0.0031345577160250973
+          ],
+          "max_probability_spread": 0.0,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "B-151",
+          "tokens": 611,
+          "probabilities_by_pass": [
+            0.01751039399321067,
+            0.01977471123835304,
+            0.018608795721571092,
+            0.01751039399321067
+          ],
+          "max_probability_spread": 0.00226431724514237,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.001165915516781947,
+          "threshold_crossings": [],
+          "winner_changed": false
+        },
+        {
+          "id": "C-119",
+          "tokens": 665,
+          "probabilities_by_pass": [
+            0.9180676341056824,
+            0.9180676341056824,
+            0.9180676341056824,
+            0.9180676341056824
+          ],
+          "max_probability_spread": 0.0,
+          "sequential_repeat_drift": 0.0,
+          "concurrent_repeat_drift": 0.0,
+          "threshold_crossings": [],
+          "winner_changed": false
+        }
+      ],
+      "max_probability_spread": 0.0077283044304370385,
+      "max_sequential_repeat_drift": 0.0,
+      "max_concurrent_repeat_drift": 0.0077283044304370385,
+      "fixtures_with_numerical_variation": 6,
+      "fixtures_exceeding_predeclared_1e_5": 6,
+      "threshold_crossings": 0,
+      "winner_changes": 0
+    },
+    "resources": [
+      {
+        "label": "before-warmup",
+        "utc": "2026-10-11T09:25:39.261265+00:00",
+        "service_stats": {
+          "batches": 158,
+          "decisions": 183,
+          "tokens": 313126,
+          "gpu_s": 1344.9583406448364,
+          "queued": 0,
+          "avg_batch": 1.16
+        },
+        "rss_gib": 0.0946197509765625,
+        "system_swap_used_gib": 26.172666015625,
+        "system_compressor_occupied_gib": 25.710800170898438,
+        "system_swapins_cumulative_bytes": 176552198144,
+        "system_swapouts_cumulative_bytes": 441996492800,
+        "memory_pressure_free_percentage": 36
+      },
+      {
+        "label": "before-sequential-1",
+        "utc": "2026-10-11T09:25:44.410006+00:00",
+        "service_stats": {
+          "batches": 161,
+          "decisions": 186,
+          "tokens": 314351,
+          "gpu_s": 1349.4719796180725,
+          "queued": 0,
+          "avg_batch": 1.16
+        },
+        "rss_gib": 0.0972442626953125,
+        "system_swap_used_gib": 26.141416015625,
+        "system_compressor_occupied_gib": 13.256134033203125,
+        "system_swapins_cumulative_bytes": 176582328320,
+        "system_swapouts_cumulative_bytes": 441996492800,
+        "memory_pressure_free_percentage": 39
+      },
+      {
+        "label": "after-sequential-1",
+        "utc": "2026-10-11T09:26:03.472034+00:00",
+        "service_stats": {
+          "batches": 173,
+          "decisions": 198,
+          "tokens": 319912,
+          "gpu_s": 1366.9126722812653,
+          "queued": 0,
+          "avg_batch": 1.14
+        },
+        "rss_gib": 0.082244873046875,
+        "system_swap_used_gib": 20.3670703125,
+        "system_compressor_occupied_gib": 17.165542602539062,
+        "system_swapins_cumulative_bytes": 177743052800,
+        "system_swapouts_cumulative_bytes": 444041527296,
+        "memory_pressure_free_percentage": 36
+      },
+      {
+        "label": "before-concurrent-1",
+        "utc": "2026-10-11T09:26:03.661325+00:00",
+        "service_stats": {
+          "batches": 173,
+          "decisions": 198,
+          "tokens": 319912,
+          "gpu_s": 1366.9126722812653,
+          "queued": 0,
+          "avg_batch": 1.14
+        },
+        "rss_gib": 0.082183837890625,
+        "system_swap_used_gib": 20.3670703125,
+        "system_compressor_occupied_gib": 17.171524047851562,
+        "system_swapins_cumulative_bytes": 177743380480,
+        "system_swapouts_cumulative_bytes": 444041527296,
+        "memory_pressure_free_percentage": 40
+      },
+      {
+        "label": "after-concurrent-1",
+        "utc": "2026-10-11T09:26:21.482318+00:00",
+        "service_stats": {
+          "batches": 181,
+          "decisions": 210,
+          "tokens": 325473,
+          "gpu_s": 1384.3825798034668,
+          "queued": 0,
+          "avg_batch": 1.16
+        },
+        "rss_gib": 0.0826873779296875,
+        "system_swap_used_gib": 16.8930078125,
+        "system_compressor_occupied_gib": 16.775970458984375,
+        "system_swapins_cumulative_bytes": 178380390400,
+        "system_swapouts_cumulative_bytes": 447522013184,
+        "memory_pressure_free_percentage": 46
+      },
+      {
+        "label": "before-concurrent-2",
+        "utc": "2026-10-11T09:26:21.751525+00:00",
+        "service_stats": {
+          "batches": 181,
+          "decisions": 210,
+          "tokens": 325473,
+          "gpu_s": 1384.3825798034668,
+          "queued": 0,
+          "avg_batch": 1.16
+        },
+        "rss_gib": 0.0826873779296875,
+        "system_swap_used_gib": 16.8930078125,
+        "system_compressor_occupied_gib": 16.773223876953125,
+        "system_swapins_cumulative_bytes": 178380980224,
+        "system_swapouts_cumulative_bytes": 447522013184,
+        "memory_pressure_free_percentage": 48
+      },
+      {
+        "label": "after-concurrent-2",
+        "utc": "2026-10-11T09:26:43.343616+00:00",
+        "service_stats": {
+          "batches": 188,
+          "decisions": 222,
+          "tokens": 331034,
+          "gpu_s": 1405.4742386341095,
+          "queued": 0,
+          "avg_batch": 1.18
+        },
+        "rss_gib": 0.0833892822265625,
+        "system_swap_used_gib": 18.680478515625,
+        "system_compressor_occupied_gib": 15.425811767578125,
+        "system_swapins_cumulative_bytes": 178843041792,
+        "system_swapouts_cumulative_bytes": 449885962240,
+        "memory_pressure_free_percentage": 44
+      },
+      {
+        "label": "before-sequential-2",
+        "utc": "2026-10-11T09:26:43.551216+00:00",
+        "service_stats": {
+          "batches": 188,
+          "decisions": 222,
+          "tokens": 331034,
+          "gpu_s": 1405.4742386341095,
+          "queued": 0,
+          "avg_batch": 1.18
+        },
+        "rss_gib": 0.0833892822265625,
+        "system_swap_used_gib": 18.680478515625,
+        "system_compressor_occupied_gib": 15.422332763671875,
+        "system_swapins_cumulative_bytes": 178843697152,
+        "system_swapouts_cumulative_bytes": 449885962240,
+        "memory_pressure_free_percentage": 44
+      },
+      {
+        "label": "after-sequential-2",
+        "utc": "2026-10-11T09:27:04.357613+00:00",
+        "service_stats": {
+          "batches": 200,
+          "decisions": 234,
+          "tokens": 336595,
+          "gpu_s": 1424.6511237621307,
+          "queued": 0,
+          "avg_batch": 1.17
+        },
+        "rss_gib": 0.0841217041015625,
+        "system_swap_used_gib": 18.870908203125,
+        "system_compressor_occupied_gib": 13.548736572265625,
+        "system_swapins_cumulative_bytes": 179491995648,
+        "system_swapouts_cumulative_bytes": 450744745984,
+        "memory_pressure_free_percentage": 46
+      }
+    ],
+    "observed_service_decisions_delta": 51,
+    "expected_service_decisions": 51,
+    "system_swapin_delta_gib": 2.7378997802734375,
+    "system_swapout_delta_gib": 8.147445678710938,
+    "combined_wall_seconds": {
+      "sequential": 39.44657254201593,
+      "concurrent": 38.97023762500612,
+      "concurrent_wall_reduction_percent": 1.207544499594856
+    }
+  },
+  "warmup": [
+    {
+      "id": "prompt_en",
+      "category": "short",
+      "request_sha256": "430063b37201e6683f116c982cfb2b8488bda4bc392f077a4f53a6f2589aedb6",
+      "seconds": 1.8896411659952719,
+      "answers": {
+        "prompt": {
+          "type": "noul",
+          "noul": 0.9989702207312985
+        }
+      },
+      "input_tokens": 246
+    },
+    {
+      "id": "A-344",
+      "category": "relevance",
+      "request_sha256": "2578b0d7c50ec28bae04daf8f79ac675c07229392ac48740df6831789e4a8216",
+      "seconds": 1.3294871249818243,
+      "answers": {
+        "relevant": {
+          "type": "noul",
+          "noul": 0.3498760461807251
+        }
+      },
+      "input_tokens": 428
+    },
+    {
+      "id": "C-54",
+      "category": "prompt",
+      "request_sha256": "8113193e31745d7feab2ed6b403057a794e7728fcdbfd9bd0417106b2cc5214e",
+      "seconds": 1.5792745420185383,
+      "answers": {
+        "dictating_prompt": {
+          "type": "noul",
+          "noul": 0.114596506115638
+        }
+      },
+      "input_tokens": 551
+    }
+  ],
+  "passes": [
+    {
+      "condition": "sequential-1",
+      "concurrency": 1,
+      "wall_seconds": 18.856610957998782,
+      "requests": [
+        {
+          "id": "prompt_en",
+          "category": "short",
+          "request_sha256": "430063b37201e6683f116c982cfb2b8488bda4bc392f077a4f53a6f2589aedb6",
+          "seconds": 0.8402768340019975,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9989702207312985
+            }
+          },
+          "input_tokens": 246
+        },
+        {
+          "id": "A-344",
+          "category": "relevance",
+          "request_sha256": "2578b0d7c50ec28bae04daf8f79ac675c07229392ac48740df6831789e4a8216",
+          "seconds": 1.193092583998805,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.3498760461807251
+            }
+          },
+          "input_tokens": 428
+        },
+        {
+          "id": "C-54",
+          "category": "prompt",
+          "request_sha256": "8113193e31745d7feab2ed6b403057a794e7728fcdbfd9bd0417106b2cc5214e",
+          "seconds": 1.578586624993477,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.114596506115638
+            }
+          },
+          "input_tokens": 551
+        },
+        {
+          "id": "prompt_swiss",
+          "category": "short",
+          "request_sha256": "6a3d756c9b12a988b38437d96c2c3a7708ff3808d3df3acf90003f8fe13a841d",
+          "seconds": 0.7709625839779619,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9992897125784146
+            }
+          },
+          "input_tokens": 251
+        },
+        {
+          "id": "A-287",
+          "category": "relevance",
+          "request_sha256": "21d480f950b84eded71f1637ca0b921313ffe4ff91183e86aae6347eee5e1a68",
+          "seconds": 1.7112321669992525,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.10261113120160154
+            }
+          },
+          "input_tokens": 596
+        },
+        {
+          "id": "C-62",
+          "category": "prompt",
+          "request_sha256": "c3253a60f79368cea94319c0ce34b1b4d57d5339b42cbb12ff6384650a5369b2",
+          "seconds": 1.6297371659893543,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.09174939716609129
+            }
+          },
+          "input_tokens": 572
+        },
+        {
+          "id": "chatter",
+          "category": "short",
+          "request_sha256": "c62ea341693fea53287a1bf44e4e07ca4684dd37e66122f72588594bbf4b2b70",
+          "seconds": 0.845070332987234,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.01860881400140665
+            }
+          },
+          "input_tokens": 244
+        },
+        {
+          "id": "B-311",
+          "category": "relevance",
+          "request_sha256": "7f42864418393a91279a6fcf20739b4569f2654622061e559191bd6f51d45246",
+          "seconds": 1.5815189170243684,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.010740218422929416
+            }
+          },
+          "input_tokens": 517
+        },
+        {
+          "id": "C-10",
+          "category": "prompt",
+          "request_sha256": "c170c7984460e358701b88ffc25af4b02b130afa5f731e9070364c7bae0cb598",
+          "seconds": 3.1679766250017565,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.8577580963228998
+            }
+          },
+          "input_tokens": 631
+        },
+        {
+          "id": "swiss_chatter",
+          "category": "short",
+          "request_sha256": "3e1e39ecda99628f45dbd9caadb1093ec17c054c8ffe74a9a2db51247312b84e",
+          "seconds": 0.943661625002278,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.0031345577160250973
+            }
+          },
+          "input_tokens": 249
+        },
+        {
+          "id": "B-151",
+          "category": "relevance",
+          "request_sha256": "1a20dd1727aed7502c8961a655a5267d9c7163778be1954271303067672fe379",
+          "seconds": 2.2761924999940675,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.01751039399321067
+            }
+          },
+          "input_tokens": 611
+        },
+        {
+          "id": "C-119",
+          "category": "prompt",
+          "request_sha256": "c850abe69491ed709e3306b7d746ce528c0b5710c74b23b238dc71f314821d69",
+          "seconds": 1.9594622089935,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.9180676341056824
+            }
+          },
+          "input_tokens": 665
+        }
+      ]
+    },
+    {
+      "condition": "concurrent-1",
+      "concurrency": 4,
+      "wall_seconds": 17.611336333997315,
+      "requests": [
+        {
+          "id": "prompt_en",
+          "category": "short",
+          "request_sha256": "430063b37201e6683f116c982cfb2b8488bda4bc392f077a4f53a6f2589aedb6",
+          "seconds": 2.8816773330036085,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9990901286462541
+            }
+          },
+          "input_tokens": 246
+        },
+        {
+          "id": "A-344",
+          "category": "relevance",
+          "request_sha256": "2578b0d7c50ec28bae04daf8f79ac675c07229392ac48740df6831789e4a8216",
+          "seconds": 1.4638212909922004,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.3498760461807251
+            }
+          },
+          "input_tokens": 428
+        },
+        {
+          "id": "C-54",
+          "category": "prompt",
+          "request_sha256": "8113193e31745d7feab2ed6b403057a794e7728fcdbfd9bd0417106b2cc5214e",
+          "seconds": 6.587361416983185,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.114596506115638
+            }
+          },
+          "input_tokens": 551
+        },
+        {
+          "id": "prompt_swiss",
+          "category": "short",
+          "request_sha256": "6a3d756c9b12a988b38437d96c2c3a7708ff3808d3df3acf90003f8fe13a841d",
+          "seconds": 2.8838753750023898,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9992443467381292
+            }
+          },
+          "input_tokens": 251
+        },
+        {
+          "id": "A-287",
+          "category": "relevance",
+          "request_sha256": "21d480f950b84eded71f1637ca0b921313ffe4ff91183e86aae6347eee5e1a68",
+          "seconds": 5.082559749978827,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.10845848594729644
+            }
+          },
+          "input_tokens": 596
+        },
+        {
+          "id": "C-62",
+          "category": "prompt",
+          "request_sha256": "c3253a60f79368cea94319c0ce34b1b4d57d5339b42cbb12ff6384650a5369b2",
+          "seconds": 5.5395665830001235,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.09174939716609129
+            }
+          },
+          "input_tokens": 572
+        },
+        {
+          "id": "chatter",
+          "category": "short",
+          "request_sha256": "c62ea341693fea53287a1bf44e4e07ca4684dd37e66122f72588594bbf4b2b70",
+          "seconds": 6.330822666990571,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.01860881400140665
+            }
+          },
+          "input_tokens": 244
+        },
+        {
+          "id": "B-311",
+          "category": "relevance",
+          "request_sha256": "7f42864418393a91279a6fcf20739b4569f2654622061e559191bd6f51d45246",
+          "seconds": 6.253868041996611,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.011418872587319565
+            }
+          },
+          "input_tokens": 517
+        },
+        {
+          "id": "C-10",
+          "category": "prompt",
+          "request_sha256": "c170c7984460e358701b88ffc25af4b02b130afa5f731e9070364c7bae0cb598",
+          "seconds": 6.254273041995475,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.8500297918924627
+            }
+          },
+          "input_tokens": 631
+        },
+        {
+          "id": "swiss_chatter",
+          "category": "short",
+          "request_sha256": "3e1e39ecda99628f45dbd9caadb1093ec17c054c8ffe74a9a2db51247312b84e",
+          "seconds": 5.179242084006546,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.0031345577160250973
+            }
+          },
+          "input_tokens": 249
+        },
+        {
+          "id": "B-151",
+          "category": "relevance",
+          "request_sha256": "1a20dd1727aed7502c8961a655a5267d9c7163778be1954271303067672fe379",
+          "seconds": 8.264237374998629,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.01977471123835304
+            }
+          },
+          "input_tokens": 611
+        },
+        {
+          "id": "C-119",
+          "category": "prompt",
+          "request_sha256": "c850abe69491ed709e3306b7d746ce528c0b5710c74b23b238dc71f314821d69",
+          "seconds": 4.6770859159878455,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.9180676341056824
+            }
+          },
+          "input_tokens": 665
+        }
+      ]
+    },
+    {
+      "condition": "concurrent-2",
+      "concurrency": 4,
+      "wall_seconds": 21.358901291008806,
+      "requests": [
+        {
+          "id": "prompt_en",
+          "category": "short",
+          "request_sha256": "430063b37201e6683f116c982cfb2b8488bda4bc392f077a4f53a6f2589aedb6",
+          "seconds": 1.611188332986785,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9990901286462541
+            }
+          },
+          "input_tokens": 246
+        },
+        {
+          "id": "A-344",
+          "category": "relevance",
+          "request_sha256": "2578b0d7c50ec28bae04daf8f79ac675c07229392ac48740df6831789e4a8216",
+          "seconds": 2.9530946250015404,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.3498760461807251
+            }
+          },
+          "input_tokens": 428
+        },
+        {
+          "id": "C-54",
+          "category": "prompt",
+          "request_sha256": "8113193e31745d7feab2ed6b403057a794e7728fcdbfd9bd0417106b2cc5214e",
+          "seconds": 9.790785458986647,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.114596506115638
+            }
+          },
+          "input_tokens": 551
+        },
+        {
+          "id": "prompt_swiss",
+          "category": "short",
+          "request_sha256": "6a3d756c9b12a988b38437d96c2c3a7708ff3808d3df3acf90003f8fe13a841d",
+          "seconds": 1.6111685000068974,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9992443467381292
+            }
+          },
+          "input_tokens": 251
+        },
+        {
+          "id": "A-287",
+          "category": "relevance",
+          "request_sha256": "21d480f950b84eded71f1637ca0b921313ffe4ff91183e86aae6347eee5e1a68",
+          "seconds": 8.151425500022015,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.10845848594729644
+            }
+          },
+          "input_tokens": 596
+        },
+        {
+          "id": "C-62",
+          "category": "prompt",
+          "request_sha256": "c3253a60f79368cea94319c0ce34b1b4d57d5339b42cbb12ff6384650a5369b2",
+          "seconds": 8.151645459001884,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.09174939716609129
+            }
+          },
+          "input_tokens": 572
+        },
+        {
+          "id": "chatter",
+          "category": "short",
+          "request_sha256": "c62ea341693fea53287a1bf44e4e07ca4684dd37e66122f72588594bbf4b2b70",
+          "seconds": 9.001934625004651,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.01860881400140665
+            }
+          },
+          "input_tokens": 244
+        },
+        {
+          "id": "B-311",
+          "category": "relevance",
+          "request_sha256": "7f42864418393a91279a6fcf20739b4569f2654622061e559191bd6f51d45246",
+          "seconds": 8.148921124986373,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.010740218422929416
+            }
+          },
+          "input_tokens": 517
+        },
+        {
+          "id": "C-10",
+          "category": "prompt",
+          "request_sha256": "c170c7984460e358701b88ffc25af4b02b130afa5f731e9070364c7bae0cb598",
+          "seconds": 8.144765292003285,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.8577580963228998
+            }
+          },
+          "input_tokens": 631
+        },
+        {
+          "id": "swiss_chatter",
+          "category": "short",
+          "request_sha256": "3e1e39ecda99628f45dbd9caadb1093ec17c054c8ffe74a9a2db51247312b84e",
+          "seconds": 8.980451290990459,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.0031345577160250973
+            }
+          },
+          "input_tokens": 249
+        },
+        {
+          "id": "B-151",
+          "category": "relevance",
+          "request_sha256": "1a20dd1727aed7502c8961a655a5267d9c7163778be1954271303067672fe379",
+          "seconds": 5.972593957994832,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.018608795721571092
+            }
+          },
+          "input_tokens": 611
+        },
+        {
+          "id": "C-119",
+          "category": "prompt",
+          "request_sha256": "c850abe69491ed709e3306b7d746ce528c0b5710c74b23b238dc71f314821d69",
+          "seconds": 3.329276208009105,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.9180676341056824
+            }
+          },
+          "input_tokens": 665
+        }
+      ]
+    },
+    {
+      "condition": "sequential-2",
+      "concurrency": 1,
+      "wall_seconds": 20.589961584017146,
+      "requests": [
+        {
+          "id": "prompt_en",
+          "category": "short",
+          "request_sha256": "430063b37201e6683f116c982cfb2b8488bda4bc392f077a4f53a6f2589aedb6",
+          "seconds": 1.2060341659816913,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9989702207312985
+            }
+          },
+          "input_tokens": 246
+        },
+        {
+          "id": "A-344",
+          "category": "relevance",
+          "request_sha256": "2578b0d7c50ec28bae04daf8f79ac675c07229392ac48740df6831789e4a8216",
+          "seconds": 1.4560193330107722,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.3498760461807251
+            }
+          },
+          "input_tokens": 428
+        },
+        {
+          "id": "C-54",
+          "category": "prompt",
+          "request_sha256": "8113193e31745d7feab2ed6b403057a794e7728fcdbfd9bd0417106b2cc5214e",
+          "seconds": 1.8471105420030653,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.114596506115638
+            }
+          },
+          "input_tokens": 551
+        },
+        {
+          "id": "prompt_swiss",
+          "category": "short",
+          "request_sha256": "6a3d756c9b12a988b38437d96c2c3a7708ff3808d3df3acf90003f8fe13a841d",
+          "seconds": 0.9146643340063747,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.9992897125784146
+            }
+          },
+          "input_tokens": 251
+        },
+        {
+          "id": "A-287",
+          "category": "relevance",
+          "request_sha256": "21d480f950b84eded71f1637ca0b921313ffe4ff91183e86aae6347eee5e1a68",
+          "seconds": 2.183729541982757,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.10261113120160154
+            }
+          },
+          "input_tokens": 596
+        },
+        {
+          "id": "C-62",
+          "category": "prompt",
+          "request_sha256": "c3253a60f79368cea94319c0ce34b1b4d57d5339b42cbb12ff6384650a5369b2",
+          "seconds": 2.0088308340054937,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.09174939716609129
+            }
+          },
+          "input_tokens": 572
+        },
+        {
+          "id": "chatter",
+          "category": "short",
+          "request_sha256": "c62ea341693fea53287a1bf44e4e07ca4684dd37e66122f72588594bbf4b2b70",
+          "seconds": 0.874642542010406,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.01860881400140665
+            }
+          },
+          "input_tokens": 244
+        },
+        {
+          "id": "B-311",
+          "category": "relevance",
+          "request_sha256": "7f42864418393a91279a6fcf20739b4569f2654622061e559191bd6f51d45246",
+          "seconds": 1.8192622089991346,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.010740218422929416
+            }
+          },
+          "input_tokens": 517
+        },
+        {
+          "id": "C-10",
+          "category": "prompt",
+          "request_sha256": "c170c7984460e358701b88ffc25af4b02b130afa5f731e9070364c7bae0cb598",
+          "seconds": 2.760845334007172,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.8577580963228998
+            }
+          },
+          "input_tokens": 631
+        },
+        {
+          "id": "swiss_chatter",
+          "category": "short",
+          "request_sha256": "3e1e39ecda99628f45dbd9caadb1093ec17c054c8ffe74a9a2db51247312b84e",
+          "seconds": 0.9642527500109281,
+          "answers": {
+            "prompt": {
+              "type": "noul",
+              "noul": 0.0031345577160250973
+            }
+          },
+          "input_tokens": 249
+        },
+        {
+          "id": "B-151",
+          "category": "relevance",
+          "request_sha256": "1a20dd1727aed7502c8961a655a5267d9c7163778be1954271303067672fe379",
+          "seconds": 1.9771865410148166,
+          "answers": {
+            "relevant": {
+              "type": "noul",
+              "noul": 0.01751039399321067
+            }
+          },
+          "input_tokens": 611
+        },
+        {
+          "id": "C-119",
+          "category": "prompt",
+          "request_sha256": "c850abe69491ed709e3306b7d746ce528c0b5710c74b23b238dc71f314821d69",
+          "seconds": 2.1828689579851925,
+          "answers": {
+            "dictating_prompt": {
+              "type": "noul",
+              "noul": 0.9180676341056824
+            }
+          },
+          "input_tokens": 665
+        }
+      ]
+    }
+  ],
+  "host_observations": {
+    "lmstudio_models": {
+      "utc": "2026-10-11T09:26:33.840025+00:00",
+      "exit": 0,
+      "stdout": "",
+      "stderr": "No models are currently loaded.\n\nTo load a model, run:\n\n    lms load <model path>"
+    },
+    "power_source": {
+      "utc": "2026-10-11T09:26:33.852976+00:00",
+      "exit": 0,
+      "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=23199843)\t100%; charged; 0:00 remaining present: true",
+      "stderr": ""
+    },
+    "thermal_state": {
+      "utc": "2026-10-11T09:26:33.861218+00:00",
+      "exit": 0,
+      "stdout": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+      "stderr": ""
+    },
+    "lmstudio_after": {
+      "utc": "2026-10-11T09:27:57.438906+00:00",
+      "stdout": "",
+      "stderr": "No models are currently loaded.\n\nTo load a model, run:\n\n    lms load <model path>"
+    }
+  },
+  "runner_sha256": "b8e16430d9cc6c09dd5a18dfa48a4ef82ec304e8a2d036107571af1a4b5384c7",
+  "limitations": [
+    "No recorder/Gemini end-to-end timing.",
+    "Loopback client timing includes service wait and forward; precise per-request queue time unavailable.",
+    "Only two passes per condition, no reliable tail percentiles.",
+    "RSS is not total MLX/Metal footprint; allocation peaks were not measured.",
+    "System memory/swap observations cover all applications.",
+    "Per-phase LM Studio stdout was empty; model inventory is recorded separately from stderr.",
+    "Threshold consistency on this fixture set is not proof of universal equivalence."
+  ],
+  "runner_metadata_fix": "After the run, command() was changed to retain successful CLI stderr when stdout is empty (LM Studio inventory). Timing/inference paths were unchanged. Executed script retained privately as runner.executed.py.",
+  "committed_runner_sha256": "2291c89cba89c021efb138006a7fb9180eec578877d282dc3e2e11eef7062aea"
+}
