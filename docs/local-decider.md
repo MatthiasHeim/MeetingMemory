@@ -19,6 +19,8 @@ The reference labels are model-generated, with known ambiguity. Operating thresh
 
 Short synthetic requests initially took a median 1.33 seconds. With four queued context-rich callers, relevance requests had a median 12–14 seconds; bulk processing and live suggestions can lag under load. Audio capture runs independently. Model/runtime files occupy about 15–16 GB; the idle LM Studio Qwen model was unloaded from RAM to make room, preserving its files.
 
+The [performance assessment](decider-performance.md) separates these queued measurements from interactive latency and proposes comparisons that preserve the model and inputs. Disk size is not runtime memory: a later shared-host experiment recorded a 35.9 GiB Decider OS process footprint (a snapshot, not a measured peak).
+
 Regression suite:
 
 ```sh
