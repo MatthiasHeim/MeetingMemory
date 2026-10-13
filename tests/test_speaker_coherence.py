@@ -439,3 +439,54 @@ def test_namesakes_are_never_merged_by_canonicalisation():
     assert "Philipp Meier" not in m
     assert m["Lukas Weber"] == "Lukas"
     assert m["Matthias Heim"] == "Matthias"
+
+
+# ── LAI-536: a relabel target must not duplicate an existing label ────────
+
+
+def _short_transcript(*rows: tuple[str, str]) -> dict:
+    """Pad with host lines past MIN_LINES so the audit actually runs."""
+    labels = [label for _, label in rows] + ["Matthias"] * 4
+    lines = [f"[00:{i:02d}] {label}: line {i}" for i, label in enumerate(labels)]
+    return {"transcript": "\n".join(lines), "participants": []}
+
+
+def test_relabel_to_short_form_joins_existing_full_name_label():
+    """Gemini already wrote the full name on some lines; a relabel to the
+    first name used to leave `Philipp` and `Philipp Baltensperger` as two
+    speakers. The untouched full-name lines must follow the canonical form."""
+    g = _short_transcript(("a", "Matthias"), ("b", "Philipp Baltensperger"),
+                          ("c", "Speaker 2"), ("d", "Matthias"))
+    check_and_repair(g, known_attendees=ATTENDEES, runner=stub({
+        "relabels": [{"line": 3, "from": "Speaker 2", "to": "Philipp",
+                      "confidence": "high", "reason": "answers line 2"}],
+    }))
+    assert set(labels_by_ts(g["transcript"]).values()) == {"Matthias", "Philipp"}
+
+
+def test_relabel_to_short_form_keeps_existing_full_name_for_unlisted_person():
+    """The person is only in `participants`, so there is no canonical form:
+    the label already in the transcript wins, the relabel adopts it."""
+    g = _short_transcript(("a", "Matthias"), ("b", "Tanja Schöller"),
+                          ("c", "Speaker 2"), ("d", "Tanja Schöller"))
+    g["participants"] = [{"name": "Tanja Schöller"}]
+    log = check_and_repair(g, known_attendees=[], runner=stub({
+        "relabels": [{"line": 3, "from": "Speaker 2", "to": "Tanja",
+                      "confidence": "high", "reason": "answers line 2"}],
+    }))
+    assert set(labels_by_ts(g["transcript"]).values()) == {
+        "Matthias", "Tanja Schöller"}
+    assert log["relabels_applied"][0]["to"] == "Tanja Schöller"
+
+
+def test_same_first_name_different_people_are_not_merged():
+    g = _short_transcript(("a", "Matthias"), ("b", "Philipp Baltensperger"),
+                          ("c", "Philipp Meier"), ("d", "Speaker 3"))
+    g["participants"] = [{"name": "Philipp Baltensperger"},
+                         {"name": "Philipp Meier"}]
+    check_and_repair(g, known_attendees=[], runner=stub({
+        "relabels": [{"line": 4, "from": "Speaker 3", "to": "Philipp",
+                      "confidence": "high", "reason": "x"}],
+    }))
+    labels = set(labels_by_ts(g["transcript"]).values())
+    assert {"Philipp Baltensperger", "Philipp Meier"} <= labels
