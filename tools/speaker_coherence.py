@@ -385,6 +385,53 @@ def canonical_label_map(known_attendees: Optional[list[dict]]) -> dict[str, str]
     return out
 
 
+_GENERIC_LABEL = re.compile(r"^speaker\s+[A-Za-z0-9]+$", re.IGNORECASE)
+
+
+def unify_name_variants(final_labels: list[str], canonical: dict[str, str],
+                        known_attendees: Optional[list[dict]]) -> dict[str, str]:
+    """Map short-form labels onto the full-name label they duplicate.
+
+    `canonical_label_map` only knows the host and calendar attendees. A person
+    who is merely in `participants`, or whose full name Gemini already wrote on
+    untouched lines, escaped it: a relabel to the first name then sat next to
+    `Tanja Schöller:` as a second speaker (LAI-536). This works on the labels
+    the transcript is about to end up with, so it also catches an untouched
+    full-name line next to a relabelled short-form one.
+
+    A single-token label merges into a multi-token one only when exactly one
+    multi-token label carries that first name and no other known person shares
+    it; otherwise the two may be different people and are left alone. The
+    surviving form is the canonical one for known people, else the form that
+    already has more lines (the full name on a tie).
+    """
+    counts: dict[str, int] = {}
+    for lab in final_labels:
+        counts[lab] = counts.get(lab, 0) + 1
+    named = [lab for lab in counts if not _GENERIC_LABEL.match(lab)]
+    known_firsts: dict[str, set[str]] = {}
+    for p in known_attendees or []:
+        name = (p.get("name") or "").strip() if isinstance(p, dict) else ""
+        if name:
+            known_firsts.setdefault(_first_tok(name), set()).add(name.lower())
+    out: dict[str, str] = {}
+    for short in (lab for lab in named if len(lab.split()) == 1):
+        first = _first_tok(short)
+        fulls = [lab for lab in named
+                 if len(lab.split()) > 1 and _first_tok(lab) == first]
+        if len(fulls) != 1 or len(known_firsts.get(first, ())) > 1:
+            continue
+        full = fulls[0]
+        if full in canonical or short in canonical:
+            keep = canonical.get(full) or canonical[short]
+        else:
+            keep = short if counts[short] > counts[full] else full
+        for lab in (short, full):
+            if lab != keep:
+                out[lab] = keep
+    return out
+
+
 def _bind_identities(speakers, lines: list[dict], allowed: set[str],
                      known_attendees: Optional[list[dict]]) -> list[dict]:
     """Generic label -> real name, but ONLY for names the calendar confirms.
@@ -619,7 +666,7 @@ def check_and_repair(gemini_dict: dict, *,
     # person cannot end up under two spellings.
     canonical = canonical_label_map(known_attendees)
     by_index = {a["line"]: a for a in applied}
-    out = transcript.split("\n")
+    final: list[str] = []
     for n, ln in enumerate(lines, start=1):
         new_label = None
         if n in by_index:
@@ -631,12 +678,19 @@ def check_and_repair(gemini_dict: dict, *,
                 break
         if new_label:
             new_label = canonical.get(new_label, new_label)
-        if new_label and new_label != ln["label"]:
+        final.append(new_label or ln["label"])
+    # One person, one label across the WHOLE transcript — including lines no
+    # relabel touched (see unify_name_variants).
+    merge = unify_name_variants(final, canonical, known_attendees)
+    final = [merge.get(lab, lab) for lab in final]
+    out = transcript.split("\n")
+    for ln, new_label in zip(lines, final):
+        if new_label != ln["label"]:
             out[ln["index"]] = f"{ln['prefix']}{new_label}:{ln['rest']}"
     gemini_dict["transcript"] = "\n".join(out)
     # Keep the log honest about what was actually written.
     for a in applied:
-        a["to"] = canonical.get(a["to"], a["to"])
+        a["to"] = final[a["line"] - 1]
 
     for b in bindings:
         for p in (gemini_dict.get("participants") or []):
