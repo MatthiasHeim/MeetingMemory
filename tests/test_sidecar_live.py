@@ -524,6 +524,7 @@ def test_prompt_opening_stays_with_its_continuation_on_one_card():
             return {name: scores for name in questions}
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -574,6 +575,7 @@ def test_cut_off_instruction_stays_with_the_later_prompt_line():
             return {name: scores for name in questions}
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -671,6 +673,7 @@ def test_clean_prompt_retries_only_while_empty_and_stops_at_three():
             return {name: [0.99] * len(lines) for name in questions}
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -692,6 +695,7 @@ def test_clean_prompt_retries_only_while_empty_and_stops_at_three():
         return " Implement the plan. "
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),

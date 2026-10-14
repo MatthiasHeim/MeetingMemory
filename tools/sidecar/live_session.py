@@ -6,6 +6,9 @@ worker; the panel stays open with whatever it has shown.
 
 from __future__ import annotations
 
+import json
+import sys
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .calibration_policy import OWNER_APPROVED_MODEL, OWNER_APPROVED_PROMPT_THRESHOLD
@@ -63,6 +66,7 @@ class RecordingLiveSession:
             clean_prompt=default_clean_prompt(api_key),
             on_update=self._on_update,
             on_unavailable=on_unavailable,
+            on_diagnostics=_log_live_diagnostics,
             prompt_threshold=prompt_threshold
             if prompt_threshold is not None
             else OWNER_APPROVED_PROMPT_THRESHOLD,
@@ -141,6 +145,13 @@ def _live_prompt_threshold() -> float:
         return calibrated_prompt_threshold(OWNER_APPROVED_MODEL)
     except PromptCalibrationError:
         return OWNER_APPROVED_PROMPT_THRESHOLD
+
+
+def _log_live_diagnostics(event: dict[str, Any]) -> None:
+    """Operational evidence without recording content or exception messages."""
+    print("LIVE_SIDECAR " + json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(), **event,
+    }, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def _maybe_judge(api_key: str | None) -> GeminiJudge | None:
