@@ -1,0 +1,154 @@
+[
+  {
+    "id": "polite-request",
+    "split": "development",
+    "context": [
+      "We need a clearer onboarding page."
+    ],
+    "current": "Could you draft a shorter introduction for the onboarding page?",
+    "kind": "request",
+    "relation": "new"
+  },
+  {
+    "id": "casual",
+    "split": "development",
+    "context": [],
+    "current": "The coffee is good today.",
+    "kind": "none"
+  },
+  {
+    "id": "decision",
+    "split": "development",
+    "context": [
+      "We could use blue or green."
+    ],
+    "current": "We have agreed to use green for the launch.",
+    "kind": "decision"
+  },
+  {
+    "id": "commitment",
+    "split": "development",
+    "context": [],
+    "current": "I will send the draft to Nina on Friday.",
+    "kind": "action"
+  },
+  {
+    "id": "proposal",
+    "split": "development",
+    "context": [],
+    "current": "Maybe we could redesign the dashboard someday.",
+    "kind": "none"
+  },
+  {
+    "id": "adopt-plan",
+    "split": "development",
+    "context": [
+      "The weather is sunny.",
+      "I propose grouping related requests into one card.",
+      "A correction should revise the existing card.",
+      "The coffee is getting cold."
+    ],
+    "current": "Yes, please implement those card changes.",
+    "kind": "request",
+    "include": [
+      1,
+      2
+    ],
+    "exclude": [
+      0,
+      3
+    ]
+  },
+  {
+    "id": "reported-task",
+    "split": "holdout",
+    "context": [],
+    "current": "Yesterday she said, 'Please delete the old reports', but I disagree and we are not doing that.",
+    "kind": "none"
+  },
+  {
+    "id": "german-action",
+    "split": "holdout",
+    "context": [],
+    "current": "Ich \u00fcbernehme den Testbericht und bringe ihn am Montag mit.",
+    "kind": "action"
+  },
+  {
+    "id": "german-decision",
+    "split": "holdout",
+    "context": [
+      "Sollen wir Dienstag oder Donnerstag nehmen?"
+    ],
+    "current": "Gut, wir haben uns auf Donnerstag geeinigt.",
+    "kind": "decision"
+  },
+  {
+    "id": "generic-unknown",
+    "split": "holdout",
+    "context": [
+      "Nice to meet you."
+    ],
+    "current": "Yes, implement that.",
+    "kind": "none"
+  },
+  {
+    "id": "substantive-question",
+    "split": "holdout",
+    "context": [
+      "Our deployment keeps failing at startup."
+    ],
+    "current": "Can you explain why the health check fails after deployment?",
+    "kind": "request"
+  },
+  {
+    "id": "negative-speculation",
+    "split": "holdout",
+    "context": [],
+    "current": "If we had more time, someone could write a migration guide.",
+    "kind": "none"
+  },
+  {
+    "id": "correction",
+    "split": "holdout",
+    "context": [],
+    "card": "Please prepare a two-page report for Friday.",
+    "current": "Actually, make that one page and have it ready on Thursday.",
+    "kind": "request",
+    "relation": "existing"
+  },
+  {
+    "id": "continuation",
+    "split": "holdout",
+    "context": [],
+    "card": "Draft the launch announcement.",
+    "current": "And include the new pricing in the announcement.",
+    "kind": "request",
+    "relation": "existing"
+  },
+  {
+    "id": "unrelated",
+    "split": "holdout",
+    "context": [],
+    "card": "Draft the launch announcement.",
+    "current": "Please check why the database backup failed.",
+    "kind": "request",
+    "relation": "new"
+  },
+  {
+    "id": "empty-acknowledgement",
+    "split": "holdout",
+    "context": [
+      "The train arrived at noon."
+    ],
+    "current": "Yes, exactly.",
+    "kind": "none"
+  },
+  {
+    "id": "abstract-self-contained-request",
+    "split": "development",
+    "context": [],
+    "current": "Please group related requests into one card.",
+    "kind": "request",
+    "relation": "new"
+  }
+]

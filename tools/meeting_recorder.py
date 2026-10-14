@@ -460,11 +460,12 @@ class MeetingRecorderApp(rumps.App):
     def _build_menu(self):
         """Build the menu bar menu."""
         self._start_stop_item = rumps.MenuItem("Start Recording", callback=self.toggle_recording)
-        self._prompt_mark_item = rumps.MenuItem("Prompt markieren", callback=None)
-        self._clip_item = rumps.MenuItem("Clip…", callback=self.copy_clip)
-        self._prompts_item = rumps.MenuItem("Prompts…", callback=self.copy_prompt)
-        self._live_panel_item = rumps.MenuItem("Live-Fenster anzeigen", callback=self.show_live_panel)
-        self._devices_item = rumps.MenuItem("List Audio Devices", callback=self.list_devices)
+        self._prompt_mark_item = rumps.MenuItem("Prompt-Stelle markieren", callback=None)
+        self._clip_item = rumps.MenuItem("Themenauszug kopieren …", callback=self.copy_clip)
+        self._prompts_item = rumps.MenuItem("Diktierte Aufgaben kopieren …", callback=self.copy_prompt)
+        self._live_panel_item = rumps.MenuItem("Recorder-Fenster öffnen", callback=self.show_live_panel)
+        self._recorder_help_item = rumps.MenuItem("Recorder-Hilfe", callback=self.show_recorder_help)
+        self._devices_item = rumps.MenuItem("Audioeingänge anzeigen", callback=self.list_devices)
         self._jev_pref_item = rumps.MenuItem("Decider lokal verwenden", callback=self.toggle_jev_preference)
         self.menu = [
             self._start_stop_item,
@@ -472,6 +473,7 @@ class MeetingRecorderApp(rumps.App):
             self._clip_item,
             self._prompts_item,
             self._live_panel_item,
+            self._recorder_help_item,
             None,  # Separator
             rumps.MenuItem("Open Recordings Folder", callback=self.open_recordings),
             rumps.MenuItem("Open Transcripts Folder", callback=self.open_transcripts),
@@ -483,6 +485,12 @@ class MeetingRecorderApp(rumps.App):
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self._sync_jev_menu_state()
+        from sidecar.panel_layout import MENU_HELP, set_menu_help
+        for name, key in (("_start_stop_item", "start"), ("_prompt_mark_item", "mark"),
+                          ("_clip_item", "clip"), ("_prompts_item", "prompts"),
+                          ("_live_panel_item", "window"), ("_recorder_help_item", "help"),
+                          ("_jev_pref_item", "decider"), ("_devices_item", "devices")):
+            set_menu_help(getattr(self, name), MENU_HELP[key])
 
     def _set_prompt_mark_available(self, available: bool) -> None:
         """Enable marking only while there is a persisted recording identity."""
@@ -703,7 +711,7 @@ class MeetingRecorderApp(rumps.App):
             self._sidecar_write_failed(stem, exc)
 
     def _close_previous_live_session(self) -> None:
-        """Stop the previous worker and close its panel before a new recording."""
+        """Retire the old session while preserving the shared window and view."""
         session = getattr(self, "_live_session", None)
         if session is None:
             return
@@ -714,12 +722,20 @@ class MeetingRecorderApp(rumps.App):
             except Exception as exc:
                 print(f"Previous live sidecar stop failed: {exc}", file=sys.stderr)
         panel = getattr(session, "panel", None)
-        closer = getattr(panel, "close", None) if panel is not None else None
+        shared = panel is not None and panel is getattr(self, "_recorder_panel", None)
+        if shared:
+            # Detach before the next session reuses the panel. Queued old UI
+            # dispatches are additionally fenced by LivePanel.reset_session.
+            session.panel = None
+        closer = getattr(panel, "close", None) if panel is not None and not shared else None
         if callable(closer):
             try:
                 closer()
             except Exception as exc:
                 print(f"Previous live panel close failed: {exc}", file=sys.stderr)
+        retire = getattr(session, "retire", None)
+        if callable(retire):
+            retire()
         self._live_session = None
 
     def _notify_live_unavailable(self, message: str) -> None:
@@ -756,6 +772,7 @@ class MeetingRecorderApp(rumps.App):
                     on_unavailable=self._notify_live_unavailable,
                     decision_stem=self._recording_stem if self._jev_preference() else None,
                     recordings_root=self.recordings_dir,
+                    panel=self._ensure_recorder_panel(),
                 )
                 self._live_session.start()
             else:
@@ -771,6 +788,10 @@ class MeetingRecorderApp(rumps.App):
 
     def _set_modal_menu_enabled(self, enabled: bool) -> None:
         """Clip, Prompts, and device list open modals. They stay off while recording."""
+        from sidecar.panel_layout import MENU_HELP, set_menu_help
+        start_item = getattr(self, "_start_stop_item", None)
+        if start_item is not None:
+            set_menu_help(start_item, MENU_HELP["start" if enabled else "stop"])
         for name, callback in (
             ("_clip_item", self.copy_clip),
             ("_prompts_item", self.copy_prompt),
@@ -796,16 +817,32 @@ class MeetingRecorderApp(rumps.App):
         except Exception as exc:
             print(f"Could not show the live panel: {exc}", file=sys.stderr)
 
+    def _ensure_recorder_panel(self):
+        panel = getattr(self, "_recorder_panel", None)
+        if panel is None:
+            from sidecar.live_window import LivePanel
+            factory = getattr(self, "_recorder_panel_factory", LivePanel)
+            def copy_clip(topic):
+                session = getattr(self, "_live_session", None)
+                if session is not None:
+                    session.copy_clip(topic)
+            panel = factory(on_copy_clip=copy_clip, on_copy_card=self._copy_to_clipboard,
+                            on_toggle_recording=lambda: self.toggle_recording(self._start_stop_item))
+            self._recorder_panel = panel
+        return panel
+
     def show_live_panel(self, _sender=None) -> None:
-        """Menu action: bring back a hidden live panel."""
+        """Open before capture, or restore the same session after closing."""
         session = getattr(self, "_live_session", None)
-        if getattr(session, "panel", None) is None:
-            self._notify_from_worker(
-                subtitle="Kein Live-Fenster",
-                message="Das Live-Fenster erscheint mit der nächsten Aufnahme.",
-            )
-            return
-        self._reveal_live_panel()
+        panel = getattr(session, "panel", None)
+        if panel is None:
+            panel = self._ensure_recorder_panel()
+            panel.set_recording_state("recording" if self._recording_blocks_modals() else "idle")
+        panel.show()
+        panel.order_front()
+
+    def show_recorder_help(self, _sender=None) -> None:
+        self._ensure_recorder_panel().show_help()
 
     def _run_window(self, **kwargs):
         """Modal text prompt. Never while recording; activate the app first otherwise."""

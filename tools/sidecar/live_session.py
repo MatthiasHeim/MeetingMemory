@@ -22,6 +22,7 @@ from .live import default_clean_prompt
 from .decider_policy import DECIDER_PROMPT_THRESHOLD, clip_thresholds
 from .prompts import PromptCalibrationError, calibrated_prompt_threshold
 from .selection import select_clip
+from .card_assistant import CardAssistant
 
 
 class RecordingLiveSession:
@@ -40,11 +41,12 @@ class RecordingLiveSession:
         recordings_root=None,
         prompt_threshold: float | None = None,
         on_unavailable: Callable[[str], None] | None = None,
+        panel=None,
     ):
         self.recorder = recorder
         self._copy_text = copy_text
         self._open_window = open_window
-        self.panel = None
+        self.panel = panel
         self._api_key = api_key
         self._judge_factory = (
             (lambda: DeciderJudge(stem=decision_stem, recordings_root=recordings_root))
@@ -52,6 +54,7 @@ class RecordingLiveSession:
         )
         # Clients and the calibration read happen on the worker's first tick.
         # Building them here used to block Start for about half a second.
+        assistant = CardAssistant(api_key)
         self.engine = LiveEngine(
             snapshot=lambda tail: snapshot_recording_tails(recorder, tail),
             transcriber=transcriber,
@@ -63,7 +66,9 @@ class RecordingLiveSession:
             threshold_factory=None if prompt_threshold is not None else (
                 (lambda: DECIDER_PROMPT_THRESHOLD) if decision_stem else _live_prompt_threshold
             ),
-            clean_prompt=default_clean_prompt(api_key),
+            contextual_cards=True,
+            clean_card=assistant.clean,
+            suggest_cards=assistant.suggest,
             on_update=self._on_update,
             on_unavailable=on_unavailable,
             on_diagnostics=_log_live_diagnostics,
@@ -77,13 +82,25 @@ class RecordingLiveSession:
         if self._open_window:
             from .live_window import LivePanel
 
-            self.panel = LivePanel(on_copy_clip=self.copy_clip, on_copy_card=self.copy_card)
+            if self.panel is None:
+                self.panel = LivePanel(on_copy_clip=self.copy_clip, on_copy_card=self.copy_card)
+            self.panel.reset_session()
+            self.panel.set_recording_state("recording")
+            self.panel.set_diagnostics_callback(_log_live_diagnostics)
+            self.panel.set_audience_callback(self.engine.set_audience)
+            self.engine.set_audience(self.panel.audience)
             self.panel.show()
         self.engine.start()
 
     def stop(self) -> None:
         """Signal the worker. The window stays until the user closes it."""
         self.engine.stop()
+        if self.panel is not None:
+            self.panel.set_recording_state("stopped")
+
+    def retire(self) -> None:
+        self.engine.retire()
+        self.panel = None
 
     def _on_update(self, lines, cards, status: str) -> None:
         if self.panel is not None:

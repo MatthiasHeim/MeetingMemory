@@ -37,10 +37,11 @@ from .live_audio import (
 from .prompts import PROMPT_CONSECUTIVE_GAP_SECONDS, _prompt_runs
 from .questions import DICTATING_PROMPT_QUESTION
 from .transcript import TranscriptLine, format_timestamp
+from .card_semantics import ContextualCardExtractor, SourceSpan, split_sources
 
 
-LIVE_TICK_SECONDS = 20.0
-LIVE_TAIL_SECONDS = 60.0
+LIVE_TICK_SECONDS = 6.0
+LIVE_TAIL_SECONDS = 24.0
 LIVE_SAMPLE_RATE = 16000
 
 
@@ -69,6 +70,7 @@ class LiveLine:
     end: float
     speaker: str
     text: str
+    provisional: bool = False
 
     def as_transcript_line(self, index: int) -> TranscriptLine:
         return TranscriptLine(
@@ -87,6 +89,9 @@ class LiveCard:
     key: str
     lines: tuple[TranscriptLine, ...]
     clean_text: str
+    kind: str = "request"
+    spans: tuple[SourceSpan, ...] = ()
+    audience: str = "all"
 
     @property
     def verbatim_text(self) -> str:
@@ -94,7 +99,10 @@ class LiveCard:
 
     @property
     def copy_text(self) -> str:
-        return self.clean_text.strip() or self.verbatim_text
+        text = self.clean_text.strip() or self.verbatim_text
+        if self.kind.startswith("suggestion_"):
+            return ("KI-Vorschlag (intern): " if self.audience == "internal" else "KI-Vorschlag: ") + text
+        return text
 
     @property
     def start_seconds(self) -> float:
@@ -490,6 +498,7 @@ class GeminiLiveTranscriber:
         """
         last: Exception | None = None
         for _attempt in range(2):
+            self.last_attempts = _attempt + 1
             try:
                 return self._once(mic, mic_rate, system, system_rate)
             except (JudgeError, OSError, ValueError) as exc:
@@ -670,10 +679,15 @@ class LiveEngine:
         on_unavailable: Callable[[str], None] | None = None,
         on_diagnostics: Callable[[dict[str, Any]], None] | None = None,
         synchronous_prompts: bool = False,
+        contextual_cards: bool = False,
+        clean_card: Callable[[LiveCard], str] | None = None,
+        suggest_cards: Callable | None = None,
         interval: float = LIVE_TICK_SECONDS,
         tail: float = LIVE_TAIL_SECONDS,
         prompt_threshold: float = OWNER_APPROVED_PROMPT_THRESHOLD,
     ):
+        if interval <= 0 or tail <= 0:
+            raise ValueError("live interval and tail must be positive")
         self._snapshot = snapshot
         self._transcriber = transcriber
         self._transcriber_factory = transcriber_factory
@@ -681,6 +695,16 @@ class LiveEngine:
         self._judge_factory = judge_factory
         self._threshold_factory = threshold_factory
         self._clean_prompt = clean_prompt
+        self._clean_card = clean_card
+        self._contextual = ContextualCardExtractor() if contextual_cards else None
+        self._suggest_cards = suggest_cards
+        self.audience = "client"
+        self._suggestions: dict[str, list[LiveCard]] = {}
+        self._suggest_thread: threading.Thread | None = None
+        self._suggest_last_at = 0.0
+        self._suggest_last_key = None
+        self._suggest_status = ""
+        self._contextual_ready_key = None
         self._on_update = on_update
         self._on_unavailable = on_unavailable
         self._on_diagnostics = on_diagnostics
@@ -700,6 +724,7 @@ class LiveEngine:
         self._prompt_runtime_ready = False
         self._unavailable_notified = False
         self._lock = threading.RLock()
+        self._prompt_condition = threading.Condition(self._lock)
         self._transcript_status = ""
         self._prompt_status = ""
         self._clean_status = ""
@@ -712,9 +737,13 @@ class LiveEngine:
         self._prompt_thread: threading.Thread | None = None
         self._clean_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._retired = False
         self._thread: threading.Thread | None = None
+        self._last_successful_snapshot_at: float | None = None
 
     def start(self) -> None:
+        if self._retired:
+            return
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
@@ -725,6 +754,15 @@ class LiveEngine:
         """Ask the worker to finish. Does not wait, so Stop stays responsive."""
         self._stop.set()
 
+    def retire(self) -> None:
+        """A newer recording owns the panel. Finish no further queued inference."""
+        self._stop.set()
+        with self._lock:
+            self._retired = True
+            self._prompt_requested = False
+            self._clean_requested = False
+            self._prompt_condition.notify_all()
+
     def _loop(self) -> None:
         # Clients are built here, on the worker, before the first sleep. Start
         # has already returned on the main thread with only the panel open.
@@ -733,10 +771,13 @@ class LiveEngine:
         except Exception as exc:
             self._fail(exc)
         self._request_prompt_work()
+        deadline = time.monotonic() + self.interval
         while not self._stop.is_set():
-            if self._stop.wait(self.interval):
+            if self._stop.wait(max(0, deadline - time.monotonic())):
                 break
             self._safe_tick()
+            # No overlapping requests or catch-up bursts after a slow request.
+            deadline = max(deadline + self.interval, time.monotonic() + min(1.0, self.interval / 6))
         self._safe_tick(closed=True)
 
     def _ensure_runtime(self) -> None:
@@ -757,13 +798,18 @@ class LiveEngine:
             self._judge = self._judge_factory()
             if self._judge is None:
                 raise JudgeError("prompt judge is unavailable")
-        if self._threshold_factory is not None:
+        if self._threshold_factory is not None and self._contextual is None:
             self.prompt_threshold = float(self._threshold_factory())
         self._prompt_runtime_ready = True
 
     def _safe_tick(self, *, closed: bool = False) -> None:
+        if self._retired:
+            return
         try:
-            snapshot = self._snapshot(self.tail)
+            tail = self.tail
+            if self._last_successful_snapshot_at is not None:
+                tail = min(120.0, max(tail, time.monotonic() - self._last_successful_snapshot_at + 12.0))
+            snapshot = self._snapshot(tail)
             if snapshot is None:
                 return
             if closed and not snapshot.closed:
@@ -779,10 +825,12 @@ class LiveEngine:
         self._ensure_runtime()
         assert self._transcriber is not None
         started = time.perf_counter()
+        snapshot_at = time.monotonic()
         raw = self._transcriber.transcribe_tails(
             snapshot.mic, snapshot.mic_rate, snapshot.system, snapshot.system_rate
         )
         self.last_transcribe_seconds = time.perf_counter() - started
+        self._last_successful_snapshot_at = snapshot_at
         incoming = _absolute_lines(raw, snapshot.window_start, snapshot.window_end)
         with self._lock:
             incoming, self._held = _select_lines_to_commit(
@@ -804,13 +852,23 @@ class LiveEngine:
                 }
                 valid_cards = []
                 for card in self.cards:
+                    if card.spans:
+                        source_map = {span.id: span for span in split_sources(self.lines)}
+                        mapped_spans = [source_map.get(span.id) for span in card.spans]
+                        if all(span is not None for span in mapped_spans):
+                            valid_cards.append(replace(card, spans=tuple(mapped_spans), lines=tuple(
+                                TranscriptLine(span.line_index, span.seconds, format_timestamp(span.seconds),
+                                               span.speaker, span.text) for span in mapped_spans)))
+                        else:
+                            self._clean_attempts.pop(card.key, None)
+                        continue
                     mapped = [current.get((line.seconds, line.speaker, line.text)) for line in card.lines]
                     if all(line is not None for line in mapped):
                         valid_cards.append(replace(card, lines=tuple(mapped)))
                     else:
                         self._clean_attempts.pop(card.key, None)
                 self.cards = valid_cards
-            needs_scores = len(self._scores) < len(self.lines)
+            needs_scores = (bool(self.lines) if self._contextual is not None else len(self._scores) < len(self.lines))
             if needs_scores and not self._prompt_status and (self._judge is not None or self._judge_factory is not None):
                 self._prompt_status = "Prompt-Erkennung läuft …"
             self._publish()
@@ -818,24 +876,104 @@ class LiveEngine:
         self._diagnostic(stage="transcript", elapsed_seconds=self.last_transcribe_seconds,
                          line_count=line_count, added_count=len(added), revised_from=revised_from,
                          mic_samples=int(snapshot.mic.size), system_present=snapshot.system is not None,
-                         local_line_count=sum(line.speaker == "Ich" for line in incoming))
+                         local_line_count=sum(line.speaker == "Ich" for line in incoming),
+                         raw_line_count=len(raw), held_line_count=int(self._held is not None),
+                         request_attempts=getattr(self._transcriber, "last_attempts", None),
+                         audio_window_seconds=snapshot.window_end - snapshot.window_start)
         if needs_scores:
             self._request_prompt_work()
         else:
             self._request_clean_work()
+        self._request_suggestions()
         return added
 
+    def set_audience(self, audience: str) -> None:
+        if audience not in {"client", "internal"}:
+            raise ValueError("unknown audience")
+        with self._lock:
+            self.audience = audience
+            self._suggest_last_at = 0.0
+            self._suggest_status = ""
+            self._publish()
+        self._request_suggestions()
+
+    def _request_suggestions(self) -> None:
+        if self._retired or self._suggest_cards is None or self._contextual is None:
+            return
+        with self._lock:
+            all_sources = tuple(split_sources(self.lines))
+            if self._contextual_ready_key != tuple(span.id for span in all_sources):
+                return
+            sources = all_sources[-12:]
+            if len(sources) < 3 or self._suggest_thread is not None:
+                return
+            key = (self.audience, tuple(span.id for span in sources))
+            if key == self._suggest_last_key or time.monotonic() - self._suggest_last_at < 45:
+                return
+            self._suggest_last_at = time.monotonic()
+            self._suggest_last_key = key
+            self._suggest_thread = threading.Thread(target=self._generate_suggestions,
+                args=(sources, tuple(self.cards), self.audience), name="meeting-sidecar-suggestions", daemon=True)
+            self._suggest_thread.start()
+
+    def _generate_suggestions(self, sources, cards, audience) -> None:
+        started = time.perf_counter()
+        retry_latest = False
+        try:
+            suggestions = self._suggest_cards(sources, cards, audience)
+            if audience == "client":
+                from .card_assistant import client_safe_suggestions
+                suggestions = client_safe_suggestions(suggestions, self._judge)
+            with self._lock:
+                current = {span.id: span for span in split_sources(self.lines)}
+                accepted = [(kind, text, tuple(current[span.id] for span in evidence))
+                            for kind, text, evidence in suggestions
+                            if all(span.id in current for span in evidence)]
+                discarded = len(suggestions) - len(accepted)
+                if accepted or not suggestions:
+                    self._suggestions[audience] = [LiveCard(
+                        f"suggestion-{audience}-{sources[-1].id}-{i}",
+                        tuple(TranscriptLine(span.line_index, span.seconds, format_timestamp(span.seconds),
+                                             span.speaker, span.text) for span in evidence),
+                        text, f"suggestion_{kind}", evidence, audience)
+                        for i, (kind, text, evidence) in enumerate(accepted)]
+                    self._suggest_status = ""
+                    self._publish()
+                if discarded:
+                    self._suggest_last_key = None
+                    self._suggest_last_at = 0.0
+                    self._suggest_status = "KI-Ideen werden nach einer Transkriptänderung aktualisiert …"
+                    retry_latest = True
+                    self._publish()
+            self._diagnostic(stage="suggestions", elapsed_seconds=time.perf_counter() - started,
+                             audience=audience, card_count=len(accepted), discarded_count=discarded)
+        except Exception as exc:
+            with self._lock:
+                self._suggest_status = f"KI-Ideen nicht verfügbar ({type(exc).__name__})."
+                self._suggest_last_key = None
+                self._publish()
+            self._diagnostic(stage="suggestions", error_type=type(exc).__name__)
+        finally:
+            with self._lock:
+                self._suggest_thread = None
+            if retry_latest:
+                self._request_suggestions()
+
     def _request_prompt_work(self) -> None:
+        if self._retired:
+            return
         if self._judge is None and self._judge_factory is None:
             return
         if self._synchronous_prompts:
-            self._prompt_requested = True
+            with self._lock:
+                self._prompt_requested = True
             self._prompt_loop()
             return
         with self._lock:
             # One pending flag refers to the latest complete transcript. It
             # cannot build an unbounded queue of obsolete audio windows.
             self._prompt_requested = True
+            self._prompt_condition.notify_all()
             if self._prompt_thread is None:
                 self._prompt_thread = threading.Thread(
                     target=self._prompt_loop, name="meeting-sidecar-prompts", daemon=True
@@ -844,14 +982,28 @@ class LiveEngine:
 
     def _prompt_loop(self) -> None:
         while True:
-            with self._lock:
-                if not self._prompt_requested:
+            with self._prompt_condition:
+                while not self._retired and not self._prompt_requested:
+                    # The contextual recorder owns its retry deadline. Keep
+                    # the legacy score-based evaluator's tick-driven contract.
+                    if self._contextual is None or self._synchronous_prompts or not self._prompt_retry_at:
+                        self._prompt_thread = None
+                        return
+                    remaining = self._prompt_retry_at - time.monotonic()
+                    if remaining <= 0:
+                        self._prompt_requested = True
+                        break
+                    self._prompt_condition.wait(timeout=remaining)
+                if self._retired:
                     self._prompt_thread = None
                     return
                 self._prompt_requested = False
             self._process_prompts()
 
     def _process_prompts(self) -> None:
+        if self._contextual is not None:
+            self._process_contextual_cards()
+            return
         started = time.perf_counter()
         lines: tuple[LiveLine, ...] = ()
         prior: tuple[float | None, ...] = ()
@@ -945,6 +1097,73 @@ class LiveEngine:
             return f"Prompt-Erkennung: {failed} Zeilen nicht ausgewertet; {pending} ausstehend."
         return "Prompt-Erkennung läuft …" if pending else ""
 
+    def _process_contextual_cards(self) -> None:
+        extractor = self._contextual
+        assert extractor is not None
+        with self._lock:
+            if time.monotonic() < self._prompt_retry_at:
+                return
+            lines = tuple(self.lines)
+        started = time.perf_counter()
+        extractor.reconcile(lines)
+        dependencies = tuple(span.id for span in extractor.sources[:len(extractor.events) + 1])
+        try:
+            self._ensure_prompt_runtime()
+            extractor.advance(lines, self._judge)
+            with self._lock:
+                current_ids = tuple(span.id for span in split_sources(self.lines))
+                processed_ids = tuple(span.id for span in extractor.sources[:len(extractor.events)])
+                stale = current_ids[:len(processed_ids)] != processed_ids
+                extractor.reconcile(tuple(self.lines))
+                if not stale:
+                    previous = {card.key: card for card in self.cards}
+                    cards = []
+                    for evidence in extractor.cards:
+                        source_lines = tuple(TranscriptLine(span.line_index, span.seconds,
+                            format_timestamp(span.seconds), span.speaker, span.text) for span in evidence.spans)
+                        old = previous.get(evidence.key)
+                        clean = old.clean_text if old and old.spans == evidence.spans else ""
+                        if old is None or old.spans != evidence.spans:
+                            self._clean_attempts.pop(evidence.key, None)
+                        cards.append(LiveCard(evidence.key, source_lines, clean, evidence.kind, evidence.spans))
+                    self.cards = cards
+                    self._contextual_ready_key = (tuple(span.id for span in extractor.sources)
+                                                  if not extractor.pending else None)
+                    self._prompt_attempts = 0
+                    self._prompt_retry_at = 0.0
+                    self._prompt_status = (f"Karten: {extractor.failed} Stellen nicht ausgewertet. " if extractor.failed else "")
+                    if extractor.pending:
+                        self._prompt_status += f"Karten werden ermittelt · {extractor.pending} Stellen ausstehend …"
+                    self._publish()
+                self._prompt_requested |= stale or bool(extractor.pending) or len(self.lines) > len(lines)
+            self._diagnostic(stage="contextual_cards", elapsed_seconds=time.perf_counter() - started,
+                             backend=getattr(self._judge, "backend", "unknown"), stale=stale,
+                             pending_count=extractor.pending, failed_count=extractor.failed,
+                             card_count=len(extractor.cards), classified_kind=extractor.last_kind)
+            if not stale:
+                self._request_clean_work()
+                self._request_suggestions()
+        except Exception as exc:
+            with self._lock:
+                current_ids = tuple(span.id for span in split_sources(self.lines))
+                stale = current_ids[:len(dependencies)] != dependencies
+                extractor.reconcile(tuple(self.lines))
+                if not stale:
+                    self._prompt_attempts += 1
+                    self._prompt_retry_at = time.monotonic() + PROMPT_RETRY_SECONDS
+                    if self._prompt_attempts >= PROMPT_SCORE_ATTEMPTS:
+                        extractor.skip_failed()
+                        self._prompt_attempts = 0
+                        self._prompt_retry_at = 0.0
+                        self._prompt_requested = bool(extractor.pending)
+                    self._prompt_status = (f"Karten-Erkennung unterbrochen ({type(exc).__name__}); "
+                                           f"{extractor.failed} Stellen nicht ausgewertet; {extractor.pending} ausstehend.")
+                    self._publish()
+                else:
+                    self._prompt_requested = True
+            self._diagnostic(stage="contextual_cards", elapsed_seconds=time.perf_counter() - started,
+                             error_type=type(exc).__name__, stale=stale, failed_count=extractor.failed)
+
     def _extend_scores(self, lines: Sequence[LiveLine], prior_scores: Sequence[float | None]) -> list[float | None]:
         assert self._judge is not None
         # Resume from the last successfully scored prefix, not the number of
@@ -1014,6 +1233,8 @@ class LiveEngine:
 
     def _request_clean_work(self) -> None:
         with self._lock:
+            if self._retired:
+                return
             if not self._cards_need_clean_retry():
                 return
             if not self._synchronous_prompts:
@@ -1029,7 +1250,7 @@ class LiveEngine:
     def _clean_loop(self) -> None:
         while True:
             with self._lock:
-                if not self._clean_requested:
+                if self._retired or not self._clean_requested:
                     self._clean_thread = None
                     return
                 self._clean_requested = False
@@ -1037,18 +1258,21 @@ class LiveEngine:
 
     def _clean_cards(self) -> None:
         """Publish verbatim cards first. Rewrites never hold up detection."""
-        assert self._clean_prompt is not None
+        assert self._clean_prompt is not None or self._clean_card is not None
         with self._lock:
             candidates = tuple(self.cards)
         for card in candidates:
             with self._lock:
+                if self._retired:
+                    break
                 attempts = self._clean_attempts.get(card.key, 0)
                 if card not in self.cards or card.clean_text.strip() or attempts >= CLEAN_PROMPT_ATTEMPTS:
                     continue
                 self._clean_attempts[card.key] = attempts + 1
             error = ""
             try:
-                clean = (self._clean_prompt(card.verbatim_text) or "").strip()
+                clean = ((self._clean_card(card) if self._clean_card is not None else
+                          self._clean_prompt(card.verbatim_text)) or "").strip()
             except Exception as exc:
                 error = type(exc).__name__
                 clean = ""
@@ -1058,13 +1282,13 @@ class LiveEngine:
                     continue
                 self.cards[self.cards.index(card)] = replace(card, clean_text=clean)
                 self._clean_status = (
-                    f"Sauberer Prompt fehlgeschlagen ({error}). Die Aufnahme läuft weiter."
+                    f"Karten-Formulierung fehlgeschlagen ({error}); Originaltext bleibt verfügbar."
                     if error else ""
                 )
                 self._publish()
 
     def _cards_need_clean_retry(self) -> bool:
-        if self._clean_prompt is None or not self.cards:
+        if (self._clean_prompt is None and self._clean_card is None) or not self.cards:
             return False
         for card in self.cards:
             if card.clean_text.strip():
@@ -1089,10 +1313,19 @@ class LiveEngine:
         # Serialise short UI dispatches so an old worker update cannot overwrite
         # a newer transcript. No provider call is made while holding this lock.
         with self._lock:
-            self.status = self._transcript_status or self._prompt_status or self._clean_status
+            if self._retired:
+                return
+            self.status = " · ".join(dict.fromkeys(value for value in (
+                self._transcript_status, self._prompt_status, self._clean_status, self._suggest_status) if value))
             if self._on_update is not None:
                 try:
-                    self._on_update(tuple(self.lines), tuple(self.cards), self.status)
+                    current_sources = {span.id for span in split_sources(self.lines)} if self._suggestions else set()
+                    suggestions = [card for card in self._suggestions.get(self.audience, [])
+                                   if all(span.id in current_sources for span in card.spans)]
+                    displayed_lines = list(self.lines)
+                    if self._held is not None:
+                        displayed_lines.append(replace(self._held, provisional=True))
+                    self._on_update(tuple(displayed_lines), tuple(self.cards + suggestions), self.status)
                 except Exception:
                     pass  # An unavailable panel cannot stop transcription.
 

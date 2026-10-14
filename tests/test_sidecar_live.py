@@ -310,7 +310,7 @@ def test_panel_close_button_hides_and_menu_brings_it_back(monkeypatch):
             panel.panel.close()
 
 
-def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
+def test_show_live_panel_menu_restores_or_opens_idle_panel(monkeypatch):
     import importlib
     import types
 
@@ -333,6 +333,12 @@ def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
         shown: list[str] = []
 
         class Panel:
+            def set_recording_state(self, state):
+                pass
+
+            def show(self):
+                pass
+
             def order_front(self):
                 shown.append("front")
 
@@ -342,9 +348,10 @@ def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
         assert notes == []
 
         app._live_session = None
+        app._ensure_recorder_panel = lambda: Panel()
         app.show_live_panel()
-        assert shown == ["front"]
-        assert notes == ["Das Live-Fenster erscheint mit der nächsten Aufnahme."]
+        assert shown == ["front", "front"]
+        assert notes == []
     finally:
         if previous is not None:
             sys.modules["meeting_recorder"] = previous
@@ -809,10 +816,10 @@ def test_live_clients_are_built_on_the_worker_not_at_start(monkeypatch):
     session.start()
     assert time.perf_counter() - started < 0.3
     deadline = time.perf_counter() + 2
-    while len(calls) < 3 and time.perf_counter() < deadline:
+    while len(calls) < 2 and time.perf_counter() < deadline:
         time.sleep(0.01)
     session.stop()
-    assert len(calls) >= 3
+    assert len(calls) == 2  # categorical cards do not load the old binary cutoff
     assert threading.main_thread().ident not in calls
 
 
@@ -887,7 +894,7 @@ def test_recording_menu_cannot_open_a_modal(monkeypatch):
         app.recorder = Recorder()
         app._build_menu()
         app._set_modal_menu_enabled(False)
-        modal_titles = {"Clip…", "Prompts…", "List Audio Devices"}
+        modal_titles = {"Themenauszug kopieren …", "Diktierte Aufgaben kopieren …", "Audioeingänge anzeigen"}
         for item in app.menu:
             if item is None or item.title not in modal_titles:
                 continue
