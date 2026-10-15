@@ -37,6 +37,7 @@ from sidecar.recorder_support import (
     sidecar_metadata_from_calendar,
     write_jev_preference,
 )
+from sidecar.recording_files import calendar_speaker_names, diarization_path, parse_speaker_names, write_speaker_names
 from sidecar.service import clip_for_stem, prompts_for_stem
 from sidecar.transcript import format_timestamp, recent_transcripts
 
@@ -572,9 +573,10 @@ class MeetingRecorderApp(rumps.App):
         try:
             from calendar_resolve import resolve
 
-            return calendar_context_from_resolution(
-                resolve(output_file.with_suffix(".json"), timeout_seconds=timeout_seconds)
-            )
+            resolution = resolve(output_file.with_suffix(".json"), timeout_seconds=timeout_seconds)
+            self._calendar_speaker_proposals = getattr(self, "_calendar_speaker_proposals", {})
+            self._calendar_speaker_proposals[output_file.stem] = calendar_speaker_names(resolution)
+            return calendar_context_from_resolution(resolution)
         except Exception as exc:
             print(f"Calendar lookup unavailable for Decider gate: {exc}", file=sys.stderr)
             return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
@@ -773,8 +775,11 @@ class MeetingRecorderApp(rumps.App):
                     decision_stem=self._recording_stem if self._jev_preference() else None,
                     recordings_root=self.recordings_dir,
                     panel=self._ensure_recorder_panel(),
+                    stem=self._recording_stem,
                 )
                 self._live_session.start()
+                stem = self._recording_stem
+                self._live_session.panel.set_speakers_callback(lambda text: self._save_speakers(stem, text))
             else:
                 self._live_session = factory(self)
                 start = getattr(self._live_session, "start", None)
@@ -896,6 +901,29 @@ class MeetingRecorderApp(rumps.App):
             )
         except Exception as exc:
             self._sidecar_write_failed(stem, exc)
+        self._propose_calendar_speakers(stem)
+
+    def _propose_calendar_speakers(self, stem: str) -> None:
+        """Prefill the Teilnehmende field from the invite; only Enter saves it."""
+        names = getattr(self, "_calendar_speaker_proposals", {}).pop(stem, [])
+        session = getattr(self, "_live_session", None)
+        panel = getattr(session, "panel", None) if session is not None else None
+        if not names or panel is None or stem != self._recording_stem:
+            return
+        if diarization_path(stem, self.recordings_dir).exists():
+            return
+        try:
+            panel.set_speakers(", ".join(names), proposed=True)
+        except Exception as exc:
+            print(f"Could not propose calendar speakers: {exc}", file=sys.stderr)
+
+    def _save_speakers(self, stem: str | None, text: str) -> str:
+        """Persist confirmed names for the final transcript of this recording."""
+        if stem is None:
+            return "Keine Aufnahme aktiv; Teilnehmende nicht gespeichert."
+        names = parse_speaker_names(text)
+        write_speaker_names(stem, names, root=self.recordings_dir)
+        return f"Teilnehmende gespeichert ({len(names)}). Das finale Transkript verwendet diese Namen."
 
     def _stop_recording(self, sender):
         """Stop the current recording. The live window stays open."""

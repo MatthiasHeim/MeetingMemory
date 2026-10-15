@@ -23,6 +23,7 @@ from .decider_policy import DECIDER_PROMPT_THRESHOLD, clip_thresholds
 from .prompts import PromptCalibrationError, calibrated_prompt_threshold
 from .selection import select_clip
 from .card_assistant import CardAssistant
+from .recording_files import write_live_transcript
 
 
 class RecordingLiveSession:
@@ -42,8 +43,14 @@ class RecordingLiveSession:
         prompt_threshold: float | None = None,
         on_unavailable: Callable[[str], None] | None = None,
         panel=None,
+        stem: str | None = None,
     ):
         self.recorder = recorder
+        # Without a stem (tests, previews) nothing is written to disk.
+        self._stem = stem
+        self._recordings_root = recordings_root
+        self._saved_lines: tuple | None = None
+        self._recording_active = True
         self._copy_text = copy_text
         self._open_window = open_window
         self.panel = panel
@@ -95,6 +102,8 @@ class RecordingLiveSession:
     def stop(self) -> None:
         """Signal the worker. The window stays until the user closes it."""
         self.engine.stop()
+        self._recording_active = False
+        self._save_live_transcript(self.engine.lines, force=True)
         if self.panel is not None:
             self.panel.set_recording_state("stopped")
 
@@ -103,8 +112,23 @@ class RecordingLiveSession:
         self.panel = None
 
     def _on_update(self, lines, cards, status: str) -> None:
+        self._save_live_transcript(lines)
         if self.panel is not None:
             self.panel.apply_update(lines, cards, status)
+
+    def _save_live_transcript(self, lines, *, force: bool = False) -> None:
+        """Keep ``<stem>.live.json`` current; a failed write never touches recording."""
+        if self._stem is None:
+            return
+        snapshot = tuple(lines)
+        if not force and snapshot == self._saved_lines:
+            return
+        try:
+            write_live_transcript(self._stem, snapshot, root=self._recordings_root,
+                                  model=OWNER_APPROVED_MODEL, recording_active=self._recording_active)
+            self._saved_lines = snapshot
+        except Exception as exc:
+            print(f"Live transcript not saved: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     def copy_card(self, text: str) -> None:
         if not text.strip():

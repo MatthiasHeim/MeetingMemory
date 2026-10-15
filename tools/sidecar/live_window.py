@@ -121,6 +121,9 @@ class _PanelTarget(NSObject):
     def copyClip_(self, _sender):
         self.panel.copy_clip()
 
+    def saveSpeakers_(self, _sender):
+        self.panel.save_speakers()
+
     def copyTranscript_(self, _sender):
         self.panel.copy_transcript()
 
@@ -176,6 +179,8 @@ class LivePanel:
         self._on_copy_clip = on_copy_clip
         self._on_copy_card = on_copy_card
         self._on_toggle_recording = on_toggle_recording
+        self._on_speakers = None
+        self._speakers_text = ""
         self._cards: tuple[LiveCard, ...] = ()
         self.audience = "client"
         self._on_audience = None
@@ -200,6 +205,8 @@ class LivePanel:
         self.cards_document = None
         self.status_field = None
         self.topic_field = None
+        self.speakers_field = None
+        self._speakers_unconfirmed = False
         self._target = None
         self._card_rows = []
 
@@ -309,6 +316,15 @@ class LivePanel:
         self._help_text.setFont_(_font(14))
         self.status_field = self._label("", 11, wrap=True)
         self.status_field.setTextColor_(_color("59666A"))
+        self.speakers_field = A.NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 200, 26))
+        self.speakers_field.setPlaceholderString_("Teilnehmende, mit Komma getrennt")
+        self.speakers_field.setFont_(_font(13))
+        self.speakers_field.setStringValue_(self._speakers_text)
+        self.speakers_field.cell().setSendsActionOnEndEditing_(True)
+        self.speakers_field.setTarget_(self._target)
+        self.speakers_field.setAction_("saveSpeakers:")
+        self.speakers_field.setToolTip_("Wer spricht in diesem Meeting? Enter speichert. Das finale Transkript ordnet die Stimmen diesen Namen zu.")
+        self._speakers_label = self._label("TEILNEHMENDE", 11, utility=True)
         self.topic_field = A.NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 200, 26))
         self.topic_field.setPlaceholderString_("Thema für einen Textauszug")
         self.topic_field.setFont_(_font(13))
@@ -320,7 +336,7 @@ class LivePanel:
         for view in (self._title, self._state_label, self._mode_control, self._fullscreen_button,
                      self._help_button, self._audience_control, self._transcript_label, self._copy_transcript_button,
                      self._cards_label, self._transcript_scroll, self.cards_scroll, self._help_scroll, self.status_field,
-                     self.topic_field, self._clip_button, self._record_button, self._consent_hint):
+                     self.topic_field, self._speakers_label, self.speakers_field, self._clip_button, self._record_button, self._consent_hint):
             self._surface.addSubview_(view)
         self._built = True
         self._layout()
@@ -354,7 +370,9 @@ class LivePanel:
             self._fullscreen_button.setFrame_(NSMakeRect(w - 126, h - 82, 80, 28))
             self._help_button.setFrame_(NSMakeRect(w - 48, h - 82, 32, 28))
             self._audience_control.setFrame_(NSMakeRect(18, h - 115, 300, 26))
-            body_top, bottom = h - 138, 116.0
+            self._speakers_label.setFrame_(NSMakeRect(20, h - 146, 110, 18))
+            self.speakers_field.setFrame_(NSMakeRect(130, h - 150, w - 150, 26))
+            body_top, bottom = h - 172, 116.0
             if presentation:
                 gap = 20.0
                 col = (w - 40 - gap) / 2
@@ -456,6 +474,9 @@ class LivePanel:
             self._audience_control.setSelectedSegment_(0)
         self._expanded_keys.clear()
         self._highlighted_key = None
+        self._on_speakers = None
+        self._speakers_unconfirmed = False
+        self.set_speakers("")
         self.apply_update((), (), "")
 
     @property
@@ -488,6 +509,30 @@ class LivePanel:
     def copy_clip(self) -> None:
         topic = str(self.topic_field.stringValue() or "") if self.topic_field is not None else ""
         threading.Thread(target=self._on_copy_clip, args=(topic,), name="meeting-sidecar-live-clip", daemon=True).start()
+
+    def set_speakers_callback(self, callback) -> None:
+        self._on_speakers = callback
+
+    def set_speakers(self, text: str, *, proposed: bool = False) -> None:
+        """Show names without saving them. A proposal (from the calendar) is saved on Enter."""
+        def update():
+            self._speakers_text = text
+            self._speakers_unconfirmed = proposed
+            if self._built:
+                self.speakers_field.setStringValue_(text)
+        _dispatch_main(update)
+
+    def save_speakers(self) -> None:
+        text = str(self.speakers_field.stringValue() or "") if self.speakers_field is not None else ""
+        if self._on_speakers is None or (text == self._speakers_text and not self._speakers_unconfirmed):
+            return
+        try:
+            self._status = self._on_speakers(text) or self._status
+            self._speakers_text, self._speakers_unconfirmed = text, False
+        except Exception as exc:
+            self._status = f"Teilnehmende nicht gespeichert ({type(exc).__name__})."
+        if self._built:
+            self._render_state()
 
     def copy_transcript(self) -> None:
         """Copy every line this window holds; works during and after a recording."""
