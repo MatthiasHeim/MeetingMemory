@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .live import LiveCard, LiveLine
-from .panel_layout import COMPACT_SIZE, MINIMUM_SIZE, PANEL_HELP, panel_mode, surface_rect, visible_cards, transcript_content, source_ranges, utf16_length
+from .panel_layout import COMPACT_SIZE, MINIMUM_SIZE, PANEL_HELP, panel_mode, surface_rect, visible_cards, transcript_content, source_ranges, transcript_copy_text, utf16_length
 from .transcript import format_timestamp
 
 NONACTIVATING_PANEL_MASK = 1 << 7
@@ -120,6 +120,9 @@ class _PanelTarget(NSObject):
 
     def copyClip_(self, _sender):
         self.panel.copy_clip()
+
+    def copyTranscript_(self, _sender):
+        self.panel.copy_transcript()
 
     def copyCard_(self, sender):
         self.panel.copy_card(int(sender.tag()))
@@ -285,6 +288,8 @@ class LivePanel:
         self._fullscreen_button = self._button("Vollbild", "toggleFullscreen:", "Öffnet oder verlässt das native macOS-Vollbild.")
         self._help_button = self._button("?", "toggleHelp:", "Die Recorder-Funktionen kurz erklärt.")
         self._transcript_label = self._label("TRANSKRIPT", 11, utility=True)
+        self._copy_transcript_button = self._button("Transkript kopieren", "copyTranscript:", "Kopiert das ganze bisherige Transkript, auch nach dem Stoppen.")
+        self._copy_transcript_button.setFont_(_font(11))
         self._cards_label = self._label("KARTEN & KI-IDEEN", 11, utility=True)
         self._audience_control = A.NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 26))
         self._audience_control.setSegmentCount_(2)
@@ -313,8 +318,8 @@ class LivePanel:
         self._consent_hint = self._label("Vorher alle Beteiligten informieren.", 10)
         self._consent_hint.setTextColor_(_color("59666A"))
         for view in (self._title, self._state_label, self._mode_control, self._fullscreen_button,
-                     self._help_button, self._audience_control, self._transcript_label, self._cards_label,
-                     self._transcript_scroll, self.cards_scroll, self._help_scroll, self.status_field,
+                     self._help_button, self._audience_control, self._transcript_label, self._copy_transcript_button,
+                     self._cards_label, self._transcript_scroll, self.cards_scroll, self._help_scroll, self.status_field,
                      self.topic_field, self._clip_button, self._record_button, self._consent_hint):
             self._surface.addSubview_(view)
         self._built = True
@@ -354,20 +359,23 @@ class LivePanel:
                 gap = 20.0
                 col = (w - 40 - gap) / 2
                 body_h = max(70, body_top - bottom - 22)
-                self._transcript_label.setFrame_(NSMakeRect(20, body_top - 18, col, 18))
+                self._transcript_label.setFrame_(NSMakeRect(20, body_top - 18, col - 150, 18))
+                self._copy_transcript_button.setFrame_(NSMakeRect(20 + col - 140, body_top - 22, 140, 24))
                 self._cards_label.setFrame_(NSMakeRect(20 + col + gap, body_top - 18, col, 18))
                 self._transcript_scroll.setFrame_(NSMakeRect(20, bottom, col, body_h))
                 self.cards_scroll.setFrame_(NSMakeRect(20 + col + gap, bottom, col, body_h))
             else:
                 available = body_top - bottom
                 transcript_h = min(220, max(125, available * 0.36))
-                self._transcript_label.setFrame_(NSMakeRect(20, body_top - 18, w - 40, 18))
+                self._transcript_label.setFrame_(NSMakeRect(20, body_top - 18, w - 190, 18))
+                self._copy_transcript_button.setFrame_(NSMakeRect(w - 160, body_top - 22, 140, 24))
                 self._transcript_scroll.setFrame_(NSMakeRect(20, body_top - 24 - transcript_h, w - 40, transcript_h))
                 cards_top = body_top - transcript_h - 42
                 self._cards_label.setFrame_(NSMakeRect(20, cards_top - 18, w - 40, 18))
                 self.cards_scroll.setFrame_(NSMakeRect(20, bottom, w - 40, max(70, cards_top - bottom - 24)))
             self._help_scroll.setFrame_(NSMakeRect(20, bottom, w - 40, max(70, body_top - bottom)))
-            for view in (self._transcript_scroll, self.cards_scroll, self._transcript_label, self._cards_label):
+            for view in (self._transcript_scroll, self.cards_scroll, self._transcript_label,
+                         self._copy_transcript_button, self._cards_label):
                 view.setHidden_(self._help_open)
             self._help_scroll.setHidden_(not self._help_open)
             self.status_field.setFrame_(NSMakeRect(20, 78, w - 40, 32))
@@ -481,6 +489,16 @@ class LivePanel:
         topic = str(self.topic_field.stringValue() or "") if self.topic_field is not None else ""
         threading.Thread(target=self._on_copy_clip, args=(topic,), name="meeting-sidecar-live-clip", daemon=True).start()
 
+    def copy_transcript(self) -> None:
+        """Copy every line this window holds; works during and after a recording."""
+        text = transcript_copy_text(self._lines)
+        if not text:
+            return
+        threading.Thread(target=self._on_copy_card, args=(text,), name="meeting-sidecar-live-transcript", daemon=True).start()
+        self._status = f"Transkript kopiert ({len(self._lines)} Abschnitte)."
+        if self._built:
+            self._render_state()
+
     def copy_card(self, index: int) -> None:
         if 0 <= index < len(self.displayed_cards):
             text = self.displayed_cards[index].copy_text
@@ -522,6 +540,7 @@ class LivePanel:
         self._state_label.setTextColor_(_color("A23F32" if self._recording_state == "recording" else "59666A"))
         self._record_button.setTitle_("Aufnahme beenden" if self._recording_state == "recording" else "Aufnahme starten")
         self._record_button.setEnabled_(self._on_toggle_recording is not None and self._recording_state != "preview")
+        self._copy_transcript_button.setEnabled_(bool(self._lines))
         has_committed = any(not line.provisional for line in self._lines)
         self._clip_button.setEnabled_(has_committed)
         self.topic_field.setEnabled_(has_committed)

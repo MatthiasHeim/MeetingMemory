@@ -9,7 +9,7 @@ import pytest
 from sidecar.card_semantics import CardEvent, ContextualCardExtractor, split_sources
 from sidecar.judges import JudgeError, _validated_choices
 from sidecar.live import LiveCard, LiveEngine, LiveLine, TailSnapshot
-from sidecar.panel_layout import visible_cards, source_ranges, utf16_length, transcript_content
+from sidecar.panel_layout import visible_cards, source_ranges, utf16_length, transcript_content, transcript_copy_text
 
 
 def line(text, time=0, speaker='Ich'):
@@ -77,6 +77,12 @@ def test_native_source_ranges_use_utf16_and_reject_stale_evidence():
     assert text.encode('utf-16-le')[start*2:(start+length)*2].decode('utf-16-le') == spans[1].text
     assert source_ranges([line('Changed.', 0)], spans) == []
     assert utf16_length('👋') == 2
+
+
+def test_transcript_copy_text_has_every_line_without_pending_marker():
+    lines = [line('First point.', 0), LiveLine(65, 70, 'Andere', 'Still talking', provisional=True)]
+    assert transcript_copy_text(lines) == '[00:00] Ich\nFirst point.\n\n[01:05] Andere\nStill talking'
+    assert transcript_copy_text([]) == ''
 
 
 def test_private_suggestions_are_hidden_in_every_client_layout_and_unknown_mode():

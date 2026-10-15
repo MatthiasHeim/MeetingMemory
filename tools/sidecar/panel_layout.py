@@ -30,6 +30,8 @@ PANEL_HELP = (
     "Informiere alle Beteiligten, bevor du startest.\n\n"
     "Prompt-Stelle markieren\n"
     "Merkt die aktuelle Stelle einer laufenden Aufnahme, damit du die diktierte Aufgabe später wiederfindest.\n\n"
+    "Transkript kopieren\n"
+    "Kopiert das ganze bisherige Transkript dieser Aufnahme, während und nach der Aufnahme.\n\n"
     "Themenauszug kopieren …\n"
     "Wählt ein gespeichertes Transkript und kopiert passende Textstellen zu deinem Thema. "
     "Während einer Aufnahme nutzt du das Themenfeld in diesem Fenster.\n\n"
@@ -98,6 +100,12 @@ def transcript_content(lines):
         offsets.append(len(text))
         text += line.text
     return text, offsets
+
+
+def transcript_copy_text(lines):
+    """Plain clipboard text of every line so far, without the on-screen pending marker."""
+    from .transcript import format_timestamp
+    return '\n\n'.join(f'[{format_timestamp(line.start)}] {line.speaker}\n{line.text}' for line in lines)
 
 
 def source_ranges(lines, spans):

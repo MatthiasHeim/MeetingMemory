@@ -1012,3 +1012,28 @@ def test_new_start_closes_the_previous_panel_and_a_failed_start_notifies(monkeyp
             sys.modules["meeting_recorder"] = previous
         else:
             sys.modules.pop("meeting_recorder", None)
+
+
+def test_panel_copies_full_transcript_during_and_after_recording(monkeypatch):
+    from sidecar import live_window
+    from sidecar.live import LiveLine
+
+    monkeypatch.setattr(live_window, "_dispatch_main", lambda callback: callback())
+    copied = []
+    monkeypatch.setattr(live_window.threading, "Thread",
+                        lambda target, args, **_kw: type("T", (), {"start": lambda self: target(*args)})())
+    panel = LivePanel(on_copy_clip=lambda _topic: None, on_copy_card=copied.append)
+    try:
+        panel.show()
+        panel.set_recording_state("recording")
+        assert not panel._copy_transcript_button.isEnabled()
+        panel.apply_update([LiveLine(0, 3, "Ich", "Hallo."), LiveLine(4, 8, "Andere", "Weiter", provisional=True)], (), "")
+        assert panel._copy_transcript_button.isEnabled()
+        panel.set_recording_state("stopped")
+        panel.copy_transcript()
+        assert copied == ["[00:00] Ich\nHallo.\n\n[00:04] Andere\nWeiter"]
+        assert "kopiert" in str(panel.status_field.stringValue())
+    finally:
+        if panel.panel is not None:
+            panel.panel.orderOut_(None)
+            panel.panel.close()
