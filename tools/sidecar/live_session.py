@@ -6,6 +6,7 @@ worker; the panel stays open with whatever it has shown.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from .calibration_policy import OWNER_APPROVED_MODEL, OWNER_APPROVED_PROMPT_THRESHOLD
@@ -16,6 +17,7 @@ from .live import (
     snapshot_recording_tails,
 )
 from .live import default_clean_prompt
+from .live_store import atomic_write_json, live_json_path, live_session_payload
 from .prompts import PromptCalibrationError, calibrated_prompt_threshold
 from .selection import select_clip
 
@@ -34,12 +36,22 @@ class RecordingLiveSession:
         judge: GeminiJudge | None = None,
         prompt_threshold: float | None = None,
         on_unavailable: Callable[[str], None] | None = None,
+        recordings_dir: str | Path | None = None,
+        stem: str | None = None,
+        clean_prompt: Callable[[str], str] | None = None,
     ):
         self.recorder = recorder
         self._copy_text = copy_text
         self._open_window = open_window
         self.panel = None
         self._api_key = api_key
+        self._stem = stem
+        self._live_path = None
+        if recordings_dir is not None and stem:
+            try:
+                self._live_path = live_json_path(recordings_dir, stem)
+            except ValueError:
+                self._live_path = None
         # Clients and the calibration read happen on the worker's first tick.
         # Building them here used to block Start for about half a second.
         self.engine = LiveEngine(
@@ -51,9 +63,10 @@ class RecordingLiveSession:
             judge=judge,
             judge_factory=None if judge is not None else (lambda: _maybe_judge(api_key)),
             threshold_factory=None if prompt_threshold is not None else _live_prompt_threshold,
-            clean_prompt=default_clean_prompt(api_key),
+            clean_prompt=clean_prompt if clean_prompt is not None else default_clean_prompt(api_key),
             on_update=self._on_update,
             on_unavailable=on_unavailable,
+            on_commit=self._persist_live if self._live_path is not None else None,
             prompt_threshold=prompt_threshold
             if prompt_threshold is not None
             else OWNER_APPROVED_PROMPT_THRESHOLD,
@@ -75,6 +88,12 @@ class RecordingLiveSession:
     def _on_update(self, lines, cards, status: str) -> None:
         if self.panel is not None:
             self.panel.apply_update(lines, cards, status)
+
+    def _persist_live(self, lines, cards) -> None:
+        """Write the committed session. Called on the live worker, once per tick."""
+        if self._live_path is None or not self._stem:
+            return
+        atomic_write_json(self._live_path, live_session_payload(self._stem, lines, cards))
 
     def copy_card(self, text: str) -> None:
         if not text.strip():

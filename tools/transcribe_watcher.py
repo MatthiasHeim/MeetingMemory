@@ -179,6 +179,7 @@ except ImportError as e:
 
 try:
     from diarize import (
+        DIARIZATION_TIMEOUT_SECONDS,
         PYANNOTE_AVAILABLE,
         PYANNOTE_IMPORT_ERROR,
         fuse_host_cluster_with_channel_vad,
@@ -380,6 +381,20 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     logger.addHandler(ch)
 
     return logger
+
+
+def _partial_alert_message(audio_file: Path, validation, live_fill=None) -> str:
+    """Partial-transcript alert. The escalation text stays; a live fill is an extra sentence."""
+    message = (
+        f"⚠️ Meeting captured but INCOMPLETE (coverage "
+        f"{validation.coverage_pct:.1f}%)\n"
+        f"{audio_file.name}\n"
+        f"{'; '.join(validation.reasons)}\n"
+        f"Stored as partial — needs review/reprocessing."
+    )
+    if isinstance(live_fill, dict) and live_fill.get("line_count"):
+        message += "\nGaps were filled from the live transcript."
+    return message
 
 
 def _fmt_mmss(seconds: float) -> str:
@@ -1273,6 +1288,16 @@ class TranscribeWatcher:
                     diarization_segments = self._run_diarization_safe(
                         mp3_path, num_speakers=num_speakers
                     )
+                    if diarization_segments:
+                        topo_name = getattr(topology, "topology", None)
+                        self.logger.info(
+                            "Using pyannote diarization prior: "
+                            f"{len(diarization_segments)} segments, "
+                            f"topology={topo_name}. This prior can change "
+                            "speaker labels versus voice-only Gemini, including "
+                            "on single-source recordings. Disable it with "
+                            "diarization.enabled: false."
+                        )
                     if (
                         diarization_segments
                         and channel_fusion
@@ -1411,6 +1436,11 @@ class TranscribeWatcher:
                              elapsed_seconds=time.time() - start_time)
 
             # Step 4c: Save JSON result alongside MP3 (now canonical).
+            # Speaker reconciliation can rewrite labels after the partial
+            # alert. Re-apply the live lines so the saved transcript still
+            # contains them; a second pass does not duplicate tagged lines.
+            if partial:
+                self._fill_partial_from_live(audio_file, result, audio_duration)
             output_payload = _transcript_payload_with_channel_alignment(
                 result.parsed_response,
                 getattr(self, "_applied_channel_alignment_lag_seconds", None),
@@ -1945,7 +1975,7 @@ class TranscribeWatcher:
             )
             return None
         cfg = self.config.get("diarization", {}) or {}
-        timeout = int(cfg.get("timeout_seconds", 3600))
+        timeout = int(cfg.get("timeout_seconds", DIARIZATION_TIMEOUT_SECONDS))
         device = str(cfg.get("device", ""))
         try:
             return run_pyannote_diarization(
@@ -2475,6 +2505,7 @@ class TranscribeWatcher:
         persist, or None if the junk guard fired (nothing should be
         persisted). `partial` is True iff `result` did not pass validation.
         """
+        self._last_live_fill = None
         validation = _validate_gemini_result(result, audio_duration)
         if validation.passed:
             self.logger.info(
@@ -2562,8 +2593,40 @@ class TranscribeWatcher:
             f"PARTIAL (coverage {best_validation.coverage_pct:.1f}%): "
             f"{'; '.join(best_validation.reasons)}"
         )
+        self._last_live_fill = self._fill_partial_from_live(
+            audio_file, best_result, audio_duration
+        )
         self._notify_telegram_partial(audio_file, best_validation)
         return best_result, best_validation, True
+
+    def _fill_partial_from_live(self, audio_file: Path, result, audio_duration: float):
+        """Insert saved live lines into gaps. Never raises; complete results are not passed here."""
+        recordings = getattr(self, "recordings_dir", None)
+        if recordings is None or result is None:
+            return None
+        path = Path(recordings) / f"{Path(audio_file).stem}.live.json"
+        if not path.is_file():
+            return None
+        try:
+            from sidecar.live_store import apply_live_fill
+
+            meta = apply_live_fill(
+                result,
+                path,
+                audio_duration,
+                channel_lag_seconds=getattr(
+                    self, "_applied_channel_alignment_lag_seconds", None
+                ),
+            )
+        except Exception as exc:
+            self.logger.warning(f"Live transcript fill failed: {exc}")
+            return None
+        if meta:
+            self.logger.info(
+                f"Filled {meta.get('line_count')} live transcript line(s) "
+                f"for {meta.get('ranges')}"
+            )
+        return meta
 
     def _notify_telegram_partial(self, audio_file: Path, validation) -> None:
         """Alert that a meeting was captured but FAILED the completeness
@@ -2577,12 +2640,8 @@ class TranscribeWatcher:
                 "skipping partial-transcript alert"
             )
             return
-        msg = (
-            f"⚠️ Meeting captured but INCOMPLETE (coverage "
-            f"{validation.coverage_pct:.1f}%)\n"
-            f"{audio_file.name}\n"
-            f"{'; '.join(validation.reasons)}\n"
-            f"Stored as partial — needs review/reprocessing."
+        msg = _partial_alert_message(
+            audio_file, validation, getattr(self, "_last_live_fill", None)
         )
         try:
             subprocess.run(

@@ -41,6 +41,20 @@ from .transcript import TranscriptLine, format_timestamp
 LIVE_TICK_SECONDS = 20.0
 LIVE_TAIL_SECONDS = 60.0
 LIVE_SAMPLE_RATE = 16000
+# A fraction past the tail is still "this clip". Anything further is either a
+# meeting-clock timestamp or a hallucination, and must not be pinned to the edge.
+_OFFSET_SLACK_SECONDS = 1.0
+# Speech the first answer leaves uncovered is requested again. The floor is
+# int16 RMS over 50 ms, above the room tone of a quiet tail and below the
+# short remarks in the owner's test recordings.
+_SPEECH_FRAME_SECONDS = 0.05
+_SPEECH_RMS_FLOOR = 260.0
+_SPEECH_MERGE_GAP_SECONDS = 0.35
+_SPEECH_MIN_SECONDS = 0.45
+_GAP_FILL_MIN_SECONDS = 0.5
+# A full minute lets the model stop after the first dense stretch and skip
+# short remarks later in the same tail. The second ask is a short slice.
+_GAP_SLICE_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -491,15 +505,36 @@ class GeminiLiveTranscriber:
         assert last is not None
         raise last
 
-    def _once(
+    def transcribe_gaps(
         self, mic: np.ndarray, mic_rate: int, system: np.ndarray | None, system_rate: int
+    ) -> list[dict[str, Any]]:
+        """Second ask for speech the meeting prompt left uncovered.
+
+        A failure here keeps the first answer. It must not fail the tick.
+        """
+        has_system = system is not None and getattr(system, "size", 0) > 0
+        try:
+            return self._once(
+                mic, mic_rate, system, system_rate, prompt=_gap_fill_prompt(has_system)
+            )
+        except (JudgeError, OSError, ValueError):
+            return []
+
+    def _once(
+        self,
+        mic: np.ndarray,
+        mic_rate: int,
+        system: np.ndarray | None,
+        system_rate: int,
+        prompt: str | None = None,
     ) -> list[dict[str, Any]]:
         _verify_pinned_gemini_destination(self.client)
         audio = stereo_tail_wav(mic, mic_rate, system, system_rate, LIVE_SAMPLE_RATE)
         if len(audio) < 64:
             return []
         has_system = system is not None and getattr(system, "size", 0) > 0
-        prompt = _transcription_prompt(has_system=has_system)
+        if prompt is None:
+            prompt = _transcription_prompt(has_system=has_system)
         parts: list[Any] = [prompt]
         if self.types is None:
             parts.append({"mime_type": "audio/wav", "data": audio})
@@ -543,6 +578,252 @@ def _visible_base_url(client: Any) -> str | None:
     return _visible_client_base_url(client)
 
 
+def speech_intervals(samples: np.ndarray | None, sample_rate: int) -> list[tuple[float, float]]:
+    """Loud regions of one tail, in seconds from the start of ``samples``.
+
+    A silent partner channel does not hide speech: a frame counts when any
+    channel is above the floor. Short gaps are merged, then blips are dropped.
+    """
+    if samples is None or sample_rate <= 0:
+        return []
+    array = np.asarray(samples)
+    if array.size == 0:
+        return []
+    if array.ndim == 1:
+        channels = [np.reshape(array, -1)]
+    elif array.ndim == 2 and array.shape[1] >= 1:
+        channels = [array[:, index] for index in range(array.shape[1])]
+    else:
+        return []
+    frame = max(1, int(round(sample_rate * _SPEECH_FRAME_SECONDS)))
+    usable = min(int(channel.shape[0]) for channel in channels)
+    count = usable // frame
+    if count <= 0:
+        return []
+    active = np.zeros(count, dtype=bool)
+    for channel in channels:
+        block = channel[: count * frame].astype(np.float32).reshape(count, frame)
+        rms = np.sqrt(np.mean(block * block, axis=1))
+        active |= rms >= _SPEECH_RMS_FLOOR
+    runs: list[tuple[float, float]] = []
+    index = 0
+    while index < count:
+        if not active[index]:
+            index += 1
+            continue
+        end = index + 1
+        while end < count and active[end]:
+            end += 1
+        runs.append((index * _SPEECH_FRAME_SECONDS, end * _SPEECH_FRAME_SECONDS))
+        index = end
+    merged: list[tuple[float, float]] = []
+    for start, end in runs:
+        if merged and start - merged[-1][1] <= _SPEECH_MERGE_GAP_SECONDS:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return [(start, end) for start, end in merged if end - start >= _SPEECH_MIN_SECONDS]
+
+
+def clip_speech_intervals(
+    mic: np.ndarray,
+    mic_rate: int,
+    system: np.ndarray | None,
+    system_rate: int,
+) -> list[tuple[float, float]]:
+    """Speech on the stereo tail, in seconds from the start of the clip.
+
+    The WAV pads the shorter channel at the start so both ends match. Interval
+    times use that same clock.
+    """
+    mic_intervals = speech_intervals(mic, mic_rate)
+    system_intervals = speech_intervals(system, system_rate)
+    mic_duration = (
+        np.asarray(mic).shape[0] / float(mic_rate) if mic_rate and np.asarray(mic).size else 0.0
+    )
+    if system is None or system_rate <= 0 or np.asarray(system).size == 0:
+        system_duration = 0.0
+    else:
+        system_duration = np.asarray(system).shape[0] / float(system_rate)
+    clip = max(mic_duration, system_duration)
+    shifted = _shift_intervals(mic_intervals, clip - mic_duration)
+    shifted.extend(_shift_intervals(system_intervals, clip - system_duration))
+    return _merge_intervals(shifted)
+
+
+def uncovered_speech(
+    intervals: Sequence[tuple[float, float]],
+    lines: Sequence[Any],
+    *,
+    slack: float = 0.75,
+) -> list[tuple[float, float]]:
+    """Speech intervals that no line covers, in the same clock as ``lines``."""
+    covered = [
+        (float(line.start) - slack, float(line.end) + slack)
+        for line in lines
+    ]
+    left: list[tuple[float, float]] = []
+    for start, end in intervals:
+        pieces = [(start, end)]
+        for cover_start, cover_end in covered:
+            nxt: list[tuple[float, float]] = []
+            for piece_start, piece_end in pieces:
+                if piece_end <= cover_start or piece_start >= cover_end:
+                    nxt.append((piece_start, piece_end))
+                    continue
+                if piece_start < cover_start:
+                    nxt.append((piece_start, min(piece_end, cover_start)))
+                if piece_end > cover_end:
+                    nxt.append((max(piece_start, cover_end), piece_end))
+            pieces = nxt
+        left.extend((a, b) for a, b in pieces if b - a >= 0.3)
+    return _merge_intervals(left)
+
+
+def supplement_uncovered_lines(
+    primary: Sequence[LiveLine],
+    extra: Sequence[LiveLine],
+    gaps: Sequence[tuple[float, float]],
+    *,
+    pad: float = 5.0,
+) -> list[LiveLine]:
+    """Keep gap-fill lines that land on, or just beside, speech the first answer missed.
+
+    The second ask often times a short remark a few seconds off the energy
+    burst. A line far from every gap stays out.
+    """
+    kept = list(primary)
+    for line in extra:
+        if any(
+            _ranges_overlap(line.start, line.end, start - pad, end + pad)
+            for start, end in gaps
+        ):
+            kept.append(line)
+    kept.sort(key=lambda line: (line.start, line.end))
+    return kept
+
+
+def _shift_intervals(
+    intervals: Sequence[tuple[float, float]], delta: float
+) -> list[tuple[float, float]]:
+    if delta <= 0:
+        return [(start, end) for start, end in intervals]
+    return [(start + delta, end + delta) for start, end in intervals]
+
+
+def _merge_intervals(intervals: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(intervals):
+        if end - start <= 0:
+            continue
+        if merged and start - merged[-1][1] <= _SPEECH_MERGE_GAP_SECONDS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _ranges_overlap(start: float, end: float, other_start: float, other_end: float) -> bool:
+    return min(end, other_end) - max(start, other_start) > 0.05
+
+
+def _gap_duration(intervals: Sequence[tuple[float, float]]) -> float:
+    return sum(end - start for start, end in intervals)
+
+
+def gap_slices(
+    gaps: Sequence[tuple[float, float]],
+    duration: float,
+    span: float = _GAP_SLICE_SECONDS,
+) -> list[tuple[float, float]]:
+    """Short windows centred on uncovered speech, in clip-relative seconds."""
+    if duration <= 0 or not gaps:
+        return []
+    if duration <= span:
+        return [(0.0, duration)]
+    chosen: list[tuple[float, float]] = []
+    for start, end in gaps:
+        mid = (start + end) / 2.0
+        left = min(max(0.0, mid - span / 2.0), duration - span)
+        right = left + span
+        if not chosen:
+            chosen.append((left, right))
+            continue
+        union_left = min(chosen[-1][0], left)
+        union_right = max(chosen[-1][1], right)
+        if union_right - union_left <= span + 2.0:
+            chosen[-1] = (union_left, min(duration, union_right))
+        else:
+            chosen.append((left, right))
+    return chosen
+
+
+def followup_slices(
+    gaps: Sequence[tuple[float, float]],
+    covered_end: float,
+    duration: float,
+    span: float = 10.0,
+) -> list[tuple[float, float]]:
+    """Slice the still-open tail, starting where the previous answer stopped.
+
+    A window that holds two short remarks often returns only the first. The
+    follow-up begins at that line. A gap near the end of the clip runs through
+    the end, so the last words are in the audio.
+    """
+    chosen: list[tuple[float, float]] = []
+    for start, end in gaps:
+        if end <= covered_end + 0.25:
+            continue
+        if duration - end <= span:
+            right = duration
+            left = min(duration, max(0.0, covered_end, duration - span))
+        else:
+            left = min(max(0.0, covered_end), duration)
+            right = min(duration, max(end + 0.75, left + span))
+            if right - left > span:
+                left = max(covered_end, right - span)
+        if right - left < 0.5 or left >= right:
+            continue
+        if chosen and left <= chosen[-1][1]:
+            chosen[-1] = (min(chosen[-1][0], left), max(chosen[-1][1], right))
+        else:
+            chosen.append((left, right))
+    return chosen
+
+
+def _slice_tail(samples: np.ndarray | None, sample_rate: int, start: float, end: float):
+    if samples is None or sample_rate <= 0:
+        return samples
+    array = np.asarray(samples)
+    if array.size == 0:
+        return array
+    first = min(array.shape[0], max(0, int(round(start * sample_rate))))
+    last = min(array.shape[0], max(first, int(round(end * sample_rate))))
+    return array[first:last]
+
+
+def _offsets_from_slice(
+    rows: Sequence[dict[str, Any]], slice_start: float, slice_duration: float
+) -> list[dict[str, Any]]:
+    """Shift clip-relative slice offsets onto the full tail.
+
+    An offset past the slice is left alone so meeting-clock placement can
+    rebase it. Adding the slice start on top of a meeting time would move it
+    twice.
+    """
+    adjusted: list[dict[str, Any]] = []
+    limit = slice_duration + _OFFSET_SLACK_SECONDS
+    for row in rows:
+        start = float(row["start_offset"])
+        end = float(row["end_offset"])
+        if start <= limit and end <= limit:
+            row = dict(row)
+            row["start_offset"] = start + slice_start
+            row["end_offset"] = end + slice_start
+        adjusted.append(row)
+    return adjusted
+
+
 def _transcription_prompt(has_system: bool) -> str:
     remote = (
         "The WAV is stereo and both channels end at the same moment. "
@@ -564,6 +845,30 @@ def _transcription_prompt(has_system: bool) -> str:
         "and continue the local speaker on the next line. "
         "Never write an ellipsis or three dots. Write the words that were spoken. Do not invent speech. Omit silence. "
         "start_offset and end_offset are seconds from the beginning of this audio, not from the start of the meeting. "
+        "Do not add the elapsed meeting time. An offset past the end of this clip is wrong. "
+        'Return JSON {"lines":[{"speaker":"...","text":"...","start_offset":0,"end_offset":0}]}.'
+    )
+
+
+def _gap_fill_prompt(has_system: bool) -> str:
+    """Short second ask for speech the meeting prompt left out.
+
+    The long prompt returns an empty list on a quiet tail that still contains
+    short remarks. This ask is only used for those gaps. Offsets stay
+    clip-relative so the same placement rules apply.
+    """
+    who = (
+        "The left channel is the local microphone, speaker Ich. "
+        "The right channel is remote audio, speaker Andere. "
+        if has_system
+        else "Label the speaker Ich. "
+    )
+    return (
+        "Transcribe every spoken word in this audio into Hochdeutsch. "
+        "Do not summarise. Include short remarks. "
+        f"{who}"
+        "start_offset and end_offset are seconds from the start of this clip. "
+        "If you hear speech, you must include it. Omit only pure silence. "
         'Return JSON {"lines":[{"speaker":"...","text":"...","start_offset":0,"end_offset":0}]}.'
     )
 
@@ -618,29 +923,77 @@ def _lines_from_response(response: Any) -> list[dict[str, Any]]:
 
 
 def _absolute_lines(
-    raw: Sequence[dict[str, Any]], window_start: float, window_end: float
+    raw: Sequence[dict[str, Any]],
+    window_start: float,
+    window_end: float,
+    trace: list[dict[str, Any]] | None = None,
 ) -> list[LiveLine]:
-    """Place offsets on the microphone clock, clamped to this tail.
+    """Place offsets on the microphone clock.
 
-    A hallucinated offset past the audio would move the frontier into the
-    future and drop every later real line.
+    Offsets within the tail are clip-relative. Offsets past the tail are
+    treated as meeting time and kept only when they fall inside this window.
+    Anything else is rejected. Clamping every outlier onto ``window_end``
+    piled later lines on one instant and the deduper then dropped them.
     """
     span = max(0.0, float(window_end) - float(window_start))
     lines: list[LiveLine] = []
     for row in raw:
-        start_offset = min(max(0.0, float(row["start_offset"])), span)
-        end_offset = min(max(0.0, float(row["end_offset"])), span)
-        if end_offset < start_offset:
-            end_offset = start_offset
+        start_offset = float(row["start_offset"])
+        end_offset = float(row["end_offset"])
+        decision, placed_start, placed_end = _place_offsets(
+            start_offset, end_offset, float(window_start), float(window_end), span
+        )
+        if trace is not None:
+            trace.append({
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "decision": decision,
+                "placed_start": placed_start,
+                "placed_end": placed_end,
+            })
+        if decision == "reject" or placed_start is None or placed_end is None:
+            continue
         lines.append(
             LiveLine(
-                window_start + start_offset,
-                window_start + end_offset,
+                placed_start,
+                placed_end,
                 str(row["speaker"]),
                 str(row["text"]),
             )
         )
     return lines
+
+
+def _place_offsets(
+    start_offset: float,
+    end_offset: float,
+    window_start: float,
+    window_end: float,
+    span: float,
+) -> tuple[str, float | None, float | None]:
+    """Return ``(decision, absolute_start, absolute_end)``."""
+    if (
+        start_offset != start_offset
+        or end_offset != end_offset
+        or start_offset in (float("inf"), float("-inf"))
+        or end_offset in (float("inf"), float("-inf"))
+    ):
+        return "reject", None, None
+    slack = _OFFSET_SLACK_SECONDS
+    meeting_clock = start_offset > span + slack or end_offset > span + slack
+    if meeting_clock:
+        if start_offset > window_end + slack or end_offset < window_start - slack:
+            return "reject", None, None
+        if end_offset < window_start - slack:
+            return "reject", None, None
+        placed_start = min(max(start_offset, window_start), window_end)
+        placed_end = min(max(end_offset, placed_start), window_end)
+        return "rebase", placed_start, placed_end
+    if start_offset < -slack or end_offset < -slack:
+        return "reject", None, None
+    relative_start = min(max(0.0, start_offset), span)
+    relative_end = min(max(relative_start, end_offset), span)
+    return "relative", window_start + relative_start, window_start + relative_end
 
 
 UpdateCallback = Callable[[tuple[LiveLine, ...], tuple[LiveCard, ...], str], None]
@@ -662,6 +1015,8 @@ class LiveEngine:
         clean_prompt: Cleaner | None = None,
         on_update: UpdateCallback | None = None,
         on_unavailable: Callable[[str], None] | None = None,
+        on_commit: Callable[[Sequence[LiveLine], Sequence[LiveCard]], None] | None = None,
+        on_offsets: Callable[[float, float, Sequence[dict[str, Any]]], None] | None = None,
         interval: float = LIVE_TICK_SECONDS,
         tail: float = LIVE_TAIL_SECONDS,
         prompt_threshold: float = OWNER_APPROVED_PROMPT_THRESHOLD,
@@ -675,6 +1030,8 @@ class LiveEngine:
         self._clean_prompt = clean_prompt
         self._on_update = on_update
         self._on_unavailable = on_unavailable
+        self._on_commit = on_commit
+        self._on_offsets = on_offsets
         self.interval = interval
         self.tail = tail
         self.prompt_threshold = prompt_threshold
@@ -712,6 +1069,9 @@ class LiveEngine:
             if self._stop.wait(self.interval):
                 break
             self._safe_tick()
+        # Committed lines are written at stop before the final transcription
+        # tick, which may be skipped once the system WAV is archived.
+        self._persist_tick(force=True)
         self._safe_tick(closed=True)
 
     def _ensure_runtime(self) -> None:
@@ -740,6 +1100,117 @@ class LiveEngine:
             self.process_snapshot(snapshot)
         except Exception as exc:
             self._fail(exc)
+        finally:
+            # At most once per tick, on this worker, never on the audio callback.
+            self._persist_tick(force=closed)
+
+    def _persist_tick(self, *, force: bool = False) -> None:
+        if self._on_commit is None:
+            return
+        if not force and not self.lines and not self.cards:
+            return
+        try:
+            self._on_commit(tuple(self.lines), tuple(self.cards))
+        except Exception:
+            self.status = (
+                "Live-Sitzung konnte nicht gespeichert werden. Die Aufnahme läuft weiter."
+            )
+
+    def _fill_uncovered_speech(
+        self,
+        snapshot: TailSnapshot,
+        incoming: list[LiveLine],
+        trace: list[dict[str, Any]],
+    ) -> list[LiveLine]:
+        """Ask again when detected speech has no line, and keep only those gaps."""
+        gap_fn = getattr(self._transcriber, "transcribe_gaps", None)
+        if gap_fn is None:
+            return incoming
+        clip_gaps = uncovered_speech(
+            [
+                (snapshot.window_start + start, snapshot.window_start + end)
+                for start, end in clip_speech_intervals(
+                    snapshot.mic, snapshot.mic_rate, snapshot.system, snapshot.system_rate
+                )
+            ],
+            incoming,
+        )
+        if _gap_duration(clip_gaps) < _GAP_FILL_MIN_SECONDS:
+            return incoming
+        absolute_speech = [
+            (snapshot.window_start + start, snapshot.window_start + end)
+            for start, end in clip_speech_intervals(
+                snapshot.mic, snapshot.mic_rate, snapshot.system, snapshot.system_rate
+            )
+        ]
+        return self._ask_gap_slices(snapshot, incoming, trace, gap_fn, absolute_speech, clip_gaps)
+
+    def _ask_gap_slices(
+        self,
+        snapshot: TailSnapshot,
+        incoming: list[LiveLine],
+        trace: list[dict[str, Any]],
+        gap_fn: Callable,
+        absolute_speech: Sequence[tuple[float, float]],
+        clip_gaps: Sequence[tuple[float, float]],
+    ) -> list[LiveLine]:
+        clip_duration = max(0.0, snapshot.window_end - snapshot.window_start)
+        relative_gaps = [
+            (start - snapshot.window_start, end - snapshot.window_start)
+            for start, end in clip_gaps
+        ]
+        filled = supplement_uncovered_lines(
+            incoming,
+            self._transcribe_slices(
+                snapshot, gap_fn, gap_slices(relative_gaps, clip_duration)[:3], trace
+            ),
+            clip_gaps,
+        )
+        follow_gaps = uncovered_speech(absolute_speech, filled)
+        if _gap_duration(follow_gaps) < _GAP_FILL_MIN_SECONDS:
+            return filled
+        covered_end = max((line.end for line in filled), default=snapshot.window_start)
+        follow = followup_slices(
+            [
+                (start - snapshot.window_start, end - snapshot.window_start)
+                for start, end in follow_gaps
+            ],
+            covered_end - snapshot.window_start,
+            clip_duration,
+        )
+        if not follow:
+            return filled
+        return supplement_uncovered_lines(
+            filled,
+            self._transcribe_slices(snapshot, gap_fn, follow[:2], trace),
+            follow_gaps,
+        )
+
+    def _transcribe_slices(
+        self,
+        snapshot: TailSnapshot,
+        gap_fn: Callable,
+        slices: Sequence[tuple[float, float]],
+        trace: list[dict[str, Any]],
+    ) -> list[LiveLine]:
+        extra_raw: list[dict[str, Any]] = []
+        for slice_start, slice_end in slices:
+            mic = _slice_tail(snapshot.mic, snapshot.mic_rate, slice_start, slice_end)
+            system = _slice_tail(snapshot.system, snapshot.system_rate, slice_start, slice_end)
+            rows: list[dict[str, Any]] = []
+            for _attempt in range(2):
+                try:
+                    rows = gap_fn(mic, snapshot.mic_rate, system, snapshot.system_rate) or []
+                except Exception:
+                    rows = []
+                if rows:
+                    break
+            extra_raw.extend(
+                _offsets_from_slice(rows, slice_start, max(0.0, slice_end - slice_start))
+            )
+        return _absolute_lines(
+            extra_raw, snapshot.window_start, snapshot.window_end, trace
+        )
 
     def process_snapshot(self, snapshot: TailSnapshot) -> list[LiveLine]:
         """Transcribe one tail, commit new lines, and refresh prompt cards."""
@@ -749,8 +1220,17 @@ class LiveEngine:
         raw = self._transcriber.transcribe_tails(
             snapshot.mic, snapshot.mic_rate, snapshot.system, snapshot.system_rate
         )
+        trace: list[dict[str, Any]] = []
+        incoming = _absolute_lines(
+            raw, snapshot.window_start, snapshot.window_end, trace
+        )
+        incoming = self._fill_uncovered_speech(snapshot, incoming, trace)
         self.last_transcribe_seconds = time.perf_counter() - started
-        incoming = _absolute_lines(raw, snapshot.window_start, snapshot.window_end)
+        if self._on_offsets is not None:
+            try:
+                self._on_offsets(snapshot.window_start, snapshot.window_end, trace)
+            except Exception:
+                pass
         incoming, self._held = _select_lines_to_commit(
             incoming,
             snapshot.window_end,
@@ -931,6 +1411,19 @@ def replay_wav(
     lags: list[float] = []
     printed_cards: dict[str, tuple[str, str]] = {}
     write = emit or print
+
+    def _log_offsets(window_start: float, window_end: float, trace: Sequence[dict[str, Any]]) -> None:
+        pieces = []
+        for item in trace:
+            piece = (
+                f"{item['start_offset']:.3f}-{item['end_offset']:.3f}:{item['decision']}"
+            )
+            if item.get("placed_start") is not None:
+                piece += f"->{item['placed_start']:.3f}-{item['placed_end']:.3f}"
+            pieces.append(piece)
+        write(f"OFFSETS {window_start:.3f}-{window_end:.3f} " + " ".join(pieces))
+
+    engine._on_offsets = _log_offsets
     cursor = begin
     while cursor < finish - 1e-6:
         cursor = min(finish, cursor + tick)
