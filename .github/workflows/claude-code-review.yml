@@ -41,15 +41,23 @@ jobs:
           path: .claude-review-marketplace
           fetch-depth: 1
           persist-credentials: false
-          sparse-checkout: |
-            .claude-plugin
-            plugins/code-review
+          sparse-checkout: plugins/code-review
+
+      # The official marketplace name is reserved for GitHub sources, so
+      # register the pinned plugin under a local marketplace name instead
+      - name: Register pinned plugin as a local marketplace
+        run: |
+          mkdir -p .claude-review-marketplace/.claude-plugin
+          cat > .claude-review-marketplace/.claude-plugin/marketplace.json <<'JSON'
+          {"name": "pinned-review", "owner": {"name": "Anthropic"},
+           "plugins": [{"name": "code-review", "source": "./plugins/code-review"}]}
+          JSON
 
       - uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           plugin_marketplaces: ${{ github.workspace }}/.claude-review-marketplace
-          plugins: "code-review@claude-code-plugins"
+          plugins: "code-review@pinned-review"
           prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
