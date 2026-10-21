@@ -1,0 +1,63 @@
+name: Claude Code Review
+
+# Automatic Claude review on every non-draft PR, using the official
+# code-review plugin. Auth: CLAUDE_CODE_OAUTH_TOKEN (Claude subscription,
+# created with `claude setup-token`). Posts with the repo's GITHUB_TOKEN,
+# so the Claude GitHub App does not need to be installed.
+
+on:
+  pull_request:
+    # Once per PR, like Codex. The plugin skips PRs it has already reviewed.
+    types: [opened, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts, bot-triggered runs, and fork PRs (forks get no secrets)
+    if: >-
+      ${{ !github.event.pull_request.draft
+      && !endsWith(github.actor, '[bot]')
+      && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      # Plugin source pinned to a reviewed commit of anthropics/claude-code
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: anthropics/claude-code
+          ref: e32908d239be040a6e0597e5ea0a01354b9e6241
+          path: .claude-review-marketplace
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: plugins/code-review
+
+      # The official marketplace name is reserved for GitHub sources, so
+      # register the pinned plugin under a local marketplace name instead
+      - name: Register pinned plugin as a local marketplace
+        run: |
+          mkdir -p .claude-review-marketplace/.claude-plugin
+          cat > .claude-review-marketplace/.claude-plugin/marketplace.json <<'JSON'
+          {"name": "pinned-review", "owner": {"name": "Anthropic"},
+           "plugins": [{"name": "code-review", "source": "./plugins/code-review"}]}
+          JSON
+
+      - uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          plugin_marketplaces: ${{ github.workspace }}/.claude-review-marketplace
+          plugins: "code-review@pinned-review"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
