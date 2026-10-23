@@ -20,3 +20,6 @@ python-dotenv>=1.0.0
 
 # InsightBase (Neon Postgres) — used by neon_insert.py
 psycopg2-binary>=2.9.0
+
+# Gemini API (gemini_processor.py, sidecar judges)
+google-genai>=1.0.0
