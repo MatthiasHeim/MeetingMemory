@@ -50,6 +50,7 @@ class RecordingLiveSession:
         self._stem = stem
         self._recordings_root = recordings_root
         self._saved_lines: tuple | None = None
+        self._saved_cards: tuple | None = None
         self._recording_active = True
         self._copy_text = copy_text
         self._open_window = open_window
@@ -103,6 +104,8 @@ class RecordingLiveSession:
         """Signal the worker. The window stays until the user closes it."""
         self.engine.stop()
         self._recording_active = False
+        # Committed lines only; cards stay as last shown. The closing tick may
+        # still publish (and so rewrite) once more.
         self._save_live_transcript(self.engine.lines, force=True)
         if self.panel is not None:
             self.panel.set_recording_state("stopped")
@@ -112,21 +115,28 @@ class RecordingLiveSession:
         self.panel = None
 
     def _on_update(self, lines, cards, status: str) -> None:
-        self._save_live_transcript(lines)
+        self._save_live_transcript(lines, cards)
         if self.panel is not None:
             self.panel.apply_update(lines, cards, status)
 
-    def _save_live_transcript(self, lines, *, force: bool = False) -> None:
-        """Keep ``<stem>.live.json`` current; a failed write never touches recording."""
+    def _save_live_transcript(self, lines, cards=None, *, force: bool = False) -> None:
+        """Keep ``<stem>.live.json`` current; a failed write never touches recording.
+
+        The only writer of that file. Lines and cards are written whenever
+        either changes, and once more at stop with ``recording_active: false``.
+        """
         if self._stem is None:
             return
-        snapshot = tuple(lines)
-        if not force and snapshot == self._saved_lines:
+        if cards is None:
+            cards = self._saved_cards if self._saved_cards is not None else ()
+        snapshot = (tuple(lines), tuple(cards))
+        if not force and snapshot == (self._saved_lines, self._saved_cards):
             return
         try:
-            write_live_transcript(self._stem, snapshot, root=self._recordings_root,
-                                  model=OWNER_APPROVED_MODEL, recording_active=self._recording_active)
-            self._saved_lines = snapshot
+            write_live_transcript(self._stem, snapshot[0], root=self._recordings_root,
+                                  model=OWNER_APPROVED_MODEL, recording_active=self._recording_active,
+                                  cards=snapshot[1])
+            self._saved_lines, self._saved_cards = snapshot
         except Exception as exc:
             print(f"Live transcript not saved: {type(exc).__name__}: {exc}", file=sys.stderr)
 

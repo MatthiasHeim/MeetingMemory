@@ -1,7 +1,10 @@
 """Per-recording files the recorder writes next to the WAV.
 
-``<stem>.live.json``         the live transcript as the window showed it, for
-                             comparison with the final transcript.
+``<stem>.live.json``         the live transcript and cards as the window showed
+                             them. Written only by ``write_live_transcript``.
+                             Read by ``live_store``: the watcher fills gaps in a
+                             partial final transcript from ``lines``, and
+                             Prompts… offers ``cards`` after the meeting.
 ``<stem>.diarization.json``  speaker names the owner confirmed in the window.
                              The watcher reads its ``roster`` before the final
                              Gemini call; ``authoritative`` drops calendar
@@ -38,8 +41,13 @@ def write_live_transcript(
     root: str | Path | None = None,
     model: str | None = None,
     recording_active: bool = True,
+    cards: Sequence[Any] = (),
 ) -> Path:
-    """Replace the live snapshot. Seconds are from the start of the recording."""
+    """Replace the live snapshot. Seconds are from the start of the recording.
+
+    ``cards`` was added after schema 1 shipped; readers treat a missing list as
+    no cards, so the schema version is unchanged.
+    """
     path = live_transcript_path(stem, root)
     payload = {
         "schema_version": 1,
@@ -57,9 +65,30 @@ def write_live_transcript(
             }
             for line in lines
         ],
+        "cards": [_card_payload(card) for card in cards],
     }
     _atomic_json(path, payload)
     return path
+
+
+def _card_payload(card: Any) -> dict[str, Any]:
+    """Clean text plus the verbatim source lines, as ``live_store`` reads them."""
+    return {
+        "key": str(getattr(card, "key", "") or ""),
+        "kind": str(getattr(card, "kind", "") or "request"),
+        "audience": str(getattr(card, "audience", "") or "all"),
+        "clean_text": str(getattr(card, "clean_text", "") or ""),
+        "verbatim_lines": [
+            {
+                "start": round(float(getattr(line, "seconds", getattr(line, "start", 0.0))), 2),
+                "speaker": str(getattr(line, "speaker", "")),
+                "text": str(getattr(line, "text", "")),
+            }
+            for line in getattr(card, "lines", ()) or ()
+        ],
+        "start": round(float(getattr(card, "start_seconds", 0.0)), 2),
+        "end": round(float(getattr(card, "end_seconds", 0.0)), 2),
+    }
 
 
 def parse_speaker_names(text: str) -> list[str]:

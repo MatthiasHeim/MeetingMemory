@@ -11,6 +11,7 @@ from .decider_policy import DECIDER_PROMPT_THRESHOLD, clip_thresholds
 from .cache import ProbabilityCache
 from .gate import judge_backend_for, load_recording_sidecar
 from .judges import CachedJudge, GeminiJudge, JevJudge, Judge
+from .live_store import saved_live_prompt_results
 from .prompts import PROMPT_THRESHOLD, PromptResult, calibrated_prompt_threshold, prompts_from_marks
 from .selection import ClipResult, select_clip
 from .transcript import Transcript, load_transcript
@@ -110,34 +111,43 @@ def prompts_for_stem(
     gemini_api_key: str | None = None,
     clean_prompt: Callable[[str], str] | None = None,
 ) -> list[PromptResult]:
-    transcript = load_transcript(stem, transcripts_root)
-    settings = load_recording_sidecar(stem, recordings_root)
-    judge = create_judge(
-        stem,
-        requested=requested_judge,
-        recordings_root=recordings_root,
-        cache_root=cache_root,
-        gemini_model=gemini_model,
-        gemini_api_key=gemini_api_key,
-        transcript_path=transcript.path,
-    )
-    # A contract-covered Gemini call is only useful here when its exact model
-    # has a threshold selected by a passing calibration. The explicitly gated
-    # Local Decider uses the threshold checked against the local reference set.
-    threshold = (
-        calibrated_prompt_threshold(judge.model)
-        if judge.backend == "gemini"
-        else DECIDER_PROMPT_THRESHOLD if judge.backend == "decider" else PROMPT_THRESHOLD
-    )
-    results = prompts_from_marks(
-        transcript.lines,
-        settings.marks,
-        judge=judge,
-        prompt_threshold=threshold,
-        channel_lag_seconds=_channel_alignment_lag_seconds(transcript.payload),
-        mic_origin_delay_seconds=settings.mic_first_sample_offset_seconds,
-    )
-    return _attach_clean_prompts(results, clean_prompt=clean_prompt, api_key=gemini_api_key)
+    live_cards = saved_live_prompt_results(stem, recordings_root)
+    try:
+        transcript = load_transcript(stem, transcripts_root)
+        settings = load_recording_sidecar(stem, recordings_root)
+        judge = create_judge(
+            stem,
+            requested=requested_judge,
+            recordings_root=recordings_root,
+            cache_root=cache_root,
+            gemini_model=gemini_model,
+            gemini_api_key=gemini_api_key,
+            transcript_path=transcript.path,
+        )
+        # A contract-covered Gemini call is only useful here when its exact model
+        # has a threshold selected by a passing calibration. The explicitly gated
+        # Local Decider uses the threshold checked against the local reference set.
+        threshold = (
+            calibrated_prompt_threshold(judge.model)
+            if judge.backend == "gemini"
+            else DECIDER_PROMPT_THRESHOLD if judge.backend == "decider" else PROMPT_THRESHOLD
+        )
+        results = prompts_from_marks(
+            transcript.lines,
+            settings.marks,
+            judge=judge,
+            prompt_threshold=threshold,
+            channel_lag_seconds=_channel_alignment_lag_seconds(transcript.payload),
+            mic_origin_delay_seconds=settings.mic_first_sample_offset_seconds,
+        )
+        results = _attach_clean_prompts(results, clean_prompt=clean_prompt, api_key=gemini_api_key)
+    except Exception:
+        # Without a final transcript, the cards saved during the meeting are
+        # still offered. With neither, the error reaches the menu as before.
+        if not live_cards:
+            raise
+        results = []
+    return list(results) + list(live_cards)
 
 
 def _attach_clean_prompts(
