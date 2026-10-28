@@ -468,3 +468,27 @@ def test_failed_pair_merge_does_not_leave_the_system_track_for_a_second_import(t
     assert (tmp / "unmerged" / "stem.sys.wav").exists()  # audio kept, out of the scan
     # The next launch finds nothing more to import for this meeting.
     assert recover_orphaned_captures(tmp, recordings, notify=lambda _p: None) == []
+
+
+def test_stale_orphans_are_held_back_and_fresh_ones_still_reach_recordings(tmp_path):
+    from meeting_recorder import STALE_ORPHAN_SECONDS, recover_orphaned_captures
+    from mic_writer import IncrementalWavWriter
+
+    tmp = tmp_path / "tmp"
+    recordings = tmp_path / "Recordings"
+    tmp.mkdir()
+    recordings.mkdir()
+    now = 2_000_000_000.0
+    for stem, age in (("old", STALE_ORPHAN_SECONDS + 60), ("fresh", 600)):
+        path = tmp / f"{stem}.mic.wav"
+        writer = IncrementalWavWriter(path, 16000, channels=1, checkpoint_seconds=1.0)
+        writer.write(np.full((16000, 1), 5, dtype=np.int16))
+        writer.close()
+        os.utime(path, (now - age, now - age))
+
+    recovered = recover_orphaned_captures(tmp, recordings, notify=lambda _p: None, now=now)
+
+    hold = tmp_path / "Recovered-hold"
+    assert sorted(recovered) == sorted([recordings / "fresh.wav", hold / "old.wav"])
+    assert not (recordings / "old.wav").exists()  # the watcher never sees it
+    assert list(tmp.glob("*.mic.wav")) == []
