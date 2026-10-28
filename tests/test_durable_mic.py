@@ -116,16 +116,16 @@ def test_clean_stop_duration_matches_wall_clock(tmp_path):
     block_n = rate // 10
     block = np.full((block_n, 1), 400, dtype=np.int16)
     clock = _Clock()
-    started = time.monotonic()
     for _ in range(20):
         recorder._audio_callback(block, block_n, clock.info(), None)
         clock.t += 0.1
         time.sleep(0.1)
-    elapsed = time.monotonic() - started
     recorder._finish_mic_writer()
     duration = wav_duration_seconds(recorder._mic_wav)
+    # Duration follows the sample clock (20 blocks of 0.1 s). Comparing it with
+    # this loop's own wall time measured the CI runner, not the writer: a slow
+    # runner took 2.7 s for the same 2.0 s of audio.
     assert duration == pytest.approx(2.0, abs=0.001)
-    assert duration == pytest.approx(elapsed, abs=0.35)
     assert duration == pytest.approx(recorder._mic_frames / rate, abs=0.001)
     pcm, _rate = recover_wav(recorder._mic_wav)
     assert int(pcm[0, 0]) == 400
