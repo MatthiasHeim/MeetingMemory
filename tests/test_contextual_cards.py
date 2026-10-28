@@ -175,16 +175,18 @@ def test_short_transcription_schedule_does_not_add_network_time_to_interval():
             time.sleep(.20)
             return []
     # Starts every interval (gap .30), not interval + work (gap .50). The
-    # ceiling sits between the two with room for CI scheduler jitter: at
-    # .14/.08/.20 a slow runner measured .214 and failed a correct schedule.
+    # schedule is deadline-based, so a bug would lengthen EVERY gap; a macOS CI
+    # runner waking one timer late lengthens one (seen: .50 once, .214 at
+    # .14/.08). Judge the median of several gaps, not the single largest.
     engine=LiveEngine(snapshot=lambda _:TailSnapshot(np.zeros(16),16000,None,16000,0,5),
                       transcriber=Transcriber(), interval=.30)
     engine.start()
-    deadline=time.monotonic()+4
-    while len(starts)<3 and time.monotonic()<deadline: time.sleep(.01)
+    deadline=time.monotonic()+6
+    while len(starts)<6 and time.monotonic()<deadline: time.sleep(.01)
     engine.retire(); engine._thread.join(2)
-    assert len(starts)>=3
-    assert max(b-a for a,b in zip(starts,starts[1:])) < .42
+    assert len(starts)>=6
+    gaps=sorted(b-a for a,b in zip(starts,starts[1:]))
+    assert gaps[len(gaps)//2] < .42
 
 
 def test_suggestions_require_valid_source_ids_and_copy_as_suggestions():
