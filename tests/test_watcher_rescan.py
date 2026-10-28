@@ -239,3 +239,68 @@ def test_notify_telegram_failure_not_suppressed_for_first_attempt(monkeypatch):
     monkeypatch.setattr(tw.TranscribeWatcher, "_telegram_notify_script", staticmethod(lambda: None))
     w._notify_telegram_failure(Path("/tmp/rec.wav"), "boom")
     assert any("telegram_notify.py not found" in msg for level, msg in w.logger.lines if level == "warning")
+
+
+# ── no duplicate transcription of the same recording (sources 1383/1384) ──
+
+
+def test_queue_add_ignores_file_already_queued(tmp_path):
+    q = tw.TranscriptionQueue(_StubLogger())
+    wav = _make_wav(tmp_path)
+    assert q.add(wav) is True
+    assert q.add(wav) is False
+    assert q.get() == wav
+    assert q.is_empty()
+    assert q.add(wav) is True  # dequeued and not active: may be queued again
+
+
+def test_queue_add_ignores_file_being_processed(tmp_path):
+    q = tw.TranscriptionQueue(_StubLogger())
+    wav = _make_wav(tmp_path)
+    q.add(wav)
+    q.current_file = q.get()
+    assert q.add(wav) is False
+    q.current_file = None
+    assert q.add(wav) is True
+
+
+def test_rescan_skips_in_flight_wav_without_spending_an_attempt(tmp_path):
+    wav = _make_wav(tmp_path)
+    w = _bare_watcher(tmp_path)
+    w.queue.current_file = wav  # long Gemini run in progress, no JSON yet
+    w._rescan_unprocessed_wavs(now=1_000_000.0)
+    assert w.queue.is_empty()
+    assert "rec" not in w._rescan_state
+
+
+def test_rescan_skips_wav_still_waiting_in_queue(tmp_path):
+    wav = _make_wav(tmp_path)
+    w = _bare_watcher(tmp_path)
+    w.queue.add(wav)  # live watcher queued it; it waits behind another meeting
+    w._rescan_unprocessed_wavs(now=1_000_000.0)
+    assert w.queue.get() == wav
+    assert w.queue.is_empty()
+    assert "rec" not in w._rescan_state
+
+
+def test_process_queue_skips_job_whose_output_appeared_meanwhile(tmp_path):
+    wav = _make_wav(tmp_path)
+    w = _bare_watcher(tmp_path)
+    ran = []
+    w._process_with_gemini = lambda f: ran.append(f)
+    w.queue.add(wav)
+    (tmp_path / "rec.json").write_text("{}")  # an earlier job finished first
+    w._process_queue()
+    assert ran == []
+    assert w.queue.current_file is None
+
+
+def test_process_queue_still_runs_a_job_without_output(tmp_path):
+    wav = _make_wav(tmp_path)
+    w = _bare_watcher(tmp_path)
+    ran = []
+    w._process_with_gemini = lambda f: ran.append(f)
+    w.queue.add(wav)
+    w._process_queue()
+    assert ran == [wav]
+    assert w.queue.current_file is None

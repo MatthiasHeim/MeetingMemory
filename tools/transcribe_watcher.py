@@ -507,25 +507,57 @@ def html_to_text(html_content: str) -> str:
 
 
 class TranscriptionQueue:
-    """Thread-safe queue for managing transcription jobs."""
+    """Thread-safe queue for managing transcription jobs.
+
+    A recording is queued at most once at a time. Without this, the periodic
+    rescan re-queued a WAV whose (20+ minute) Gemini run was still in
+    progress, because "no JSON yet" looks the same as "failed": the second
+    job ran right after the first and the recording landed in InsightBase
+    twice (sources 1383/1384, 2026-10-28).
+    """
 
     def __init__(self, logger: logging.Logger):
         self.queue = queue.Queue()
         self.processing = False
         self.current_file: Optional[Path] = None
         self.logger = logger
+        self._pending: set[str] = set()
+        self._lock = threading.Lock()
 
-    def add(self, audio_file: Path):
-        """Add a file to the transcription queue."""
+    @staticmethod
+    def _key(audio_file: Path) -> str:
+        return str(Path(audio_file).resolve())
+
+    def is_queued_or_active(self, audio_file: Path) -> bool:
+        """True while the file waits in the queue or is being processed."""
+        key = self._key(audio_file)
+        with self._lock:
+            if key in self._pending:
+                return True
+        current = self.current_file
+        return current is not None and self._key(current) == key
+
+    def add(self, audio_file: Path) -> bool:
+        """Add a file to the transcription queue unless it is already queued
+        or being processed. Returns True when it was queued."""
+        if self.is_queued_or_active(audio_file):
+            self.logger.info(f"Already queued or in progress, not re-queued: {audio_file.name}")
+            return False
+        with self._lock:
+            self._pending.add(self._key(audio_file))
         self.queue.put(audio_file)
         self.logger.info(f"Queued for transcription: {audio_file.name}")
+        return True
 
     def get(self) -> Optional[Path]:
         """Get next file from queue, non-blocking."""
         try:
-            return self.queue.get_nowait()
+            audio_file = self.queue.get_nowait()
         except queue.Empty:
             return None
+        with self._lock:
+            self._pending.discard(self._key(audio_file))
+        return audio_file
 
     def is_empty(self) -> bool:
         return self.queue.empty()
@@ -827,6 +859,10 @@ class TranscribeWatcher:
                 continue
             if not self._wav_needs_processing(wav_file):
                 continue
+            # A long run has no JSON yet either; that is not a failure, so it
+            # neither re-queues nor spends one of the file's retry attempts.
+            if self.queue.is_queued_or_active(wav_file):
+                continue
 
             stem = wav_file.stem
             entry = state.get(stem, {"attempts": 0, "last_attempt_ts": 0.0, "gave_up": False})
@@ -866,6 +902,12 @@ class TranscribeWatcher:
         """Process the next file in the queue based on processing mode."""
         audio_file = self.queue.get()
         if audio_file is None:
+            return
+        # The output may have appeared while this job waited (an earlier job
+        # for the same recording finished). Transcribing again would insert a
+        # second InsightBase source for the same meeting.
+        if not self._wav_needs_processing(audio_file):
+            self.logger.info(f"Skipping {audio_file.name}: transcript already exists")
             return
 
         self.queue.current_file = audio_file
