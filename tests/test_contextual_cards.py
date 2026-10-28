@@ -172,16 +172,19 @@ def test_short_transcription_schedule_does_not_add_network_time_to_interval():
     class Transcriber:
         def transcribe_tails(self,*args):
             starts.append(time.monotonic())
-            time.sleep(.08)
+            time.sleep(.20)
             return []
+    # Starts every interval (gap .30), not interval + work (gap .50). The
+    # ceiling sits between the two with room for CI scheduler jitter: at
+    # .14/.08/.20 a slow runner measured .214 and failed a correct schedule.
     engine=LiveEngine(snapshot=lambda _:TailSnapshot(np.zeros(16),16000,None,16000,0,5),
-                      transcriber=Transcriber(), interval=.14)
+                      transcriber=Transcriber(), interval=.30)
     engine.start()
-    deadline=time.monotonic()+2
+    deadline=time.monotonic()+4
     while len(starts)<3 and time.monotonic()<deadline: time.sleep(.01)
-    engine.retire(); engine._thread.join(1)
+    engine.retire(); engine._thread.join(2)
     assert len(starts)>=3
-    assert max(b-a for a,b in zip(starts,starts[1:])) < .20
+    assert max(b-a for a,b in zip(starts,starts[1:])) < .42
 
 
 def test_suggestions_require_valid_source_ids_and_copy_as_suggestions():
