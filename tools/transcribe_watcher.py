@@ -1837,8 +1837,13 @@ class TranscribeWatcher:
           - config.yaml: diarization.roster: ["Name", {name, company, role}]
           - per-recording sidecar: <recording>.diarization.json with
             {"roster": [...]} or {"attendees": [...]}
+
+        ``"authoritative": true`` (written when the owner confirms names in
+        the recorder window) keeps only calendar invitees named in the
+        roster, plus the owner, so an absent invitee is not offered as a voice.
         """
         roster_items = []
+        authoritative = False
         cfg = self.config.get("diarization", {}) or {}
         roster_items.extend(cfg.get("roster") or [])
 
@@ -1848,9 +1853,9 @@ class TranscribeWatcher:
                 with open(sidecar, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    roster_items.extend(
-                        data.get("roster") or data.get("attendees") or []
-                    )
+                    sidecar_roster = data.get("roster") or data.get("attendees") or []
+                    roster_items.extend(sidecar_roster)
+                    authoritative = data.get("authoritative") is True and bool(sidecar_roster)
             except Exception as e:
                 self.logger.warning(
                     f"Diarization sidecar roster unreadable "
@@ -1861,6 +1866,24 @@ class TranscribeWatcher:
             return known_attendees
 
         merged = list(known_attendees or [])
+        if authoritative:
+            confirmed = {
+                ((item.get("name") if isinstance(item, dict) else item) or "").strip().lower()
+                for item in roster_items
+            }
+            kept = [
+                p for p in merged
+                if isinstance(p, dict) and (
+                    (p.get("role") or "").lower() == "self"
+                    or (p.get("name") or "").strip().lower() in confirmed
+                )
+            ]
+            if len(kept) != len(merged):
+                self.logger.info(
+                    f"Recorder-confirmed roster dropped {len(merged) - len(kept)} "
+                    f"calendar invitee(s) not named in {sidecar.name}"
+                )
+            merged = kept
         existing = {
             (p.get("name") or "").strip().lower()
             for p in merged

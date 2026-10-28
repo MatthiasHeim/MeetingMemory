@@ -1,3 +1,5 @@
+> **2026-10-10:** The former Jev route now uses local Perplexity Decider, including the enabled recorder preference. See [local-decider.md](local-decider.md) for current setup, tests and model-specific thresholds. Earlier Jev/Gemini calibration notes below are historical.
+
 # Meeting sidecar
 
 Status on 2026-09-28: Slice 1 is the finished-transcript clerk. Slice 2 adds a

@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .decider_policy import DECIDER_PROMPT_THRESHOLD, clip_thresholds
 from .cache import ProbabilityCache
 from .gate import judge_backend_for, load_recording_sidecar
 from .judges import CachedJudge, GeminiJudge, JevJudge, Judge
@@ -41,7 +42,7 @@ def create_judge(
     """Resolve the gate before constructing an optional Jev client.
 
     The order here is intentional and testable: a denied Jev choice never even
-    creates a Jev adapter, so no OpenRouter-capable object exists on that path.
+    creates a Jev adapter, so no model client is created on that path.
     """
     backend = judge_backend_for(
         stem,
@@ -68,7 +69,8 @@ def clip_for_transcript(
     timestamps: bool = True,
 ) -> ClipResult:
     probabilities = judge.judge(transcript.lines, {"relevant": relevance_question(topic)})["relevant"]
-    return select_clip(transcript.lines, probabilities, widen=widen, timestamps=timestamps)
+    return select_clip(transcript.lines, probabilities, widen=widen, timestamps=timestamps,
+                       **clip_thresholds(judge.backend, widen=widen))
 
 
 def clip_for_stem(
@@ -121,11 +123,11 @@ def prompts_for_stem(
     )
     # A contract-covered Gemini call is only useful here when its exact model
     # has a threshold selected by a passing calibration. The explicitly gated
-    # Jev path retains the historical baseline threshold.
+    # Local Decider uses the threshold checked against the local reference set.
     threshold = (
         calibrated_prompt_threshold(judge.model)
         if judge.backend == "gemini"
-        else PROMPT_THRESHOLD
+        else DECIDER_PROMPT_THRESHOLD if judge.backend == "decider" else PROMPT_THRESHOLD
     )
     results = prompts_from_marks(
         transcript.lines,

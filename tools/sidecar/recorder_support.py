@@ -175,7 +175,7 @@ PREFERENCE_FILENAME = "sidecar-preferences.json"
 
 
 def preference_path(config_path: str | Path) -> Path:
-    """Store the Jev switch beside the recorder config, not inside it.
+    """Store the local Decider switch (legacy use_jev remains readable) beside the recorder config, not inside it.
 
     Rewriting ``config.yaml`` would drop comments. The switch is a separate
     JSON file so the default stays off until Matthias turns it on.
@@ -192,7 +192,7 @@ def jev_preference_enabled(config_path: str | Path | None) -> bool:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeError):
         return False
-    return isinstance(raw, dict) and raw.get("use_jev") is True
+    return isinstance(raw, dict) and raw.get("use_decider", raw.get("use_jev")) is True
 
 
 def write_jev_preference(config_path: str | Path, enabled: bool) -> Path:
@@ -202,7 +202,7 @@ def write_jev_preference(config_path: str | Path, enabled: bool) -> Path:
     path = preference_path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"use_jev": enabled}, indent=2, sort_keys=True) + "\n",
+        json.dumps({"use_decider": enabled}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return path

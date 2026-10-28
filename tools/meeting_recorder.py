@@ -27,7 +27,7 @@ import soundfile as sf
 import rumps
 
 from capture_provenance import archive_capture, merge_filter
-from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar
+from sidecar.gate import amend_recording_sidecar, initialise_recording_sidecar, load_recording_sidecar
 from sidecar.recorder_support import (
     CalendarRecordingContext,
     append_prompt_mark,
@@ -37,6 +37,7 @@ from sidecar.recorder_support import (
     sidecar_metadata_from_calendar,
     write_jev_preference,
 )
+from sidecar.recording_files import calendar_speaker_names, diarization_path, parse_speaker_names, write_speaker_names
 from sidecar.service import clip_for_stem, prompts_for_stem
 from sidecar.transcript import format_timestamp, recent_transcripts
 
@@ -460,18 +461,20 @@ class MeetingRecorderApp(rumps.App):
     def _build_menu(self):
         """Build the menu bar menu."""
         self._start_stop_item = rumps.MenuItem("Start Recording", callback=self.toggle_recording)
-        self._prompt_mark_item = rumps.MenuItem("Prompt markieren", callback=None)
-        self._clip_item = rumps.MenuItem("Clip…", callback=self.copy_clip)
-        self._prompts_item = rumps.MenuItem("Prompts…", callback=self.copy_prompt)
-        self._live_panel_item = rumps.MenuItem("Live-Fenster anzeigen", callback=self.show_live_panel)
-        self._devices_item = rumps.MenuItem("List Audio Devices", callback=self.list_devices)
-        self._jev_pref_item = rumps.MenuItem("Jev verwenden", callback=self.toggle_jev_preference)
+        self._prompt_mark_item = rumps.MenuItem("Prompt-Stelle markieren", callback=None)
+        self._clip_item = rumps.MenuItem("Themenauszug kopieren …", callback=self.copy_clip)
+        self._prompts_item = rumps.MenuItem("Diktierte Aufgaben kopieren …", callback=self.copy_prompt)
+        self._live_panel_item = rumps.MenuItem("Recorder-Fenster öffnen", callback=self.show_live_panel)
+        self._recorder_help_item = rumps.MenuItem("Recorder-Hilfe", callback=self.show_recorder_help)
+        self._devices_item = rumps.MenuItem("Audioeingänge anzeigen", callback=self.list_devices)
+        self._jev_pref_item = rumps.MenuItem("Decider lokal verwenden", callback=self.toggle_jev_preference)
         self.menu = [
             self._start_stop_item,
             self._prompt_mark_item,
             self._clip_item,
             self._prompts_item,
             self._live_panel_item,
+            self._recorder_help_item,
             None,  # Separator
             rumps.MenuItem("Open Recordings Folder", callback=self.open_recordings),
             rumps.MenuItem("Open Transcripts Folder", callback=self.open_transcripts),
@@ -483,6 +486,12 @@ class MeetingRecorderApp(rumps.App):
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self._sync_jev_menu_state()
+        from sidecar.panel_layout import MENU_HELP, set_menu_help
+        for name, key in (("_start_stop_item", "start"), ("_prompt_mark_item", "mark"),
+                          ("_clip_item", "clip"), ("_prompts_item", "prompts"),
+                          ("_live_panel_item", "window"), ("_recorder_help_item", "help"),
+                          ("_jev_pref_item", "decider"), ("_devices_item", "devices")):
+            set_menu_help(getattr(self, name), MENU_HELP[key])
 
     def _set_prompt_mark_available(self, available: bool) -> None:
         """Enable marking only while there is a persisted recording identity."""
@@ -559,16 +568,17 @@ class MeetingRecorderApp(rumps.App):
 
         The existing resolver keys its lookup from the timestamped filename;
         it does not need a completed transcript. Any lookup failure is an
-        unresolved meeting and is persisted fail-closed for the Jev gate.
+        unresolved meeting and is persisted fail-closed for the Decider gate.
         """
         try:
             from calendar_resolve import resolve
 
-            return calendar_context_from_resolution(
-                resolve(output_file.with_suffix(".json"), timeout_seconds=timeout_seconds)
-            )
+            resolution = resolve(output_file.with_suffix(".json"), timeout_seconds=timeout_seconds)
+            self._calendar_speaker_proposals = getattr(self, "_calendar_speaker_proposals", {})
+            self._calendar_speaker_proposals[output_file.stem] = calendar_speaker_names(resolution)
+            return calendar_context_from_resolution(resolution)
         except Exception as exc:
-            print(f"Calendar lookup unavailable for Jev gate: {exc}", file=sys.stderr)
+            print(f"Calendar lookup unavailable for Decider gate: {exc}", file=sys.stderr)
             return CalendarRecordingContext(external_attendees=None, attendance_resolved=False)
 
     def _jev_preference(self) -> bool:
@@ -582,17 +592,17 @@ class MeetingRecorderApp(rumps.App):
         try:
             item.state = 1 if self._jev_preference() else 0
         except Exception as exc:
-            print(f"Could not show Jev preference state: {exc}", file=sys.stderr)
+            print(f"Could not show Decider preference state: {exc}", file=sys.stderr)
 
     def toggle_jev_preference(self, sender):
-        """Flip the Jev switch. This is not shown when a recording starts."""
+        """Flip the local Decider switch. This is not shown when a recording starts."""
         enabled = not self._jev_preference()
         try:
             write_jev_preference(self.config_path, enabled)
         except Exception as exc:
             rumps.notification(
                 title="MeetingRecorder",
-                subtitle="Jev verwenden",
+                subtitle="Decider lokal verwenden",
                 message=f"Die Einstellung konnte nicht gespeichert werden: {exc}",
             )
             return
@@ -660,8 +670,8 @@ class MeetingRecorderApp(rumps.App):
             self._sidecar_write_failed(timestamp, exc)
 
     def _sidecar_write_failed(self, stem: str, exc: Exception) -> None:
-        """Keep recording and permanently force Gemini after any write failure."""
-        print(f"Sidecar write failed for {stem}; Jev forced off: {exc}", file=sys.stderr)
+        """Keep recording and disable the optional decision route after any write failure."""
+        print(f"Sidecar write failed for {stem}; Decider forced off: {exc}", file=sys.stderr)
         failures = getattr(self, "_sidecar_write_failed_stems", None)
         if failures is None:
             failures = set()
@@ -681,7 +691,7 @@ class MeetingRecorderApp(rumps.App):
         try:
             self._notify_from_worker(
                 subtitle="Sidecar nicht gespeichert",
-                message="Die Aufnahme läuft weiter; Jev bleibt ausgeschaltet.",
+                message="Die Aufnahme läuft weiter; Decider bleibt ausgeschaltet.",
             )
         except Exception as notify_exc:
             print(f"Sidecar failure notification failed: {notify_exc}", file=sys.stderr)
@@ -703,7 +713,7 @@ class MeetingRecorderApp(rumps.App):
             self._sidecar_write_failed(stem, exc)
 
     def _close_previous_live_session(self) -> None:
-        """Stop the previous worker and close its panel before a new recording."""
+        """Retire the old session while preserving the shared window and view."""
         session = getattr(self, "_live_session", None)
         if session is None:
             return
@@ -714,12 +724,20 @@ class MeetingRecorderApp(rumps.App):
             except Exception as exc:
                 print(f"Previous live sidecar stop failed: {exc}", file=sys.stderr)
         panel = getattr(session, "panel", None)
-        closer = getattr(panel, "close", None) if panel is not None else None
+        shared = panel is not None and panel is getattr(self, "_recorder_panel", None)
+        if shared:
+            # Detach before the next session reuses the panel. Queued old UI
+            # dispatches are additionally fenced by LivePanel.reset_session.
+            session.panel = None
+        closer = getattr(panel, "close", None) if panel is not None and not shared else None
         if callable(closer):
             try:
                 closer()
             except Exception as exc:
                 print(f"Previous live panel close failed: {exc}", file=sys.stderr)
+        retire = getattr(session, "retire", None)
+        if callable(retire):
+            retire()
         self._live_session = None
 
     def _notify_live_unavailable(self, message: str) -> None:
@@ -754,8 +772,14 @@ class MeetingRecorderApp(rumps.App):
                     api_key=self._gemini_api_key(),
                     copy_text=self._copy_to_clipboard,
                     on_unavailable=self._notify_live_unavailable,
+                    decision_stem=self._recording_stem if self._jev_preference() else None,
+                    recordings_root=self.recordings_dir,
+                    panel=self._ensure_recorder_panel(),
+                    stem=self._recording_stem,
                 )
                 self._live_session.start()
+                stem = self._recording_stem
+                self._live_session.panel.set_speakers_callback(lambda text: self._save_speakers(stem, text))
             else:
                 self._live_session = factory(self)
                 start = getattr(self._live_session, "start", None)
@@ -769,6 +793,10 @@ class MeetingRecorderApp(rumps.App):
 
     def _set_modal_menu_enabled(self, enabled: bool) -> None:
         """Clip, Prompts, and device list open modals. They stay off while recording."""
+        from sidecar.panel_layout import MENU_HELP, set_menu_help
+        start_item = getattr(self, "_start_stop_item", None)
+        if start_item is not None:
+            set_menu_help(start_item, MENU_HELP["start" if enabled else "stop"])
         for name, callback in (
             ("_clip_item", self.copy_clip),
             ("_prompts_item", self.copy_prompt),
@@ -794,16 +822,32 @@ class MeetingRecorderApp(rumps.App):
         except Exception as exc:
             print(f"Could not show the live panel: {exc}", file=sys.stderr)
 
+    def _ensure_recorder_panel(self):
+        panel = getattr(self, "_recorder_panel", None)
+        if panel is None:
+            from sidecar.live_window import LivePanel
+            factory = getattr(self, "_recorder_panel_factory", LivePanel)
+            def copy_clip(topic):
+                session = getattr(self, "_live_session", None)
+                if session is not None:
+                    session.copy_clip(topic)
+            panel = factory(on_copy_clip=copy_clip, on_copy_card=self._copy_to_clipboard,
+                            on_toggle_recording=lambda: self.toggle_recording(self._start_stop_item))
+            self._recorder_panel = panel
+        return panel
+
     def show_live_panel(self, _sender=None) -> None:
-        """Menu action: bring back a hidden live panel."""
+        """Open before capture, or restore the same session after closing."""
         session = getattr(self, "_live_session", None)
-        if getattr(session, "panel", None) is None:
-            self._notify_from_worker(
-                subtitle="Kein Live-Fenster",
-                message="Das Live-Fenster erscheint mit der nächsten Aufnahme.",
-            )
-            return
-        self._reveal_live_panel()
+        panel = getattr(session, "panel", None)
+        if panel is None:
+            panel = self._ensure_recorder_panel()
+            panel.set_recording_state("recording" if self._recording_blocks_modals() else "idle")
+        panel.show()
+        panel.order_front()
+
+    def show_recorder_help(self, _sender=None) -> None:
+        self._ensure_recorder_panel().show_help()
 
     def _run_window(self, **kwargs):
         """Modal text prompt. Never while recording; activate the app first otherwise."""
@@ -857,6 +901,29 @@ class MeetingRecorderApp(rumps.App):
             )
         except Exception as exc:
             self._sidecar_write_failed(stem, exc)
+        self._propose_calendar_speakers(stem)
+
+    def _propose_calendar_speakers(self, stem: str) -> None:
+        """Prefill the Teilnehmende field from the invite; only Enter saves it."""
+        names = getattr(self, "_calendar_speaker_proposals", {}).pop(stem, [])
+        session = getattr(self, "_live_session", None)
+        panel = getattr(session, "panel", None) if session is not None else None
+        if not names or panel is None or stem != self._recording_stem:
+            return
+        if diarization_path(stem, self.recordings_dir).exists():
+            return
+        try:
+            panel.set_speakers(", ".join(names), proposed=True)
+        except Exception as exc:
+            print(f"Could not propose calendar speakers: {exc}", file=sys.stderr)
+
+    def _save_speakers(self, stem: str | None, text: str) -> str:
+        """Persist confirmed names for the final transcript of this recording."""
+        if stem is None:
+            return "Keine Aufnahme aktiv; Teilnehmende nicht gespeichert."
+        names = parse_speaker_names(text)
+        write_speaker_names(stem, names, root=self.recordings_dir)
+        return f"Teilnehmende gespeichert ({len(names)}). Das finale Transkript verwendet diese Namen."
 
     def _stop_recording(self, sender):
         """Stop the current recording. The live window stays open."""
@@ -1054,6 +1121,9 @@ class MeetingRecorderApp(rumps.App):
                     topic,
                     transcripts_root=self.transcripts_dir,
                     recordings_root=self.recordings_dir,
+                    requested_judge=("decider" if self._jev_preference() and load_recording_sidecar(
+                        transcript.stem, self.recordings_dir
+                    ).jev else None),
                     gemini_api_key=self._gemini_api_key(),
                 )
                 self._copy_to_clipboard(clip.text)
@@ -1092,6 +1162,9 @@ class MeetingRecorderApp(rumps.App):
                     transcript.stem,
                     transcripts_root=self.transcripts_dir,
                     recordings_root=self.recordings_dir,
+                    requested_judge=("decider" if self._jev_preference() and load_recording_sidecar(
+                        transcript.stem, self.recordings_dir
+                    ).jev else None),
                     gemini_api_key=self._gemini_api_key(),
                 )
             except Exception as exc:

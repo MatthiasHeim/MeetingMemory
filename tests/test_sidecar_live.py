@@ -310,7 +310,7 @@ def test_panel_close_button_hides_and_menu_brings_it_back(monkeypatch):
             panel.panel.close()
 
 
-def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
+def test_show_live_panel_menu_restores_or_opens_idle_panel(monkeypatch):
     import importlib
     import types
 
@@ -333,6 +333,12 @@ def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
         shown: list[str] = []
 
         class Panel:
+            def set_recording_state(self, state):
+                pass
+
+            def show(self):
+                pass
+
             def order_front(self):
                 shown.append("front")
 
@@ -342,9 +348,10 @@ def test_show_live_panel_menu_reveals_or_explains(monkeypatch):
         assert notes == []
 
         app._live_session = None
+        app._ensure_recorder_panel = lambda: Panel()
         app.show_live_panel()
-        assert shown == ["front"]
-        assert notes == ["Das Live-Fenster erscheint mit der nächsten Aufnahme."]
+        assert shown == ["front", "front"]
+        assert notes == []
     finally:
         if previous is not None:
             sys.modules["meeting_recorder"] = previous
@@ -524,6 +531,7 @@ def test_prompt_opening_stays_with_its_continuation_on_one_card():
             return {name: scores for name in questions}
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -574,6 +582,7 @@ def test_cut_off_instruction_stays_with_the_later_prompt_line():
             return {name: scores for name in questions}
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -671,6 +680,7 @@ def test_clean_prompt_retries_only_while_empty_and_stops_at_three():
             return {name: [0.99] * len(lines) for name in questions}
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -692,6 +702,7 @@ def test_clean_prompt_retries_only_while_empty_and_stops_at_three():
         return " Implement the plan. "
 
     engine = LiveEngine(
+        synchronous_prompts=True,
         snapshot=lambda _tail: None,
         transcriber=Transcriber(),
         judge=Judge(),
@@ -805,10 +816,10 @@ def test_live_clients_are_built_on_the_worker_not_at_start(monkeypatch):
     session.start()
     assert time.perf_counter() - started < 0.3
     deadline = time.perf_counter() + 2
-    while len(calls) < 3 and time.perf_counter() < deadline:
+    while len(calls) < 2 and time.perf_counter() < deadline:
         time.sleep(0.01)
     session.stop()
-    assert len(calls) >= 3
+    assert len(calls) == 2  # categorical cards do not load the old binary cutoff
     assert threading.main_thread().ident not in calls
 
 
@@ -883,7 +894,7 @@ def test_recording_menu_cannot_open_a_modal(monkeypatch):
         app.recorder = Recorder()
         app._build_menu()
         app._set_modal_menu_enabled(False)
-        modal_titles = {"Clip…", "Prompts…", "List Audio Devices"}
+        modal_titles = {"Themenauszug kopieren …", "Diktierte Aufgaben kopieren …", "Audioeingänge anzeigen"}
         for item in app.menu:
             if item is None or item.title not in modal_titles:
                 continue
@@ -1001,3 +1012,28 @@ def test_new_start_closes_the_previous_panel_and_a_failed_start_notifies(monkeyp
             sys.modules["meeting_recorder"] = previous
         else:
             sys.modules.pop("meeting_recorder", None)
+
+
+def test_panel_copies_full_transcript_during_and_after_recording(monkeypatch):
+    from sidecar import live_window
+    from sidecar.live import LiveLine
+
+    monkeypatch.setattr(live_window, "_dispatch_main", lambda callback: callback())
+    copied = []
+    monkeypatch.setattr(live_window.threading, "Thread",
+                        lambda target, args, **_kw: type("T", (), {"start": lambda self: target(*args)})())
+    panel = LivePanel(on_copy_clip=lambda _topic: None, on_copy_card=copied.append)
+    try:
+        panel.show()
+        panel.set_recording_state("recording")
+        assert not panel._copy_transcript_button.isEnabled()
+        panel.apply_update([LiveLine(0, 3, "Ich", "Hallo."), LiveLine(4, 8, "Andere", "Weiter", provisional=True)], (), "")
+        assert panel._copy_transcript_button.isEnabled()
+        panel.set_recording_state("stopped")
+        panel.copy_transcript()
+        assert copied == ["[00:00] Ich\nHallo.\n\n[00:04] Andere\nWeiter"]
+        assert "kopiert" in str(panel.status_field.stringValue())
+    finally:
+        if panel.panel is not None:
+            panel.panel.orderOut_(None)
+            panel.panel.close()

@@ -21,7 +21,7 @@ from .transcript import recordings_dir, safe_stem
 
 
 class JudgeGateError(PermissionError):
-    """A caller asked for Jev without the recording's explicit opt-in."""
+    """A caller asked for Decider without the recording's explicit opt-in."""
 
 
 @dataclass(frozen=True)
@@ -321,7 +321,7 @@ def _authoritative_sidecar_path(stem: str, root: str | Path | None) -> Path:
     """Return a regular, non-symlinked sidecar eligible to authorize Jev."""
     if root is None and os.environ.get("MEETING_SIDECAR_RECORDINGS_DIR"):
         raise JudgeGateError(
-            "Jev refuses a recordings directory supplied through MEETING_SIDECAR_RECORDINGS_DIR"
+            "Decider refuses a recordings directory supplied through MEETING_SIDECAR_RECORDINGS_DIR"
         )
     root_path = recordings_dir(root)
     path = root_path / f"{safe_stem(stem)}.sidecar.json"
@@ -330,11 +330,11 @@ def _authoritative_sidecar_path(stem: str, root: str | Path | None) -> Path:
         link_status = path.lstat()
         resolved_path = path.resolve(strict=True)
     except OSError as exc:
-        raise JudgeGateError("Jev requires a readable local recording sidecar") from exc
+        raise JudgeGateError("Decider requires a readable local recording sidecar") from exc
     if stat.S_ISLNK(link_status.st_mode) or not stat.S_ISREG(link_status.st_mode):
-        raise JudgeGateError("Jev requires a regular, non-symlinked recording sidecar")
+        raise JudgeGateError("Decider requires a regular, non-symlinked recording sidecar")
     if resolved_path.parent != resolved_root:
-        raise JudgeGateError("Jev sidecar is not inside the recordings root")
+        raise JudgeGateError("Decider sidecar is not inside the recordings root")
     return path
 
 
@@ -343,7 +343,7 @@ def _require_same_transcript_stem(stem: str, transcript_path: str | Path | None)
         return
     path = Path(transcript_path)
     if path.suffix != ".json" or path.stem != safe_stem(stem):
-        raise JudgeGateError("Jev sidecar stem does not match the finished transcript")
+        raise JudgeGateError("Decider sidecar stem does not match the finished transcript")
 
 
 def judge_backend_for(
@@ -355,14 +355,14 @@ def judge_backend_for(
 ) -> str:
     """Choose the only permitted judge backend for a completed recording.
 
-    Gemini is always the default. ``--judge jev`` is an offline override and
+    Gemini is the default when no choice is supplied. ``decider`` (or legacy ``jev``)
     succeeds only when this exact recording persisted an explicit ``jev: true``
     choice from the Preferences switch. External attendance does not withdraw
     that choice. A missing or corrupt JSON is indistinguishable from opt-out.
     """
     normalised = (requested or "gemini").lower()
-    if normalised not in {"gemini", "jev"}:
-        raise ValueError("judge must be 'gemini' or 'jev'")
+    if normalised not in {"gemini", "jev", "decider"}:
+        raise ValueError("judge must be 'gemini' or 'decider' (legacy 'jev' alias accepted)")
     if normalised == "gemini":
         return "gemini"
     stem = safe_stem(stem)
@@ -370,20 +370,20 @@ def judge_backend_for(
     _authoritative_sidecar_path(stem, recordings_root)
     record = load_recording_sidecar(stem, recordings_root)
     if not record.payload or record.payload.get("recording_stem") != stem:
-        raise JudgeGateError("Jev requires a sidecar bound to this recording stem")
+        raise JudgeGateError("Decider requires a sidecar bound to this recording stem")
     raw_external = record.payload.get("external_attendees", _UNSET)
     if raw_external is _UNSET or (raw_external is not None and type(raw_external) is not bool):
         raise JudgeGateError(
-            "Jev requires an explicit tri-state attendance field"
+            "Decider requires an explicit tri-state attendance field"
         )
     if not record.jev:
         raise JudgeGateError(
-            "Jev is disabled for this recording; use Gemini or record an explicit jev: true choice"
+            "Decider is disabled for this recording; use Gemini or record an explicit jev: true choice"
         )
     # 2026-09-28: the Preferences switch is the authority. A stored ``jev: true``
     # authorises Jev for this recording. External attendance stays metadata;
     # it no longer needs a separate acknowledgement.
-    return "jev"
+    return normalised
 
 
 def append_jev_audit_record(
@@ -393,18 +393,20 @@ def append_jev_audit_record(
     *,
     audit_root: str | Path | None = None,
 ) -> Path:
-    """Append an audit-only Jev use record without transcript/request text.
+    """Append an audit-only Decider use record without transcript/request text.
 
     The record is written before helper invocation.  If it cannot be made
-    durable, the caller must fail before an OpenRouter-capable helper sees any
+    durable, the caller must fail before the local helper sees any
     meeting material.
     """
     if type(request_count) is not int or request_count < 1:
-        raise ValueError("Jev audit request count must be a positive integer")
+        raise ValueError("Decider audit request count must be a positive integer")
     root = Path(audit_root or _DEFAULT_AUDIT_ROOT).expanduser()
-    path = root / "jev-audit.jsonl"
+    path = root / "decider-audit.jsonl"
     entry = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "provider": "local-mlx",
+        "model": "pplx-decider-v1.1-27b",
         "stem": safe_stem(stem),
         "external_attendees": record.external_attendees,
         "jev_external_acknowledged": record.jev_external_acknowledged,
