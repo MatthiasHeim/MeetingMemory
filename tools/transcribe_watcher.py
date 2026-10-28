@@ -885,15 +885,19 @@ class TranscribeWatcher:
             if entry["attempts"] > 0 and (now - entry["last_attempt_ts"]) < RESCAN_MIN_SPACING_SEC:
                 continue  # too soon since the last attempt
 
+            # add() is the authoritative check: the live file handler may have
+            # queued this WAV since is_queued_or_active() above. Only a job the
+            # rescan actually queued counts as a retry attempt.
+            if not self.queue.add(wav_file):
+                continue
             entry["attempts"] += 1
             entry["last_attempt_ts"] = now
             state[stem] = entry
             changed = True
             self.logger.info(
-                f"Rescan: re-queueing {wav_file.name} "
+                f"Rescan: re-queued {wav_file.name} "
                 f"(attempt {entry['attempts']}/{RESCAN_MAX_ATTEMPTS})"
             )
-            self.queue.add(wav_file)
 
         if changed:
             _save_rescan_state(self._rescan_state_path, state)

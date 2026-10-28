@@ -304,3 +304,13 @@ def test_process_queue_still_runs_a_job_without_output(tmp_path):
     w._process_queue()
     assert ran == [wav]
     assert w.queue.current_file is None
+
+
+def test_rescan_does_not_count_attempt_when_handler_queued_it_first(tmp_path):
+    wav = _make_wav(tmp_path)
+    w = _bare_watcher(tmp_path)
+    # The live handler wins the race between the rescan's check and its add().
+    w.queue.is_queued_or_active = lambda f: False
+    w.queue.add = lambda f: False
+    w._rescan_unprocessed_wavs(now=1_000_000.0)
+    assert "rec" not in w._rescan_state
