@@ -1435,7 +1435,7 @@ class LiveEngine:
                 self._suggest_status = f"KI-Ideen nicht verfügbar ({type(exc).__name__})."
                 self._suggest_last_key = None
                 self._publish()
-            self._diagnostic(stage="suggestions", error_type=type(exc).__name__)
+            self._diagnostic(stage="suggestions", **_error_fields(exc))
         finally:
             with self._lock:
                 self._suggest_thread = None
@@ -1567,7 +1567,7 @@ class LiveEngine:
                 pending_count = len(self.lines) - processed_count
                 failures = self._prompt_consecutive_failures
             self._diagnostic(stage="prompts", elapsed_seconds=time.perf_counter() - started,
-                             error_type=type(exc).__name__, stale=stale,
+                             **_error_fields(exc), stale=stale,
                              requested_count=requested_count, new_line_from=len(prior), new_line_to=len(lines),
                              processed_count=processed_count, scored_count=processed_count - failed_count,
                              pending_count=pending_count, failed_count=failed_count,
@@ -1645,7 +1645,7 @@ class LiveEngine:
                 else:
                     self._prompt_requested = True
             self._diagnostic(stage="contextual_cards", elapsed_seconds=time.perf_counter() - started,
-                             error_type=type(exc).__name__, stale=stale, failed_count=extractor.failed)
+                             **_error_fields(exc), stale=stale, failed_count=extractor.failed)
 
     def _extend_scores(self, lines: Sequence[LiveLine], prior_scores: Sequence[float | None]) -> list[float | None]:
         assert self._judge is not None
@@ -1790,7 +1790,7 @@ class LiveEngine:
                 self._on_unavailable(self.status)
             except Exception:
                 pass
-        self._diagnostic(stage="transcript", error_type=type(exc).__name__)
+        self._diagnostic(stage="transcript", **_error_fields(exc))
 
     def _publish(self) -> None:
         # Serialise short UI dispatches so an old worker update cannot overwrite
@@ -1819,6 +1819,26 @@ class LiveEngine:
                 self._on_diagnostics(values)
             except Exception:
                 pass
+
+
+def _error_fields(exc: BaseException) -> dict[str, Any]:
+    """Type names and an HTTP status for a diagnostic line, never exception text.
+
+    ``JudgeError`` wraps the provider failure, so its own type says nothing
+    about why a call failed. On 2026-10-28 182 live calls logged only
+    ``JudgeError``; the cause (timeout, quota, server error, bad JSON) is the
+    part that tells them apart. No cause means the response itself was unusable.
+    """
+    fields: dict[str, Any] = {"error_type": type(exc).__name__}
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None:
+        fields["error_cause"] = type(cause).__name__
+        for name in ("code", "status_code", "status"):
+            code = getattr(cause, name, None)
+            if isinstance(code, int) and not isinstance(code, bool):
+                fields["error_code"] = code
+                break
+    return fields
 
 
 def replay_wav(

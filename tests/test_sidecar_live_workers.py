@@ -516,3 +516,40 @@ def test_unrelated_index_shift_preserves_existing_card_and_clean_text():
         release.set()
         drain(engine)
     assert len(clean_calls) == 1
+
+
+def test_failed_transcript_logs_the_provider_cause_and_status_but_no_text():
+    from sidecar.judges import JudgeError
+
+    class QuotaError(Exception):
+        code = 429
+
+    def raising(cause):
+        class Failing:
+            def transcribe_tails(self, *_args):
+                try:
+                    raise cause
+                except Exception as exc:
+                    raise JudgeError("live transcript request failed: PRIVATE") from exc
+        return Failing()
+
+    for cause, expected in ((QuotaError("PRIVATE quota body"), {"error_cause": "QuotaError", "error_code": 429}),
+                            (TimeoutError("PRIVATE"), {"error_cause": "TimeoutError"})):
+        diagnostics = []
+        engine = LiveEngine(snapshot=lambda _: None, transcriber=raising(cause), on_diagnostics=diagnostics.append)
+        try:
+            engine.process_snapshot(snapshot())
+        except Exception as exc:
+            engine._fail(exc)
+        event = [d for d in diagnostics if d.get("stage") == "transcript" and d.get("error_type")][-1]
+        assert event["error_type"] == "JudgeError"
+        assert {k: event.get(k) for k in expected} == expected
+        assert ("error_code" in event) == ("error_code" in expected)
+        assert "PRIVATE" not in json.dumps(diagnostics)
+
+
+def test_unusable_response_without_cause_logs_only_its_type():
+    from sidecar.live import _error_fields
+    from sidecar.judges import JudgeError
+
+    assert _error_fields(JudgeError("live transcript JSON has no lines array")) == {"error_type": "JudgeError"}
