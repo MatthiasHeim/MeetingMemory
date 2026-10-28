@@ -15,7 +15,7 @@ from .judges import (
     question_protocol_fingerprint,
 )
 from .questions import DICTATING_PROMPT_QUESTION, PROMPT_CONTENT_QUESTION
-from .transcript import TranscriptLine
+from .transcript import TranscriptLine, format_timestamp
 
 try:  # `sidecar` is also imported as a top-level package by headless tests.
     from channel_align import MAX_LAG_SEC
@@ -120,6 +120,18 @@ class PromptResult:
     def association_label(self) -> str | None:
         """Human-facing warning for a marked card without a proven time map."""
         return "Zuordnung unsicher" if self.source == "mark" and self.mapping_uncertain else None
+
+
+def prompt_choice_label(prompt: PromptResult) -> str:
+    """Menu line for one prompt card. Live cards are the ones saved during capture."""
+    if prompt.source == "mark":
+        label = f"Markierung bei {format_timestamp(prompt.mark_seconds or 0)}"
+        if prompt.association_label:
+            label += f" — {prompt.association_label}"
+        return label
+    if prompt.source == "live":
+        return f"Live bei {format_timestamp(prompt.start_seconds)}"
+    return f"Vorschlag bei {format_timestamp(prompt.start_seconds)}"
 
 
 @dataclass(frozen=True)
