@@ -288,6 +288,20 @@ def _recover_one_orphan(
                 path.unlink()
         except OSError as exc:
             print(f"Recovered {dest.name} but could not remove {path.name}: {exc}", file=sys.stderr)
+    # A readable track that did not make it into the recovered WAV (the pair
+    # could not be merged) belongs to the same meeting. Left in .tmp, the next
+    # launch would recover it as a second recording and transcribe the meeting
+    # twice. Keep the audio, out of the startup scan.
+    for kind in loaded:
+        path = files[kind]
+        if path in consumed or not path.exists():
+            continue
+        try:
+            unmerged = tmp_dir / "unmerged"
+            unmerged.mkdir(exist_ok=True)
+            os.replace(path, unmerged / path.name)
+        except OSError as exc:
+            print(f"Recovered {dest.name} but could not set aside {path.name}: {exc}", file=sys.stderr)
     return dest
 
 

@@ -442,3 +442,29 @@ def _kill_child(path: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--kill-child":
         _kill_child(sys.argv[2])
+
+
+def test_failed_pair_merge_does_not_leave_the_system_track_for_a_second_import(tmp_path, monkeypatch):
+    import soundfile as sf
+
+    import meeting_recorder
+    from meeting_recorder import recover_orphaned_captures
+    from mic_writer import IncrementalWavWriter
+
+    tmp = tmp_path / "tmp"
+    recordings = tmp_path / "recordings"
+    tmp.mkdir()
+    recordings.mkdir()
+    mic = tmp / "stem.mic.wav"
+    system = tmp / "stem.sys.wav"
+    writer = IncrementalWavWriter(mic, 16000, channels=1, checkpoint_seconds=1.0)
+    writer.write(np.full((16000, 1), 440, dtype=np.int16))
+    writer.close()
+    sf.write(system, np.full((16000, 2), 200, dtype=np.int16), 16000, subtype="PCM_16")
+    monkeypatch.setattr(meeting_recorder, "_merge_recovered_pair", lambda *a, **k: False)
+
+    assert recover_orphaned_captures(tmp, recordings, notify=lambda _p: None) == [recordings / "stem.wav"]
+    assert not system.exists()
+    assert (tmp / "unmerged" / "stem.sys.wav").exists()  # audio kept, out of the scan
+    # The next launch finds nothing more to import for this meeting.
+    assert recover_orphaned_captures(tmp, recordings, notify=lambda _p: None) == []

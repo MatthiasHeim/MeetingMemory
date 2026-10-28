@@ -286,3 +286,20 @@ def test_prompt_choice_label_keeps_mark_and_suggestion_wording():
     suggested = PromptResult((line,), "suggested")
     assert prompt_choice_label(marked) == "Markierung bei 00:12 — Zuordnung unsicher"
     assert prompt_choice_label(suggested) == "Vorschlag bei 00:12"
+
+
+def test_gap_slices_respect_end_aligned_channels():
+    import numpy as np
+
+    from sidecar.live import _slice_end_aligned
+
+    rate = 10
+    mic = np.arange(60 * rate)            # 60 s
+    system = np.arange(40 * rate) + 10_000  # 40 s, padded 20 s at the start of the clip
+    clip = 60.0
+    assert _slice_end_aligned(system, rate, 0, 15, clip).size == 0  # all padding: silence
+    part = _slice_end_aligned(system, rate, 15, 25, clip)
+    assert part.size == 5 * rate and int(part[0]) == 10_000  # starts where system audio starts
+    late = _slice_end_aligned(system, rate, 50, 55, clip)
+    assert int(late[0]) == 10_000 + 30 * rate
+    assert int(_slice_end_aligned(mic, rate, 50, 55, clip)[0]) == 50 * rate

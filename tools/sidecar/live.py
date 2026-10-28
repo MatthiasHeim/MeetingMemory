@@ -817,6 +817,25 @@ def _slice_tail(samples: np.ndarray | None, sample_rate: int, start: float, end:
     return array[first:last]
 
 
+def _tail_seconds(samples: np.ndarray | None, sample_rate: int) -> float:
+    if samples is None or sample_rate <= 0:
+        return 0.0
+    return float(np.asarray(samples).shape[0]) / float(sample_rate)
+
+
+def _slice_end_aligned(
+    samples: np.ndarray | None, sample_rate: int, start: float, end: float, clip_seconds: float
+):
+    """Cut ``[start, end)`` of the stereo clip timeline out of one channel.
+
+    ``stereo_tail_wav`` end-aligns the channels: the shorter one is padded at
+    the start, so its own clock starts ``clip_seconds - its duration`` later.
+    A slice that falls in that padding is silence for this channel.
+    """
+    pad = max(0.0, clip_seconds - _tail_seconds(samples, sample_rate))
+    return _slice_tail(samples, sample_rate, start - pad, end - pad)
+
+
 def _offsets_from_slice(
     rows: Sequence[dict[str, Any]], slice_start: float, slice_duration: float
 ) -> list[dict[str, Any]]:
@@ -1253,9 +1272,13 @@ class LiveEngine:
         trace: list[dict[str, Any]],
     ) -> list[LiveLine]:
         extra_raw: list[dict[str, Any]] = []
+        clip_seconds = max(
+            _tail_seconds(snapshot.mic, snapshot.mic_rate),
+            _tail_seconds(snapshot.system, snapshot.system_rate),
+        )
         for slice_start, slice_end in slices:
-            mic = _slice_tail(snapshot.mic, snapshot.mic_rate, slice_start, slice_end)
-            system = _slice_tail(snapshot.system, snapshot.system_rate, slice_start, slice_end)
+            mic = _slice_end_aligned(snapshot.mic, snapshot.mic_rate, slice_start, slice_end, clip_seconds)
+            system = _slice_end_aligned(snapshot.system, snapshot.system_rate, slice_start, slice_end, clip_seconds)
             rows: list[dict[str, Any]] = []
             for _attempt in range(2):
                 try:
