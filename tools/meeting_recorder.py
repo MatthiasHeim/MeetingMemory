@@ -184,20 +184,35 @@ _ORPHAN_MIC_SUFFIX = ".mic.wav"
 _ORPHAN_SYS_SUFFIX = ".sys.wav"
 
 
+STALE_ORPHAN_SECONDS = 48 * 3600
+
+
 def recover_orphaned_captures(
     tmp_dir: Path,
     recordings_dir: Path,
     *,
     notify=None,
+    hold_dir: Optional[Path] = None,
+    stale_after_seconds: float = STALE_ORPHAN_SECONDS,
+    now: Optional[float] = None,
 ) -> list[Path]:
     """Move crashed mic/system WAVs from ``.tmp`` into ``Recordings``.
 
     An orphan is deleted only after a playable file has been written. A file
     that cannot be read stays where it is. ``notify`` is a non-modal callback
     ``(path) -> None``; it must not open a dialog.
+
+    Orphans last written more than ``stale_after_seconds`` ago are recovered
+    into ``hold_dir`` (default ``<MeetingRecorder>/Recovered-hold``) instead:
+    ``Recordings`` feeds the watcher, which transcribes and starts
+    /meeting-actions, and a weeks-old meeting must not produce tickets and
+    drafts without a person deciding (2026-10-29: four August/September
+    orphans were imported on the first launch with recovery).
     """
     tmp_dir = Path(tmp_dir)
     recordings_dir = Path(recordings_dir)
+    hold_dir = Path(hold_dir) if hold_dir is not None else recordings_dir.parent / "Recovered-hold"
+    now = time.time() if now is None else now
     if not tmp_dir.is_dir():
         return []
     recordings_dir.mkdir(parents=True, exist_ok=True)
@@ -219,7 +234,10 @@ def recover_orphaned_captures(
         grouped.setdefault(stem, {})[kind] = path
     recovered: list[Path] = []
     for stem, files in sorted(grouped.items()):
-        dest = _recover_one_orphan(stem, files, tmp_dir, recordings_dir)
+        newest = max((path.stat().st_mtime for path in files.values() if path.exists()), default=now)
+        target = hold_dir if now - newest > stale_after_seconds else recordings_dir
+        target.mkdir(parents=True, exist_ok=True)
+        dest = _recover_one_orphan(stem, files, tmp_dir, target)
         if dest is None:
             continue
         recovered.append(dest)
@@ -1073,10 +1091,12 @@ class MeetingRecorderApp(rumps.App):
             print(f"Orphaned recording recovery failed: {exc}", file=sys.stderr)
 
     def _notify_recovered_recording(self, path: Path) -> None:
+        held = path.parent != self.recordings_dir
         rumps.notification(
             title="MeetingRecorder",
-            subtitle="Aufnahme wiederhergestellt",
-            message=f"Unterbrochene Aufnahme gespeichert: {path.name}",
+            subtitle="Alte Aufnahme zurückgelegt" if held else "Aufnahme wiederhergestellt",
+            message=(f"{path.name} liegt in {path.parent.name}, wird nicht automatisch verarbeitet."
+                     if held else f"Unterbrochene Aufnahme gespeichert: {path.name}"),
         )
 
     def _build_menu(self):
