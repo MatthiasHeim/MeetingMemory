@@ -1522,6 +1522,11 @@ class TranscribeWatcher:
                 audio_duration=audio_duration,
             )
 
+            # Step 6e: Suggest who each speaker is (CRM + transcript), for
+            # the Brain Portal's "Confirm speakers" panel. Runs for every
+            # meeting, held or not, and never blocks or changes the gate.
+            self._propose_speakers(source_id)
+
             # Step 7: Trigger Claude for the LLM-only steps (insights, email
             # draft, ClientContext, CRM, wiki). It reads the seeded fields
             # and skips its old Step 1b/Step 2-UPDATE/Step 8.
@@ -1549,6 +1554,37 @@ class TranscribeWatcher:
             # nearest event's counterpart as identity (2026-09-04 Tanja↔Sarah).
             return safe_calendar_publication(inferred or verified)
         return verified if attribution_gate(payload)["speaker_dependent_actions"] == "hold" else inferred
+
+    def _propose_speakers(self, source_id) -> bool:
+        """Fire-and-forget tools/speaker_review.py propose for this source.
+
+        Stores sources.metadata.speaker_review (who each label probably is,
+        from the transcript and the CRM). Matthias confirms or corrects it in
+        the Brain Portal; confirming is what releases a held meeting.
+        """
+        cfg = (getattr(self, "config", None) or {}).get("speaker_review", {}) or {}
+        if source_id is None or not cfg.get("enabled", True):
+            return False
+        log_dir = expand_path(self.config['paths']['logs'])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"speaker-review-{source_id}.log"
+        env = os.environ.copy()
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin"
+        config_dir = (self.config.get('claude_trigger', {}) or {}).get('config_dir')
+        if config_dir:
+            env["CLAUDE_CONFIG_DIR"] = str(expand_path(config_dir))
+        try:
+            with open(log_file, 'a') as lf:
+                proc = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve().parent / "speaker_review.py"),
+                     "propose", "--source-id", str(source_id)],
+                    env=env, stdout=lf, stderr=lf, start_new_session=True,
+                )
+            self.logger.info(f"Speaker suggestions started for source {source_id}: PID={proc.pid}")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Speaker suggestions not started for source {source_id}: {e}")
+            return False
 
     def _trigger_claude_if_attributed(self, json_path: Path, source_id=None):
         """Start /meeting-actions only when the gate allows a Claude pass.

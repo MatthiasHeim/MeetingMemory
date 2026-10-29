@@ -139,3 +139,26 @@ def test_resolve_calendar_appends_step0_roster_instructions(tmp_path, monkeypatc
     assert "CALENDAR IDENTITY IS AMBIGUOUS" in prompt
     assert "apply_calendar_candidate.py" in prompt
     assert "--unknown" in prompt
+
+
+def test_propose_speakers_spawns_review_for_seeded_source(monkeypatch, tmp_path):
+    w = _watcher(tmp_path, {"config_dir": str(tmp_path / "auto")})
+    calls = []
+
+    def fake_popen(args, env=None, stdout=None, stderr=None, start_new_session=None):
+        calls.append((args, env))
+        return _FakeProc()
+
+    monkeypatch.setattr(tw.subprocess, "Popen", fake_popen)
+    assert w._propose_speakers(1387) is True
+    args, env = calls[0]
+    assert args[1].endswith("speaker_review.py") and args[2:] == ["propose", "--source-id", "1387"]
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "auto")
+
+
+def test_propose_speakers_skips_without_source_or_when_disabled(monkeypatch, tmp_path):
+    w = _watcher(tmp_path, {})
+    monkeypatch.setattr(tw.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
+    assert w._propose_speakers(None) is False
+    w.config["speaker_review"] = {"enabled": False}
+    assert w._propose_speakers(1387) is False
