@@ -314,3 +314,45 @@ def test_rescan_does_not_count_attempt_when_handler_queued_it_first(tmp_path):
     w.queue.add = lambda f: False
     w._rescan_unprocessed_wavs(now=1_000_000.0)
     assert "rec" not in w._rescan_state
+
+
+# ── startup honours the persisted give-up state ───────────────────────
+
+
+def test_startup_does_not_requeue_gave_up_wav():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = Path(td)
+        _make_wav(tmp_path, "dead.wav")
+        w = _bare_watcher(tmp_path, state={"dead": {"attempts": 4, "last_attempt_ts": 1.0, "gave_up": True}})
+        w._process_existing_files()
+        assert w.queue.is_empty()
+        assert w._giveups == []  # already alerted before; no repeat
+
+
+def test_startup_flags_wav_at_cap_once_without_requeue():
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = Path(td)
+        _make_wav(tmp_path, "dead.wav")
+        w = _bare_watcher(tmp_path, state={"dead": {"attempts": tw.RESCAN_MAX_ATTEMPTS, "last_attempt_ts": 1.0, "gave_up": False}})
+        w._process_existing_files()
+        assert w.queue.is_empty()
+        assert len(w._giveups) == 1
+        assert json.loads(w._rescan_state_path.read_text())["dead"]["gave_up"] is True
+        w._process_existing_files()  # second restart: silent
+        assert w.queue.is_empty() and len(w._giveups) == 1
+
+
+def test_startup_still_queues_normal_and_below_cap_wavs():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = Path(td)
+        fresh = _make_wav(tmp_path, "fresh.wav")
+        retry = _make_wav(tmp_path, "retry.wav")
+        w = _bare_watcher(tmp_path, state={"retry": {"attempts": 2, "last_attempt_ts": 1.0, "gave_up": False}})
+        w._process_existing_files()
+        queued = {w.queue.get(), w.queue.get()}
+        assert queued == {fresh, retry}
+        assert w._giveups == []

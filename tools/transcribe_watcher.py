@@ -827,8 +827,42 @@ class TranscribeWatcher:
                 continue
 
             if self._wav_needs_processing(wav_file):
+                if self._rescan_gave_up(wav_file):
+                    continue
                 self.logger.info(f"Found unprocessed file: {wav_file.name}")
                 self.queue.add(wav_file)
+
+    def _rescan_gave_up(self, wav_file: Path) -> bool:
+        """True if the F3 rescan already spent this WAV's retries.
+
+        Startup used to ignore the persisted give-up state, so every launchd
+        restart re-transcribed (and re-paid Gemini for) recordings that had
+        used all RESCAN_MAX_ATTEMPTS. A WAV at the cap whose `gave_up` flag was
+        not yet written (the rescan sets it on its next tick) is flagged and
+        alerted here, exactly once. Clear the state entry (or add a JSON) to
+        retry by hand."""
+        state = getattr(self, "_rescan_state", None)
+        if not state:
+            return False
+        entry = state.get(wav_file.stem)
+        if not entry:
+            return False
+        if entry.get("gave_up"):
+            self.logger.warning(
+                f"Not re-queuing {wav_file.name}: rescan already gave up on it "
+                f"(clear its entry in {RESCAN_STATE_FILENAME} to retry)"
+            )
+            return True
+        if entry.get("attempts", 0) >= RESCAN_MAX_ATTEMPTS:
+            entry["gave_up"] = True
+            _save_rescan_state(self._rescan_state_path, state)
+            self.logger.error(
+                f"Startup: giving up on {wav_file.name} after "
+                f"{entry['attempts']} automatic attempts — manual reprocess needed"
+            )
+            self._notify_telegram_giveup(wav_file, entry["attempts"])
+            return True
+        return False
 
     def _rescan_attempt_count(self, audio_file: Path) -> int:
         """Number of F3 rescan-triggered (re)queues recorded for this WAV.
