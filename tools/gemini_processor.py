@@ -458,6 +458,14 @@ class GeminiAudioProcessor:
         self.model = model
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
+        # A missing/zero timeout is exactly the hang class this guards
+        # against (google-genai's HttpOptions.timeout defaults to None, which
+        # httpx treats as "wait forever"), so refuse it rather than silently
+        # running unbounded.
+        if not timeout_seconds or timeout_seconds <= 0:
+            raise ValueError(
+                f"timeout_seconds must be a positive number, got {timeout_seconds!r}"
+            )
         self.timeout_seconds = timeout_seconds
 
         # Import here to allow the module to load without the dependency
@@ -467,8 +475,23 @@ class GeminiAudioProcessor:
             self.genai = genai
             self.types = types
             # Use standard client - custom httpx clients cause issues
-            # The Files API handles large uploads reliably
-            self.client = genai.Client(api_key=self.api_key)
+            # The Files API handles large uploads reliably.
+            #
+            # http_options.timeout is REQUIRED: without it google-genai sends
+            # every request with timeout=None, so a socket that dies silently
+            # (machine sleep, Wi-Fi/VPN change, server drops without RST)
+            # blocks in SSL_read forever. That froze the watcher on
+            # 2026-07-28, 2026-09-17 and 2026-11-09 (sampled: main thread in
+            # ssl3_read_internal, 12h after "Sending to Gemini API...").
+            # httpx applies this as a per-read inactivity timeout, so a
+            # stalled stream raises httpx.ReadTimeout, which
+            # _generate_with_retry retries and the watcher's escalation
+            # ladder handles. Unit is milliseconds. The SDK also sends it as
+            # X-Server-Timeout, so it must exceed the longest single call.
+            self.client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(timeout=int(timeout_seconds * 1000)),
+            )
         except ImportError:
             raise ImportError(
                 "google-genai package not installed. "

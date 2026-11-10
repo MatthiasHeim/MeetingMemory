@@ -380,6 +380,15 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(ch)
 
+    # gemini_processor logs per-call progress, retries and timeouts on its
+    # own module logger, which had no handler, so a retry storm or a stalled
+    # call left nothing in watcher.log after "Sending to Gemini API...".
+    gp_logger = logging.getLogger("gemini_processor")
+    gp_logger.setLevel(logging.INFO)
+    if fh not in gp_logger.handlers:
+        gp_logger.addHandler(fh)
+    gp_logger.propagate = False
+
     return logger
 
 

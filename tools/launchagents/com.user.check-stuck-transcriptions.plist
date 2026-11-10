@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.check-stuck-transcriptions</string>
+
+    <!-- DETERMINISTIC check (pure Python, no LLM): flags any recording stuck
+         at "Sending to Gemini API..." for more than 2h with no transcript and
+         sends one Telegram line ("Transcription stuck" in Brain's
+         notify-policy.yaml; telegram_notify dedupes the same text for 12h).
+         Backstop for the 2026-07-28 / 2026-09-17 / 2026-11-09 watcher hangs.
+         See tools/check_stuck_transcriptions.py. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Matthias/Repos/MeetingMemory/venv/bin/python</string>
+        <string>/Users/Matthias/Repos/MeetingMemory/tools/check_stuck_transcriptions.py</string>
+        <string>--notify</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Matthias/Repos/MeetingMemory</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Every 30 min: a hang is reported at most ~2.5h after the call started. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Logs in ~/Library/Logs, NOT TCC-protected ~/Documents (exit-78 lesson). -->
+    <key>StandardOutPath</key>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/check-stuck-transcriptions.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Matthias/Library/Logs/MeetingRecorder/check-stuck-transcriptions.error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/Matthias/.local/bin</string>
+    </dict>
+</dict>
+</plist>
