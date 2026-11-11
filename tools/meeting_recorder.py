@@ -131,6 +131,28 @@ def activate_app_for_modal(appkit=None) -> None:
         print(f"Could not activate MeetingRecorder before a dialog: {exc}", file=sys.stderr)
 
 
+# Another local program (the Lailix Portal) asks for a recording by creating this
+# file. It only ever means "start if idle": a running recording is never touched,
+# and nothing here can stop one.
+START_REQUEST_NAME = "start-if-idle"
+START_REQUEST_MAX_AGE_SECONDS = 30.0
+
+
+def consume_start_request(control_dir: Path, now: Optional[float] = None) -> bool:
+    """Remove a pending start request and say whether it is fresh enough to act on.
+
+    A stale request (left behind while the recorder was not running) is removed
+    without effect, so a restart can never begin a recording nobody asked for.
+    """
+    request = control_dir / START_REQUEST_NAME
+    try:
+        age = (time.time() if now is None else now) - request.stat().st_mtime
+        request.unlink()
+    except OSError:
+        return False
+    return -5.0 <= age <= START_REQUEST_MAX_AGE_SECONDS
+
+
 def expand_path(path: str) -> Path:
     """Expand ~ and environment variables in path."""
     return Path(os.path.expandvars(os.path.expanduser(path)))
@@ -1078,6 +1100,26 @@ class MeetingRecorderApp(rumps.App):
         self._build_menu()
         self._install_prompt_mark_shortcut()
         self._recover_orphaned_recordings()
+        self._watch_start_requests()
+
+    def _watch_start_requests(self) -> None:
+        """Poll for a "start if idle" request from another local program."""
+        self.control_dir = self.recordings_dir.parent / "control"
+        try:
+            self.control_dir.mkdir(parents=True, exist_ok=True)
+            (self.control_dir / START_REQUEST_NAME).unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Start-request folder unavailable: {exc}", file=sys.stderr)
+            return
+        self._start_request_timer = rumps.Timer(self._poll_start_request, 1)
+        self._start_request_timer.start()
+
+    def _poll_start_request(self, _timer) -> None:
+        try:
+            if consume_start_request(self.control_dir) and not self.recorder.is_recording:
+                self._start_recording(self._start_stop_item)
+        except Exception as exc:
+            print(f"Start request failed: {exc}", file=sys.stderr)
 
     def _recover_orphaned_recordings(self) -> None:
         """Play back crashed captures into Recordings without a modal dialog."""
