@@ -126,6 +126,14 @@ def gate(data: dict) -> dict:
         missing = list(status.get("missing_stages") or [])
     else:
         missing = ["acoustic_identity_review"]
+    system_track = (data.get("_meta") or {}).get("system_track_attribution") or {}
+    if system_track.get("ran") and system_track.get("uncertain_regions"):
+        # An unresolved host/remote contradiction from the system-track stage
+        # always holds, whatever the stored report says (tighten-only: this
+        # never clears a stage the report already lists).
+        policy = HOLD
+        if "acoustic_identity_review" not in missing:
+            missing.append("acoustic_identity_review")
     if calendar_bind_ambiguous(data):
         # Collision is a review stage, not a dead end: Claude may
         # disambiguate. Named commitments stay blocked until a bind.

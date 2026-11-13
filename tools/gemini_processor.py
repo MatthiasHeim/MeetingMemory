@@ -381,6 +381,11 @@ class GeminiResult:
     # why, plus the regions it could not resolve confidently.
     speaker_coherence_log: Optional[dict] = None
 
+    # Log of the deterministic system-track host/remote attribution stage
+    # (system_track_attribution). Valid on bleeding recordings too: it reads
+    # the digital system track, never the mic. Lands in `_meta`.
+    system_track_attribution: Optional[dict] = None
+
     # Admissibility verdict for the mic channel on this recording
     # (channel_vad.channel_separation_report). Distinguishes "attribution was
     # channel-verified" from "the channel oracle was unusable and skipped".
@@ -423,6 +428,8 @@ class GeminiResult:
             out["speaker_coherence"] = self.speaker_coherence_log
         if self.channel_separation is not None:
             out["_meta"]["channel_separation"] = self.channel_separation
+        if self.system_track_attribution is not None:
+            out["_meta"]["system_track_attribution"] = self.system_track_attribution
         if self.speaker_attribution is not None:
             out["_meta"]["speaker_attribution"] = self.speaker_attribution
         return out

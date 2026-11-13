@@ -148,6 +148,21 @@ except ImportError as e:
     SPEAKER_VERIFY_AVAILABLE = False
     _SPEAKER_VERIFY_IMPORT_ERROR = str(e)
 
+# Deterministic host/remote attribution from the SYSTEM track. Unlike the mic
+# channel, the system track is digital and stays valid when the mic bleeds, so
+# this stage runs on every hybrid recording regardless of `channel_admissible`.
+# It replaces speaker_verify (mic-based) in the attribution flow.
+try:
+    from system_track_attribution import (
+        RemoteActivity as _RemoteActivity,
+        chunk_offsets_for as _st_chunk_offsets,
+        run as _system_track_run,
+    )
+    SYSTEM_TRACK_ATTRIBUTION_AVAILABLE = True
+except ImportError as e:
+    SYSTEM_TRACK_ATTRIBUTION_AVAILABLE = False
+    _SYSTEM_TRACK_IMPORT_ERROR = str(e)
+
 # Semantic speaker-coherence gate: the repair path for the (common) case where
 # the mic channel bleeds and channel attribution is inadmissible. Runs after
 # transcription and BEFORE the JSON write, so no insight is ever extracted
@@ -1480,11 +1495,17 @@ class TranscribeWatcher:
                              result.parsed_response, known_attendees=known_attendees,
                              audio_sha256=trial_audio_sha256)
 
-            # Step 4b2: Channel-based attribution verification. Runs AFTER
-            # reconcile so flips target canonical names. Flips turns whose
-            # transcript label confidently contradicts the mic-channel
-            # ground truth (see speaker_verify module docstring).
-            self._verify_speakers_inplace(result, channel_vad, cal_match)
+            # Step 4b2: System-track attribution. Runs AFTER reconcile so
+            # swaps/relabels act on canonical names. Reads the digital system
+            # track (remote active = remote+both VAD segments), which stays
+            # valid when the mic bleeds, so it runs regardless of
+            # `channel_admissible`. Replaces the mic-based speaker_verify
+            # pass, which was skipped on every bleeding recording and which
+            # the new stage supersedes on clean ones (the system track says
+            # the same thing without needing mic isolation).
+            self._system_track_attribution_inplace(
+                result, channel_vad, cal_match, audio_duration
+            )
             save_trial_stage(self.config, audio_file, "before_coherence",
                              result.parsed_response, known_attendees=known_attendees,
                              audio_sha256=trial_audio_sha256)
@@ -2250,11 +2271,14 @@ class TranscribeWatcher:
             if not report.get("admissible"):
                 # 2026-08-07: the mic hears the loudspeakers on most of our
                 # recordings, so its host/remote spans are noise dressed as
-                # certainty. Everything downstream that would treat them as
-                # ground truth is disabled for this recording; semantic
-                # coherence repair is the attribution path instead.
+                # certainty. Everything downstream that would treat the MIC as
+                # ground truth is disabled for this recording. The digital
+                # system track is unaffected and still drives the
+                # system-track attribution stage; semantic coherence repair
+                # covers the rest.
                 self.logger.warning(
-                    f"Channel attribution DISABLED for {audio_file.name}: "
+                    f"Mic-channel attribution DISABLED for {audio_file.name} "
+                    f"(system-track attribution still runs): "
                     f"{report.get('reason')} "
                     f"(host_bleed_rate={report.get('host_bleed_rate')} > "
                     f"{report.get('max_host_bleed_rate')}). The host mic is "
@@ -2299,9 +2323,93 @@ class TranscribeWatcher:
         )
         return convert_for_gemini(audio_file, output_dir=self.transcripts_dir)
 
+    @staticmethod
+    def _remote_host_namesake(cal_match: Optional[dict]) -> Optional[str]:
+        """Name of a REMOTE attendee sharing the host's first name, if any.
+
+        Host-label detection keys on the first name "Matthias"; a different
+        remote Matthias makes every such label ambiguous. Exact duplicates of
+        the host himself do not count (see _verify_speakers_inplace).
+        """
+        for att in (cal_match or {}).get("participant_details") or []:
+            name = (att.get("name") or "").strip() if isinstance(att, dict) else ""
+            name_lower = name.lower()
+            if not name_lower.split() or name_lower.split()[0] != "matthias":
+                continue
+            if (att.get("role") or "").lower() == "self":
+                continue
+            if name_lower == _SELF_FULL_NAME.lower():
+                continue
+            return name
+        return None
+
+    def _system_track_attribution_inplace(self, result, channel_vad,
+                                          cal_match: Optional[dict],
+                                          audio_duration: Optional[float]
+                                          ) -> None:
+        """Deterministic host/remote attribution from the system track.
+
+        Mutates `result.transcript` (swap of an inverted chunk, per-turn
+        relabels) and stores the forensic log on `result.system_track_attribution`
+        (persisted to `_meta`). Never raises and never blocks: on any problem
+        the transcript is left exactly as it was.
+        """
+        try:
+            if not SYSTEM_TRACK_ATTRIBUTION_AVAILABLE:
+                self.logger.warning(
+                    "system_track_attribution unavailable; host/remote "
+                    f"attribution not checked ({_SYSTEM_TRACK_IMPORT_ERROR})"
+                )
+                return
+            namesake = self._remote_host_namesake(cal_match)
+            if namesake:
+                self.logger.warning(
+                    f"System-track attribution skipped: remote attendee "
+                    f"{namesake!r} shares the host's first name"
+                )
+            remote = _RemoteActivity.from_vad(channel_vad)
+            chunk_sec = getattr(
+                getattr(self, "gemini_processor", None),
+                "CHUNK_DURATION_SEC", 15 * 60,
+            )
+            meta = {"chunked": getattr(result, "chunked", False),
+                    "chunk_count": getattr(result, "chunk_count", 1)}
+            names = [p.get("name") for p in (result.participants or [])
+                     if isinstance(p, dict)]
+            new_text, log = _system_track_run(
+                result.transcript, remote,
+                duration_sec=audio_duration,
+                chunk_offsets=_st_chunk_offsets(meta, audio_duration, chunk_sec),
+                participants=names,
+                namesake_remote=bool(namesake),
+                skip_reason=("no_three_channel_layout_or_single_source"
+                             if channel_vad is None else "no_remote_activity"),
+            )
+            if log.get("labels_changed"):
+                result.transcript = new_text
+            result.system_track_attribution = log
+            if not log.get("ran"):
+                self.logger.info(
+                    f"System-track attribution not run: {log.get('reason')}"
+                )
+            else:
+                self.logger.info(
+                    "System-track attribution: "
+                    f"{len(log['swaps'])} swap(s), {len(log['relabels'])} "
+                    f"relabel(s), {log['unresolved']} uncertain region(s); "
+                    f"{log['turns_checked']} turns / {log['seconds_checked']}s "
+                    f"checked (coverage {log['coverage']}, verified "
+                    f"{log['verified_coverage']})"
+                )
+        except Exception as e:
+            self.logger.warning(f"System-track attribution failed: {e}")
+
     def _verify_speakers_inplace(self, result, channel_vad,
                                  cal_match: Optional[dict]) -> None:
-        """Flip confidently-misattributed turns using channel ground truth.
+        """RETIRED from the flow (2026-11): no longer called by
+        _process_with_gemini; see _system_track_attribution_inplace.
+
+        Flip confidently-misattributed turns using channel ground truth.
 
         Mutates the GeminiResult (transcript, participants) so the JSON
         write, DB enrichment, and Claude all see verified attribution.
