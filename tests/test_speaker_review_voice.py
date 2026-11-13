@@ -300,3 +300,19 @@ def test_confirm_still_succeeds_when_enrolment_fails_or_archive_is_pruned(tmp_pa
     out = sr.confirm(1, mapping, trigger=False)
     assert out["ok"] and any("voice enrolment failed" in w for w in out["warnings"])
     assert "] Person A:" in json.loads(tpath.read_text())["transcript"]
+
+
+def test_confirm_enrolment_honours_the_configured_timeout(tmp_path, monkeypatch):
+    stem = "2026-11-01_10-00-00"
+    tpath = _prepare_archive(tmp_path, stem)
+    _cfg(monkeypatch, tmp_path, timeout_seconds=45)
+    seen = {}
+
+    def fake_enrol(*a, **k):
+        seen["timeout"] = k.get("timeout_seconds")
+        return {"enrolled": [], "skipped": [], "reason": None}
+    monkeypatch.setattr(vm, "enrol_people", fake_enrol)
+    mapping = _mapping()
+    gem, rename = _gem_after_rename(mapping)
+    sr.enrol_voices(str(tpath), gem, mapping, rename)
+    assert seen["timeout"] == 45

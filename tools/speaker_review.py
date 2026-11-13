@@ -797,7 +797,8 @@ def enrol_voices(tpath: str, gem: dict, mapping: list[dict], rename: dict[str, s
             library=VoiceLibrary(default_library_dir({"voice_matching": cfg})),
             mic_offset_sec=(meta.get("channel_alignment") or {}).get("lag_seconds") or 0.0,
             participants=[p.get("name") for p in gem.get("participants") or [] if isinstance(p, dict)],
-            device=str(cfg.get("device") or ""))
+            device=str(cfg.get("device") or ""),
+            timeout_seconds=int(cfg.get("timeout_seconds") or voice_match.EMBED_TIMEOUT_SECONDS))
     except Exception as exc:
         logger.warning("voice enrolment failed (confirm unaffected): %s", exc)
         return {"enrolled": [], "skipped": [], "reason": f"{type(exc).__name__}: {exc}"[:200]}

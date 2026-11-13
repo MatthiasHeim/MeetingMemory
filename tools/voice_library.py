@@ -243,6 +243,13 @@ class VoiceLibrary:
             by_id = next((p for p in index["people"]
                           if p.get("crm_contact_id") == crm_contact_id), None)
             if by_id is not None:
+                if by_name is not None and by_name is not by_id:
+                    # The name already belongs to another stored person:
+                    # following the id would rename that profile onto a
+                    # duplicate name and make later matches ambiguous.
+                    raise PersonConflict(
+                        f"name {name!r} and CRM contact {crm_contact_id} point to "
+                        "different stored people; not merging")
                 return by_id          # renamed in the CRM: the id wins
             if by_name is not None and by_name.get("crm_contact_id") not in (None, crm_contact_id):
                 raise PersonConflict(
@@ -304,7 +311,12 @@ class VoiceLibrary:
             person["samples"] = person["samples"][-MAX_SAMPLES_PER_PERSON:]
 
             self._write_vector(sample["id"], vec)      # vector first, index second
-            self._write_index(index)
+            try:
+                self._write_index(index)
+            except BaseException:
+                # An unindexed vector could never be found by `forget`.
+                self._unlink_vectors([sample["id"]])
+                raise
             self._unlink_vectors([s["id"] for s in replaced + dropped])
             return {"person_id": person["id"], "created": created,
                     "replaced": bool(replaced), "samples": len(person["samples"])}

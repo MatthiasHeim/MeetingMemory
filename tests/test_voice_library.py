@@ -204,3 +204,30 @@ def test_cli_never_prints_a_vector(tmp_path, capsys):
     assert stats["samples_by_basis"] == {"human_confirmed": 1, "self_channel": 1}
     for v in B["Person A"][:8]:                       # none of the vector's digits appear
         assert f"{abs(float(v)):.4f}" not in out
+
+
+def test_name_and_crm_id_of_different_people_is_a_conflict(tmp_path):
+    lib = VoiceLibrary(tmp_path / "lib")
+    lib.add_sample("Person A", B["Person A"], stem=_stem(1), segments=5, basis=BASIS_HUMAN, crm_contact_id=1)
+    lib.add_sample("Person B", B["Person B"], stem=_stem(2), segments=5, basis=BASIS_HUMAN, crm_contact_id=2)
+    with pytest.raises(PersonConflict):
+        lib.add_sample("Person A", B["Person A"], stem=_stem(3), segments=5, basis=BASIS_HUMAN,
+                       crm_contact_id=2)
+    assert sorted((p["name"], p["crm_contact_id"], len(p["samples"])) for p in lib.people()) == \
+        [("Person A", 1, 1), ("Person B", 2, 1)]
+    # the same person under the same id and name is still fine
+    lib.add_sample("Person B", B["Person B"], stem=_stem(4), segments=5, basis=BASIS_HUMAN, crm_contact_id=2)
+    assert len([p for p in lib.people() if p["name"] == "Person B"][0]["samples"]) == 2
+
+
+def test_failed_index_write_leaves_no_orphan_vector(tmp_path, monkeypatch):
+    lib = VoiceLibrary(tmp_path / "lib")
+    lib.add_sample("Person A", B["Person A"], stem=_stem(1), segments=5, basis=BASIS_HUMAN)
+    before = sorted(p.name for p in lib.vectors_dir.iterdir())
+
+    def boom(index):
+        raise OSError("disk full")
+    monkeypatch.setattr(lib, "_write_index", boom)
+    with pytest.raises(OSError):
+        lib.add_sample("Person B", B["Person B"], stem=_stem(2), segments=5, basis=BASIS_HUMAN)
+    assert sorted(p.name for p in lib.vectors_dir.iterdir()) == before
