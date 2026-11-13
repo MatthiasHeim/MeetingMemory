@@ -333,7 +333,7 @@ def update_source_with_gemini(
         g = g.parsed_response  # type: ignore[attr-defined]
 
     meta = g.get("_meta", {})
-    attribution_metadata = {k: meta[k] for k in ("speaker_attribution", "channel_separation") if k in meta}
+    attribution_metadata = {k: meta[k] for k in ("speaker_attribution", "channel_separation", "system_track_attribution") if k in meta}
     attribution_metadata.update({k: g[k] for k in ("speaker_verification", "speaker_coherence") if k in g})
 
     language = g.get("language") or DEFAULT_LANGUAGE

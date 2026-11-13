@@ -187,6 +187,26 @@ def _gws_calendar_events(
     return body.get("items", []) if isinstance(body, dict) else []
 
 
+def _is_all_day(ev: dict) -> bool:
+    """True for all-day / multi-day events: a date-only start, no dateTime.
+
+    Such an event cannot be the meeting that was recorded, only background
+    (a holiday, a trip, an out-of-office block). Counting it as a candidate
+    turned one real meeting into a false collision on 2026-11-12: an all-day
+    event that began on 2026-11-06 and spanned the day gave match_count 3
+    and put the whole transcript on hold.
+    """
+    start = ev.get("start") if isinstance(ev, dict) else None
+    if not isinstance(start, dict):
+        return False
+    return bool(start.get("date")) and not start.get("dateTime")
+
+
+def _bindable_events(events: list[dict]) -> list[dict]:
+    """Events that may be a meeting bind candidate (timed events only)."""
+    return [ev for ev in events if not _is_all_day(ev)]
+
+
 def _pick_best_event(events: list[dict], target: datetime) -> Optional[dict]:
     """Choose the event whose start is closest to `target`.
 
@@ -460,7 +480,9 @@ def resolve(transcript_path: str | Path, *, timeout_seconds: float = 30.0) -> di
         f"{2*SEARCH_WINDOW_MIN}min around {started.strftime('%Y-%m-%dT%H:%M:%SZ')}"
     )
 
-    events = _gws_calendar_events(time_min, time_max, timeout_seconds=timeout_seconds)
+    events = _bindable_events(
+        _gws_calendar_events(time_min, time_max, timeout_seconds=timeout_seconds)
+    )
     _annotate_calendar_search(log["calendar_search"], len(events))
     client_names = _load_client_names()
     log["calendar_search"]["candidates"] = [
