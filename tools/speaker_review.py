@@ -140,6 +140,94 @@ def _clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
 
 
+# ── Voice evidence (from _meta.voice_match; names and scores only) ───────────
+
+def _voice_entry_for(voice_log: Optional[dict], label: str) -> Optional[dict]:
+    """The voice-match entry for a transcript label. After an auto_apply rename
+    the transcript carries the new name while the log is keyed by the old one."""
+    labels = (voice_log or {}).get("labels") or {}
+    if label in labels:
+        return labels[label]
+    for r in (voice_log or {}).get("renames") or []:
+        if r.get("to") == label and r.get("label") in labels:
+            return labels[r["label"]]
+    return None
+
+
+def _same_person(a: str, b: str) -> bool:
+    ta, tb = set((a or "").casefold().split()), set((b or "").casefold().split())
+    return bool(ta and tb and (ta <= tb or tb <= ta))
+
+
+def apply_voice_evidence(proposals: dict[str, dict], labels: list[dict],
+                         voice_log: Optional[dict]) -> dict[str, list[dict]]:
+    """Fold `_meta.voice_match` into the per-label proposals (in place).
+
+    Returns {label: [extra candidates]} for the portal's candidate list.
+
+    Resolution against the transcript-based (model) proposal:
+      * clear voice match, model unknown / low / medium confidence  -> the
+        voice match becomes the proposal (confidence medium: one new signal
+        from a library that is still small; the human confirms anyway);
+      * clear voice match that AGREES with the model                -> the
+        model's proposal stays, the voice is added to its evidence and the
+        confidence is raised to high;
+      * clear voice match that CONTRADICTS a HIGH-confidence model proposal
+        (an introduction, being addressed by name)                  -> the
+        model's proposal stays; the disagreement is stated in the evidence
+        and flagged `voice_conflict` so the human decides;
+      * possible match -> evidence text and candidate only.
+    Host labels and matches to the host are never used.
+    """
+    extra: dict[str, list[dict]] = {}
+    if not isinstance(voice_log, dict) or not voice_log.get("ran"):
+        return extra
+    for lb in labels:
+        label = lb["label"]
+        entry = _voice_entry_for(voice_log, label)
+        if lb.get("self_label") or not entry or not entry.get("best"):
+            continue
+        best, verdict = entry["best"], entry.get("verdict")
+        if verdict not in ("clear", "possible") or best.get("role") == "self":
+            continue
+        name, score = best["name"], float(best["score"])
+        text = f"Voice matches {name} ({score:.2f})"
+        runner = entry.get("runner_up")
+        if runner:
+            text += f", next closest {runner['name']} ({float(runner['score']):.2f})"
+        prop = proposals.get(label) or {"kind": "unknown", "confidence": "low", "evidence": ""}
+        voice = {"name": name, "score": round(score, 3), "verdict": verdict}
+        if best.get("crm_contact_id") is not None:
+            voice["crm_contact_id"] = best["crm_contact_id"]
+        if verdict == "clear":
+            model_named = prop.get("kind") in ("self", "crm", "new") and prop.get("name")
+            agrees = bool(model_named) and _same_person(prop["name"], name) and prop.get("kind") != "self"
+            contradicts = bool(model_named) and not agrees and prop.get("confidence") == "high"
+            if agrees:
+                prop["confidence"] = "high"
+            elif contradicts:
+                prop["voice_conflict"] = True
+                text += f"; this disagrees with the transcript evidence for {prop['name']}"
+            else:
+                replaced = f" (replaces the transcript-based guess {prop['name']})" if model_named else ""
+                prop = {"kind": "crm" if best.get("crm_contact_id") is not None else "new",
+                        "name": name, "confidence": "medium",
+                        "evidence": prop.get("evidence") or ""}
+                if best.get("crm_contact_id") is not None:
+                    prop["contact_id"] = best["crm_contact_id"]
+                text += replaced
+        else:
+            text += f" (possible only: {entry.get('reason') or 'not clear'})"
+        prop["evidence"] = _clip((text + ". " + (prop.get("evidence") or "")).strip(), 300)
+        prop["voice"] = voice
+        proposals[label] = prop
+        if best.get("crm_contact_id") is not None:
+            extra.setdefault(label, []).append(
+                {"id": best["crm_contact_id"], "name": name, "company": None, "position": None,
+                 "email": None, "voice_score": round(score, 3)})
+    return extra
+
+
 def validate_mapping(mapping: object, labels: list[str]) -> list[dict]:
     """Normalise the portal's mapping; raise ValueError with a readable reason.
 
@@ -597,11 +685,18 @@ def propose(source_id: int, *, runner: Optional[Callable[[str], str]] = None, dr
                                    else {"kind": "unknown", "confidence": "low", "evidence": "No suggestion (model call failed)."})
                      for lb in labels}
 
+    # Voice fingerprint evidence (local; names and scores only) from the watcher.
+    voice_extra = apply_voice_evidence(proposals, labels, (gem.get("_meta") or {}).get("voice_match"))
+
+    def _cands(label: str) -> list[dict]:
+        rows = [{k: c.get(k) for k in ("id", "name", "company", "position", "email")}
+                for c in candidates.get(label, [])]
+        seen = {r["id"] for r in rows}
+        return rows + [c for c in voice_extra.get(label, []) if c["id"] not in seen]
+
     review = {
         "status": "proposed", "proposed_at": _now(), "model": "sonnet", "error": error,
-        "labels": [dict(lb, proposal=proposals[lb["label"]],
-                        candidates=[{k: c.get(k) for k in ("id", "name", "company", "position", "email")}
-                                    for c in candidates.get(lb["label"], [])])
+        "labels": [dict(lb, proposal=proposals[lb["label"]], candidates=_cands(lb["label"]))
                    for lb in labels],
     }
     if not dry_run:
@@ -669,6 +764,45 @@ def trigger_meeting_actions(source_id: int, transcript_path: str, suffix: str) -
     return {"pid": proc.pid, "log": str(log_file)}
 
 
+def enrol_voices(tpath: str, gem: dict, mapping: list[dict], rename: dict[str, str]) -> dict:
+    """Enrol each confirmed non-host person's voice from the archived system
+    track. Names and counts only; never raises, so it can never fail a confirm.
+
+    The recording is found from the transcript path: `<root>/Transcripts/<stem>.json`
+    -> `<root>/CaptureArchive/<stem>/` (then `<root>/Recordings/<stem>.wav`).
+    `prune_recordings` deletes both after its retention window; once they are
+    gone nothing is enrolled and the report says so (the confirmation itself
+    is unaffected). Gated by voice_matching.enabled and .store_others.
+    """
+    try:
+        cfg = (_pipeline_config().get("voice_matching") or {})
+        if not cfg.get("enabled", True) or not cfg.get("store_others", True):
+            return {"enrolled": [], "skipped": [], "reason": "store_others disabled in config"}
+        people = {}
+        for e in mapping:
+            if e["kind"] in ("crm", "new"):
+                who = {"name": e["name"]}
+                if e.get("contact_id") is not None:
+                    who["crm_contact_id"] = e["contact_id"]
+                people[rename[e["label"]]] = who
+        if not people:
+            return {"enrolled": [], "skipped": [], "reason": "no confirmed non-host person"}
+        import voice_match
+        from voice_library import VoiceLibrary, default_library_dir
+        meta = gem.get("_meta") or {}
+        stem = Path(tpath).stem
+        return voice_match.enrol_people(
+            gem.get("transcript") or "", people, stem=stem, base=Path(tpath).parent.parent,
+            duration_sec=meta.get("audio_duration_seconds"),
+            library=VoiceLibrary(default_library_dir({"voice_matching": cfg})),
+            mic_offset_sec=(meta.get("channel_alignment") or {}).get("lag_seconds") or 0.0,
+            participants=[p.get("name") for p in gem.get("participants") or [] if isinstance(p, dict)],
+            device=str(cfg.get("device") or ""))
+    except Exception as exc:
+        logger.warning("voice enrolment failed (confirm unaffected): %s", exc)
+        return {"enrolled": [], "skipped": [], "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def confirm(source_id: int, mapping_raw: object, *, dry_run: bool = False, trigger: bool = True) -> dict:
     src = fetch_source(source_id)
     tpath = src["transcript_path"]
@@ -726,6 +860,10 @@ def confirm(source_id: int, mapping_raw: object, *, dry_run: bool = False, trigg
         conn.close()
 
     # The relabel is done; what follows is reported, never undone.
+    try:
+        result["voice_enrolment"] = enrol_voices(tpath, gem, mapping, rename)
+    except Exception as exc:   # enrol_voices already guards itself; this is the second shield
+        result["warnings"].append(f"voice enrolment failed: {exc}")
     if src["insight_count"]:
         try:
             result["flagged"] = _flag_insights(source_id)

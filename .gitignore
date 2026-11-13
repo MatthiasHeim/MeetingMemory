@@ -55,3 +55,7 @@ workflows/
 transcript-mcp-server/
 .claude/
 venv_py312/
+
+# Voice fingerprints are biometric data: never commit them (tools/voice_library.py)
+voice_library/
+*.npy
