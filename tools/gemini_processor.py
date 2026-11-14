@@ -386,6 +386,10 @@ class GeminiResult:
     # the digital system track, never the mic. Lands in `_meta`.
     system_track_attribution: Optional[dict] = None
 
+    # Log of the voice-matching stage (voice_match): per label best/runner-up
+    # NAMES and similarity scores, host check, conflicts. Never a vector.
+    voice_match: Optional[dict] = None
+
     # Admissibility verdict for the mic channel on this recording
     # (channel_vad.channel_separation_report). Distinguishes "attribution was
     # channel-verified" from "the channel oracle was unusable and skipped".
@@ -430,6 +434,8 @@ class GeminiResult:
             out["_meta"]["channel_separation"] = self.channel_separation
         if self.system_track_attribution is not None:
             out["_meta"]["system_track_attribution"] = self.system_track_attribution
+        if self.voice_match is not None:
+            out["_meta"]["voice_match"] = self.voice_match
         if self.speaker_attribution is not None:
             out["_meta"]["speaker_attribution"] = self.speaker_attribution
         return out
