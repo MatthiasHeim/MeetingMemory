@@ -241,7 +241,7 @@ def test_suggestions_wait_for_published_contextual_result():
         def choose(self,state,questions):return {'kind':'none','relation':'new'}
     engine=LiveEngine(snapshot=lambda _:None,judge=Judge(),contextual_cards=True,synchronous_prompts=True,
                       suggest_cards=lambda *args:calls.append(args) or [])
-    engine.lines=[LiveLine(0,10,'Ich','This is ordinary talk. The coffee is nice. The train arrived.')]
+    engine.lines=[LiveLine(0,10,'Ich','This is ordinary talk. The coffee is nice.'),LiveLine(10.5,12,'Andere','The train arrived.')]
     engine._request_suggestions()
     assert calls==[]
     engine._request_prompt_work()
