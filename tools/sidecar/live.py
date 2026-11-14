@@ -127,6 +127,60 @@ class LiveCard:
         return self.lines[-1].seconds if self.lines else 0.0
 
 
+CARD_REBIND_TOLERANCE_SECONDS = 1.0
+
+
+def _card_overlaps(left: LiveCard, right: LiveCard) -> bool:
+    if not left.lines or not right.lines:
+        return False
+    return (left.start_seconds <= right.end_seconds + CARD_REBIND_TOLERANCE_SECONDS
+            and right.start_seconds <= left.end_seconds + CARD_REBIND_TOLERANCE_SECONDS)
+
+
+def rebind_card(card: LiveCard, lines: Sequence[LiveLine]) -> LiveCard | None:
+    """Re-attach ``card`` to the current lines, or None when its speech is gone.
+
+    A later transcription pass can merge or rewrite the lines a card was built
+    on. The card is still true: the speaker still said it. It follows the lines
+    that now overlap its time range (same speaker), keeping its key and clean
+    text. It is dropped only when no such line is left.
+    """
+    sources = split_sources(lines)
+    by_id = {span.id: span for span in sources}
+
+    def _span_lines(spans: Sequence[Any]) -> tuple[TranscriptLine, ...]:
+        return tuple(TranscriptLine(span.line_index, span.seconds, format_timestamp(span.seconds),
+                                    span.speaker, span.text) for span in spans)
+
+    if card.spans:
+        if all(span.id in by_id for span in card.spans):
+            mapped = tuple(by_id[span.id] for span in card.spans)
+            return replace(card, spans=mapped, lines=_span_lines(mapped))
+        moments = [span.seconds for span in card.spans]
+        speakers = {_norm(span.speaker) for span in card.spans}
+    elif card.lines:
+        current = {(line.start, line.speaker, line.text): index for index, line in enumerate(lines)}
+        found = [current.get((old.seconds, old.speaker, old.text)) for old in card.lines]
+        if all(index is not None for index in found):
+            return replace(card, lines=tuple(lines[index].as_transcript_line(index) for index in found))
+        moments = [old.seconds for old in card.lines]
+        speakers = {_norm(old.speaker) for old in card.lines}
+    else:
+        return None
+    low = min(moments) - CARD_REBIND_TOLERANCE_SECONDS
+    high = max(moments) + CARD_REBIND_TOLERANCE_SECONDS
+    indexes = [index for index, line in enumerate(lines)
+               if _norm(line.speaker) in speakers and line.end >= low and line.start <= high]
+    if not indexes:
+        return None
+    if card.spans:
+        chosen = tuple(span for span in sources if span.line_index in indexes)
+        if not chosen:
+            return None
+        return replace(card, spans=chosen, lines=_span_lines(chosen))
+    return replace(card, lines=tuple(lines[index].as_transcript_line(index) for index in indexes))
+
+
 # An incoming line must overlap a committed line of the same speaker by more
 # than this share of the shorter interval before it can replace or drop it.
 OVERLAP_REPLACE_RATIO = 0.5
@@ -414,7 +468,13 @@ def commit_new_lines(
                 or _extends_fragment(previous.text, stored.text)
             )
             updated = False
-            if longer and covers:
+            # A rewrite that swallows several settled lines must keep their
+            # words. A shorter merge of them is a worse hearing: keep the lines.
+            swallowed = [other for index, other in enumerate(all_lines)
+                         if index != match_at and _same_speaker(other, stored)
+                         and _overlap_ratio(other, stored) > OVERLAP_REPLACE_RATIO]
+            lossless = not swallowed or len(stored.text) >= sum(len(o.text) for o in swallowed + [previous]) + len(swallowed)
+            if longer and covers and lossless:
                 all_lines[match_at] = LiveLine(
                     min(previous.start, stored.start),
                     max(previous.end, stored.end),
@@ -424,7 +484,8 @@ def commit_new_lines(
                 updated = True
             else:
                 extra = _continuation_words(previous.text, stored.text)
-                if extra and stored.end > previous.end + FRONTIER_SLACK_SECONDS:
+                # A continuation would also drop the swallowed lines: only when it swallows none.
+                if extra and not swallowed and stored.end > previous.end + FRONTIER_SLACK_SECONDS:
                     all_lines[match_at] = LiveLine(
                         previous.start,
                         max(previous.end, stored.end),
@@ -1328,29 +1389,19 @@ class LiveEngine:
                 self._prompt_consecutive_failures = 0
                 self._prompt_retry_at = 0.0
                 self._prompt_retry_end = None
-                # Never leave a card/clean rewrite attached to replaced text.
-                current = {
-                    (line.start, line.speaker, line.text): line.as_transcript_line(index)
-                    for index, line in enumerate(self.lines)
-                }
+                # Never leave a card/clean rewrite attached to replaced text:
+                # follow the rewritten lines, drop only when the speech is gone.
                 valid_cards = []
                 for card in self.cards:
-                    if card.spans:
-                        source_map = {span.id: span for span in split_sources(self.lines)}
-                        mapped_spans = [source_map.get(span.id) for span in card.spans]
-                        if all(span is not None for span in mapped_spans):
-                            valid_cards.append(replace(card, spans=tuple(mapped_spans), lines=tuple(
-                                TranscriptLine(span.line_index, span.seconds, format_timestamp(span.seconds),
-                                               span.speaker, span.text) for span in mapped_spans)))
-                        else:
-                            self._clean_attempts.pop(card.key, None)
-                        continue
-                    mapped = [current.get((line.seconds, line.speaker, line.text)) for line in card.lines]
-                    if all(line is not None for line in mapped):
-                        valid_cards.append(replace(card, lines=tuple(mapped)))
-                    else:
+                    moved = rebind_card(card, self.lines)
+                    if moved is None:
                         self._clean_attempts.pop(card.key, None)
+                    else:
+                        valid_cards.append(moved)
                 self.cards = valid_cards
+                for audience, held_cards in list(self._suggestions.items()):
+                    self._suggestions[audience] = [moved for moved in
+                        (rebind_card(card, self.lines) for card in held_cards) if moved is not None]
             needs_scores = (bool(self.lines) if self._contextual is not None else len(self._scores) < len(self.lines))
             if needs_scores and not self._prompt_status and (self._judge is not None or self._judge_factory is not None):
                 self._prompt_status = "Prompt-Erkennung läuft …"
@@ -1388,6 +1439,10 @@ class LiveEngine:
             if self._contextual_ready_key != tuple(span.id for span in all_sources):
                 return
             sources = all_sources[-12:]
+            # Nobody but the host has spoken: a client question or idea would
+            # be addressed to no one. Request cards are not affected.
+            if all(_norm(span.speaker) == "ich" for span in all_sources):
+                return
             if len(sources) < 3 or self._suggest_thread is not None:
                 return
             key = (self.audience, tuple(span.id for span in sources))
@@ -1609,6 +1664,17 @@ class LiveEngine:
                         if old is None or old.spans != evidence.spans:
                             self._clean_attempts.pop(evidence.key, None)
                         cards.append(LiveCard(evidence.key, source_lines, clean, evidence.kind, evidence.spans))
+                    if extractor.pending:
+                        # The extractor is still re-reading rewritten lines. Keep
+                        # shown cards (already re-attached to the new lines)
+                        # until it catches up, unless it re-found that speech.
+                        for kept in self.cards:
+                            if kept.key in {card.key for card in cards} or kept.kind.startswith("suggestion_"):
+                                continue
+                            if any(_card_overlaps(kept, card) for card in cards):
+                                continue
+                            cards.append(kept)
+                        cards.sort(key=lambda card: card.start_seconds)
                     self.cards = cards
                     self._contextual_ready_key = (tuple(span.id for span in extractor.sources)
                                                   if not extractor.pending else None)
@@ -1707,9 +1773,11 @@ class LiveEngine:
             else:
                 self._clean_attempts.pop(key, None)
                 cards.append(LiveCard(key, verbatim_lines, ""))
-        # Keep a card that was already shown if a later rescore drops it for one tick.
+        # Keep a card that was already shown if a later rescore drops it for one
+        # tick. Once its lines have been rescored, the new verdict stands.
+        unscored_from = self.lines[len(self._scores)].start if len(self._scores) < len(self.lines) else math.inf
         for card in self.cards:
-            if card.key not in seen:
+            if card.key not in seen and card.end_seconds + CARD_REBIND_TOLERANCE_SECONDS >= unscored_from:
                 cards.append(card)
         cards.sort(key=lambda card: card.start_seconds)
         self.cards = cards

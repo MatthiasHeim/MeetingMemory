@@ -177,7 +177,9 @@ def test_short_transcription_schedule_does_not_add_network_time_to_interval():
     # Starts every interval (gap .30), not interval + work (gap .50). The
     # schedule is deadline-based, so a bug would lengthen EVERY gap; a macOS CI
     # runner waking one timer late lengthens one (seen: .50 once, .214 at
-    # .14/.08). Judge the median of several gaps, not the single largest.
+    # .14/.08). Judge the MEAN gap: deadlines do not accumulate, so one late
+    # wake-up shifts the mean by jitter/5, while added network time shifts it
+    # by the full .20 (.50 vs .30). Midpoint limit .40.
     engine=LiveEngine(snapshot=lambda _:TailSnapshot(np.zeros(16),16000,None,16000,0,5),
                       transcriber=Transcriber(), interval=.30)
     engine.start()
@@ -185,8 +187,8 @@ def test_short_transcription_schedule_does_not_add_network_time_to_interval():
     while len(starts)<6 and time.monotonic()<deadline: time.sleep(.01)
     engine.retire(); engine._thread.join(2)
     assert len(starts)>=6
-    gaps=sorted(b-a for a,b in zip(starts,starts[1:]))
-    assert gaps[len(gaps)//2] < .42
+    gaps=[b-a for a,b in zip(starts,starts[1:])]
+    assert sum(gaps)/len(gaps) < .40
 
 
 def test_suggestions_require_valid_source_ids_and_copy_as_suggestions():
@@ -241,7 +243,7 @@ def test_suggestions_wait_for_published_contextual_result():
         def choose(self,state,questions):return {'kind':'none','relation':'new'}
     engine=LiveEngine(snapshot=lambda _:None,judge=Judge(),contextual_cards=True,synchronous_prompts=True,
                       suggest_cards=lambda *args:calls.append(args) or [])
-    engine.lines=[LiveLine(0,10,'Ich','This is ordinary talk. The coffee is nice. The train arrived.')]
+    engine.lines=[LiveLine(0,10,'Ich','This is ordinary talk. The coffee is nice.'),LiveLine(10.5,12,'Andere','The train arrived.')]
     engine._request_suggestions()
     assert calls==[]
     engine._request_prompt_work()

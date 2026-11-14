@@ -195,14 +195,48 @@ def jev_preference_enabled(config_path: str | Path | None) -> bool:
     return isinstance(raw, dict) and raw.get("use_decider", raw.get("use_jev")) is True
 
 
+def _read_preferences(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_preference_key(path: Path, key: str, value: Any) -> Path:
+    """Set one key and keep every other key, so the switches never erase each other."""
+    values = _read_preferences(path)
+    values[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def write_jev_preference(config_path: str | Path, enabled: bool) -> Path:
     """Persist the Preferences switch. The value must be an exact boolean."""
     if type(enabled) is not bool:
         raise ValueError("Jev preference must be a boolean")
     path = preference_path(config_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"use_decider": enabled}, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return path
+    legacy = _read_preferences(path)
+    if "use_jev" in legacy:  # superseded by use_decider; other keys are kept
+        legacy.pop("use_jev")
+        path.write_text(json.dumps(legacy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return _write_preference_key(path, "use_decider", enabled)
+
+
+WINDOW_MODES = ("meeting", "internal")
+DEFAULT_WINDOW_MODE = "meeting"
+
+
+def read_window_mode(path: str | Path | None) -> str:
+    """Live window mode from the preferences file. Missing, old or malformed means meeting mode."""
+    if path is None:
+        return DEFAULT_WINDOW_MODE
+    value = _read_preferences(Path(path)).get("window_mode")
+    return value if value in WINDOW_MODES else DEFAULT_WINDOW_MODE
+
+
+def write_window_mode(path: str | Path, mode: str) -> Path:
+    if mode not in WINDOW_MODES:
+        raise ValueError("unknown window mode")
+    return _write_preference_key(Path(path), "window_mode", mode)
