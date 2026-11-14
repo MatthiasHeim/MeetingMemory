@@ -24,6 +24,63 @@ def surface_rect(width: float, height: float, *, fullscreen: bool = False) -> tu
     return (width - surface_width - margin, margin, surface_width, surface_height)
 
 
+HEADER_HEIGHT = 44.0
+MEETING_COLUMNS_MIN_WIDTH = 720.0
+# Meeting mode shows only the transcript, the cards and what is needed to start or stop.
+MEETING_CONTROLS = frozenset({"title", "state", "window_mode", "record", "transcript", "cards", "jump"})
+INTERNAL_CONTROLS = MEETING_CONTROLS | frozenset({
+    "view_size", "fullscreen", "help", "audience", "speakers", "topic", "clip", "copy_transcript", "status", "consent"})
+
+
+def visible_controls(window_mode: str) -> frozenset:
+    """Unknown modes fail to the quiet, screen-share-safe set."""
+    return INTERNAL_CONTROLS if window_mode == "internal" else MEETING_CONTROLS
+
+
+def meeting_layout(width: float, height: float) -> dict[str, tuple[float, float, float, float]]:
+    """Bottom-origin rects (x, y, w, h) using the whole window, no margin or backdrop."""
+    pad = 14.0
+    top = height - HEADER_HEIGHT
+    label_h = 18.0
+    rects = {"title": (pad, height - 46, 160, 38), "window_mode": (width - 140 - pad, height - 36, 140, 26)}
+    rects["record"] = (rects["window_mode"][0] - 150 - 8, height - 37, 150, 28)
+    if width >= 640:  # on a narrow window the record button already says what is happening
+        rects["state"] = (rects["record"][0] - 170, height - 30, 160, 18)
+    if width >= MEETING_COLUMNS_MIN_WIDTH:
+        gap = 16.0
+        left = round((width - 2 * pad - gap) * 0.56)
+        right = width - 2 * pad - gap - left
+        body = max(60.0, top - pad - label_h)
+        rects["transcript_label"] = (pad, top - label_h, left, label_h)
+        rects["cards_label"] = (pad + left + gap, top - label_h, right, label_h)
+        rects["transcript"] = (pad, pad, left, body)
+        rects["cards"] = (pad + left + gap, pad, right, body)
+    else:
+        usable = max(120.0, top - pad - 2 * label_h - 10)
+        transcript_h = usable * 0.55
+        cards_h = usable - transcript_h
+        rects["transcript_label"] = (pad, top - label_h, width - 2 * pad, label_h)
+        rects["transcript"] = (pad, top - label_h - transcript_h, width - 2 * pad, transcript_h)
+        cards_label_y = top - label_h - transcript_h - 10 - label_h
+        rects["cards_label"] = (pad, cards_label_y, width - 2 * pad, label_h)
+        rects["cards"] = (pad, pad, width - 2 * pad, max(40.0, cards_label_y - pad))
+    return rects
+
+
+FOLLOW_SLACK = 24.0
+
+
+def is_at_bottom(offset: float, viewport: float, content: float, slack: float = FOLLOW_SLACK) -> bool:
+    """True when the visible area reaches the end of the content (or nothing scrolls)."""
+    return offset + viewport >= content - slack
+
+
+def scroll_offset_after_update(follow: bool, old_offset: float, viewport: float, new_content: float) -> float:
+    """Follow the end only while following; otherwise stay exactly where the reader is."""
+    furthest = max(0.0, new_content - viewport)
+    return furthest if follow else min(max(0.0, old_offset), furthest)
+
+
 PANEL_HELP = (
     "Aufnahme starten / beenden\n"
     "Startet Mikrofon und Systemton oder speichert die laufende Aufnahme. "
@@ -41,10 +98,13 @@ PANEL_HELP = (
     "Während einer Aufnahme nutzt du das Themenfeld in diesem Fenster.\n\n"
     "Diktierte Aufgaben kopieren …\n"
     "Sucht markierte oder erkannte Aufgaben in einem gespeicherten Transkript. Du wählst aus, was kopiert wird.\n\n"
-    "Fenster und Ansichten\n"
-    "Kompakt und Präsentation zeigen dieselbe Aufnahme. Grossziehen zeigt den Hintergrund; "
-    "Kleinziehen blendet ihn aus. Vollbild ist separat verfügbar. "
-    "Schliessen versteckt nur das Fenster. «Recorder-Fenster öffnen» im Menü bringt es zurück.\n\n"
+    "Meeting / Intern\n"
+    "Meeting ist die ruhige Ansicht zum Teilen: Transkript, Karten und Aufnahme-Knopf, immer ohne private Hinweise. "
+    "Intern zeigt alle Schalter (Teilnehmende, Auszug, Kompakt/Präsentation, Vollbild, Hilfe). "
+    "Die Wahl bleibt gespeichert. Schliessen versteckt nur das Fenster. «Recorder-Fenster öffnen» im Menü bringt es zurück.\n\n"
+    "Scrollen\n"
+    "Das Fenster folgt dem Neuesten nur, solange du am Ende bist. Scrollst du nach oben, bleibt die Ansicht stehen; "
+    "«↓ Zum Neuesten» springt zurück und folgt wieder.\n\n"
     "Kundenansicht / Intern · privat\n"
     "Kundenansicht zeigt allgemeine KI-Ideen und blendet interne Hinweise sofort aus. "
     "Intern kann private Beratung enthalten. Diese Wahl gilt unabhängig von Fenstergrösse und Vollbild. "

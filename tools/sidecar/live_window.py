@@ -13,17 +13,22 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .live import LiveCard, LiveLine
-from .panel_layout import COMPACT_SIZE, MINIMUM_SIZE, PANEL_HELP, panel_mode, surface_rect, visible_cards, transcript_content, source_ranges, transcript_copy_text, utf16_length
+from .panel_layout import (COMPACT_SIZE, MINIMUM_SIZE, PANEL_HELP, is_at_bottom, meeting_layout, panel_mode,
+                           scroll_offset_after_update, surface_rect, visible_cards, visible_controls,
+                           transcript_content, source_ranges, transcript_copy_text, utf16_length)
+from .recorder_support import DEFAULT_WINDOW_MODE, PREFERENCE_FILENAME, read_window_mode, write_window_mode
 from .transcript import format_timestamp
 
 NONACTIVATING_PANEL_MASK = 1 << 7
 FLOATING_WINDOW_LEVEL = 3
+DEFAULT_PREFERENCES_PATH = Path.home() / "Documents" / "MeetingRecorder" / PREFERENCE_FILENAME
 BACKGROUND_PATH = Path(__file__).with_name("assets") / "meeting-background-lailix-logo-raised.png"
 
 try:
     import AppKit as A
     import Quartz  # Register CoreGraphics metadata used by CALayer colours.
-    from Foundation import NSObject, NSMakeRect, NSMakeSize, NSMakeRange, NSString
+    import objc
+    from Foundation import NSObject, NSMakeRect, NSMakeSize, NSMakeRange, NSString, NSNotificationCenter
 except ImportError:  # Geometry/help remain importable on non-macOS test hosts.
     A = None
     NSObject = object
@@ -115,8 +120,27 @@ class _BackdropView(A.NSView if A is not None else object):
         )
 
 
+class _FollowScroll(A.NSScrollView if A is not None else object):
+    """A scroll view that tells its panel when the reader moved it."""
+    on_user_scroll = None
+
+    def scrollWheel_(self, event):
+        objc.super(_FollowScroll, self).scrollWheel_(event)
+        if self.on_user_scroll is not None:
+            self.on_user_scroll()
+
+
 class _PanelTarget(NSObject):
     panel = None
+
+    def changeWindowMode_(self, sender):
+        self.panel.set_window_mode("meeting" if sender.selectedSegment() == 0 else "internal")
+
+    def jumpLatest_(self, sender):
+        self.panel.jump_to_latest("transcript" if int(sender.tag()) == 0 else "cards")
+
+    def liveScrolled_(self, _notification):
+        self.panel._sync_follow()
 
     def copyClip_(self, _sender):
         self.panel.copy_clip()
@@ -175,7 +199,12 @@ class _PanelTarget(NSObject):
 
 class LivePanel:
     def __init__(self, *, on_copy_clip: Callable[[str], None], on_copy_card: Callable[[str], None],
-                 on_toggle_recording: Callable[[], None] | None = None):
+                 on_toggle_recording: Callable[[], None] | None = None,
+                 preferences_path: Path | None = None):
+        self._preferences_path = Path(preferences_path) if preferences_path else DEFAULT_PREFERENCES_PATH
+        self.window_mode = read_window_mode(self._preferences_path)
+        # Auto-follow the newest content only while the reader is at the end.
+        self._follow = {"transcript": True, "cards": True}
         self._on_copy_clip = on_copy_clip
         self._on_copy_card = on_copy_card
         self._on_toggle_recording = on_toggle_recording
@@ -307,8 +336,29 @@ class LivePanel:
         self._audience_control.setTarget_(self._target)
         self._audience_control.setAction_("changeAudience:")
         self._audience_control.setToolTip_("Kundenansicht blendet interne KI-Hinweise sofort aus. Unabhängig von Kompakt oder Präsentation.")
+        self._window_control = A.NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 160, 26))
+        self._window_control.setSegmentCount_(2)
+        for i, title in enumerate(("Meeting", "Intern")):
+            self._window_control.setLabel_forSegment_(title, i)
+            self._window_control.setWidth_forSegment_(70, i)
+        self._window_control.setSelectedSegment_(0 if self.window_mode == "meeting" else 1)
+        self._window_control.setTarget_(self._target)
+        self._window_control.setAction_("changeWindowMode:")
+        self._window_control.setToolTip_("Meeting: ruhige Ansicht zum Teilen. Intern: alle Schalter und KI-Ideen mit privaten Hinweisen.")
         self._transcript_scroll, self.transcript_text = self._scroll_text()
         self.cards_scroll = self._scroll()
+        self._jump_buttons = {}
+        for tag, which in enumerate(("transcript", "cards")):
+            button = self._button("↓ Zum Neuesten", "jumpLatest:", "Springt zum neuesten Eintrag und folgt wieder automatisch.")
+            button.setTag_(tag)
+            button.setFont_(_font(11))
+            button.setHidden_(True)
+            self._jump_buttons[which] = button
+        for which, scroll in (("transcript", self._transcript_scroll), ("cards", self.cards_scroll)):
+            scroll.on_user_scroll = self._sync_follow
+            scroll.setPostsBoundsChangedNotifications_(False)
+            NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+                self._target, "liveScrolled:", "NSScrollViewDidLiveScrollNotification", scroll)
         self.cards_document = _TopView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 100))
         self.cards_scroll.setDocumentView_(self.cards_document)
         self._help_scroll, self._help_text = self._scroll_text()
@@ -336,8 +386,19 @@ class LivePanel:
         for view in (self._title, self._state_label, self._mode_control, self._fullscreen_button,
                      self._help_button, self._audience_control, self._transcript_label, self._copy_transcript_button,
                      self._cards_label, self._transcript_scroll, self.cards_scroll, self._help_scroll, self.status_field,
-                     self.topic_field, self._speakers_label, self.speakers_field, self._clip_button, self._record_button, self._consent_hint):
+                     self.topic_field, self._speakers_label, self.speakers_field, self._clip_button, self._record_button, self._consent_hint,
+                     self._window_control, *self._jump_buttons.values()):
             self._surface.addSubview_(view)
+        # Which views belong to which named control (see panel_layout.visible_controls).
+        self._control_views = {
+            "title": (self._title,), "state": (self._state_label,), "window_mode": (self._window_control,),
+            "record": (self._record_button,), "view_size": (self._mode_control,), "fullscreen": (self._fullscreen_button,),
+            "help": (self._help_button,), "audience": (self._audience_control,),
+            "speakers": (self._speakers_label, self.speakers_field), "topic": (self.topic_field,),
+            "clip": (self._clip_button,), "copy_transcript": (self._copy_transcript_button,),
+            "status": (self.status_field,), "consent": (self._consent_hint,),
+            "transcript": (self._transcript_scroll, self._transcript_label),
+            "cards": (self.cards_scroll, self._cards_label)}
         self._built = True
         self._layout()
         self._render_transcript()
@@ -352,6 +413,13 @@ class LivePanel:
         try:
             bounds = self.panel.contentView().bounds()
             width, height = bounds.size.width, bounds.size.height
+            allowed = visible_controls(self.window_mode)
+            for name, views in self._control_views.items():
+                for view in views:
+                    view.setHidden_(name not in allowed)
+            if self.window_mode == "meeting":
+                self._layout_meeting(width, height)
+                return
             self._view_mode = panel_mode(width, height, fullscreen=self._fullscreen)
             presentation = self._view_mode == "presentation"
             self._backdrop.setHidden_(not presentation)
@@ -367,6 +435,8 @@ class LivePanel:
             self._state_label.setAlignment_(A.NSTextAlignmentRight)
             self._mode_control.setFrame_(NSMakeRect(18, h - 82, 222, 28))
             self._mode_control.setSelectedSegment_(1 if presentation else 0)
+            self._window_control.setFrame_(NSMakeRect(140, h - 46, 140, 26))
+            self._window_control.setSelectedSegment_(1)
             self._fullscreen_button.setFrame_(NSMakeRect(w - 126, h - 82, 80, 28))
             self._help_button.setFrame_(NSMakeRect(w - 48, h - 82, 32, 28))
             self._audience_control.setFrame_(NSMakeRect(18, h - 115, 300, 26))
@@ -396,6 +466,7 @@ class LivePanel:
                          self._copy_transcript_button, self._cards_label):
                 view.setHidden_(self._help_open)
             self._help_scroll.setHidden_(not self._help_open)
+            self._place_jump_buttons()
             self.status_field.setFrame_(NSMakeRect(20, 78, w - 40, 32))
             self.topic_field.setFrame_(NSMakeRect(20, 44, w - 178, 26))
             self._clip_button.setFrame_(NSMakeRect(w - 152, 43, 132, 28))
@@ -407,6 +478,86 @@ class LivePanel:
             self._render_cards()
         finally:
             self._laying_out = False
+
+    def _layout_meeting(self, width: float, height: float) -> None:
+        """Meeting mode: the whole window for transcript and cards, almost no controls."""
+        self._view_mode = "meeting"
+        self._help_open = False
+        self._help_scroll.setHidden_(True)
+        self._backdrop.setHidden_(True)
+        self._surface.setFrame_(NSMakeRect(0, 0, width, height))
+        self._surface.layer().setCornerRadius_(0)
+        self._surface.layer().setBorderWidth_(0)
+        rects = meeting_layout(width, height)
+        self._state_label.setHidden_("state" not in rects)
+        for name, view in (("title", self._title), ("state", self._state_label), ("window_mode", self._window_control),
+                           ("record", self._record_button), ("transcript", self._transcript_scroll),
+                           ("cards", self.cards_scroll), ("transcript_label", self._transcript_label),
+                           ("cards_label", self._cards_label)):
+            if name in rects:
+                view.setFrame_(NSMakeRect(*rects[name]))
+        self._state_label.setAlignment_(A.NSTextAlignmentRight)
+        self._window_control.setSelectedSegment_(0)
+        self._cards_label.setHidden_(False)
+        self._transcript_label.setHidden_(False)
+        self.transcript_text.setFont_(_font(16))
+        self._fit_text_view(self._transcript_scroll, self.transcript_text)
+        self._place_jump_buttons()
+        self._render_cards()
+
+    def _place_jump_buttons(self) -> None:
+        for which, scroll in (("transcript", self._transcript_scroll), ("cards", self.cards_scroll)):
+            frame = scroll.frame()
+            button = self._jump_buttons[which]
+            button.setFrame_(NSMakeRect(frame.origin.x + frame.size.width - 142, frame.origin.y + 6, 134, 26))
+        self._update_jump_buttons()
+
+    def _update_jump_buttons(self) -> None:
+        allowed = "jump" in visible_controls(self.window_mode)
+        for which, button in self._jump_buttons.items():
+            button.setHidden_(self._follow[which] or not allowed or (self._help_open and self.window_mode != "meeting"))
+
+    def _scroll_geometry(self, which: str):
+        scroll = self._transcript_scroll if which == "transcript" else self.cards_scroll
+        clip = scroll.contentView()
+        document = scroll.documentView()
+        return scroll, clip, float(clip.bounds().origin.y), float(clip.bounds().size.height), float(document.frame().size.height)
+
+    def _sync_follow(self) -> None:
+        """Called only for reader-made scrolls: following resumes at the end, stops anywhere else."""
+        if not self._built:
+            return
+        for which in ("transcript", "cards"):
+            _scroll, _clip, offset, viewport, content = self._scroll_geometry(which)
+            self._follow[which] = is_at_bottom(offset, viewport, content)
+        self._update_jump_buttons()
+
+    def _apply_scroll(self, which: str, old_offset: float) -> None:
+        scroll, clip, _offset, viewport, content = self._scroll_geometry(which)
+        target = scroll_offset_after_update(self._follow[which], old_offset, viewport, content)
+        clip.scrollToPoint_((0, target))
+        scroll.reflectScrolledClipView_(clip)
+        self._update_jump_buttons()
+
+    def jump_to_latest(self, which: str) -> None:
+        if which not in self._follow or not self._built:
+            return
+        self._follow[which] = True
+        self._apply_scroll(which, 0.0)
+
+    def set_window_mode(self, mode: str, *, persist: bool = True) -> None:
+        if mode not in {"meeting", "internal"}:
+            raise ValueError("unknown window mode")
+        self.window_mode = mode
+        if mode == "meeting" and self.audience != "client":
+            self.set_audience("client")  # never show private hints in the shareable mode
+        if persist:
+            try:
+                write_window_mode(self._preferences_path, mode)
+            except OSError:
+                pass
+        if self._built:
+            self._layout()
 
     def set_mode(self, mode: str) -> None:
         if mode not in {"compact", "presentation"}:
@@ -560,6 +711,12 @@ class LivePanel:
         self._highlighted_key = key if key in self._expanded_keys else None
         self._render_transcript()
         self._render_cards()
+        selected = self.displayed_cards[index]
+        ranges = source_ranges(self._lines, selected.spans) if key in self._expanded_keys else []
+        if ranges:
+            self._follow["transcript"] = False
+            self.transcript_text.scrollRangeToVisible_(NSMakeRange(*ranges[0]))
+            self._update_jump_buttons()
 
     def apply_update(self, lines: Sequence[LiveLine], cards: Sequence[LiveCard], status: str) -> None:
         snapshot_lines, snapshot_cards = tuple(lines), tuple(cards)
@@ -593,9 +750,7 @@ class LivePanel:
         self.status_field.setStringValue_(self._status or hint)
 
     def _render_transcript(self) -> None:
-        visible = self.transcript_text.visibleRect()
-        old_height = self.transcript_text.frame().size.height
-        follow = visible.origin.y + visible.size.height >= old_height - 30
+        old_offset = float(self._transcript_scroll.contentView().bounds().origin.y)
         value, _offsets = transcript_content(self._lines)
         if not value:
             value = ("Sobald du sprichst, erscheint hier das Transkript." if self._recording_state == "recording"
@@ -608,10 +763,9 @@ class LivePanel:
         storage = self.transcript_text.textStorage()
         for start, length in ranges:
             storage.addAttribute_value_range_(A.NSBackgroundColorAttributeName, _color("F5E6AE"), NSMakeRange(start, length))
-        if ranges:
-            self.transcript_text.scrollRangeToVisible_(NSMakeRange(*ranges[0]))
-        elif follow and self._lines:
-            self.transcript_text.scrollRangeToVisible_(NSMakeRange(utf16_length(value), 0))
+        # The highlight is shown once, when the reader opens a card's source
+        # (toggle_source); a later update never pulls the view back to it.
+        self._apply_scroll("transcript", old_offset)
 
     def _render_cards(self) -> None:
         if self.cards_document is None:
@@ -622,7 +776,7 @@ class LivePanel:
         self._card_rows = []
         width = float(self.cards_scroll.contentView().bounds().size.width)
         viewport_h = self.cards_scroll.contentView().bounds().size.height
-        body_font = _font(15 if self.view_mode == "presentation" else 14)
+        body_font = _font(15 if self.view_mode in ("presentation", "meeting") else 14)
         source_font = _font(13)
         y = 0.0
         displayed = self.displayed_cards
@@ -674,8 +828,7 @@ class LivePanel:
             self._card_rows.append(row)
             y += height + 12
         self.cards_document.setFrame_(NSMakeRect(0, 0, width, max(viewport_h, y)))
-        self.cards_scroll.contentView().scrollToPoint_((0, min(old_origin.y, max(0, y - viewport_h))))
-        self.cards_scroll.reflectScrolledClipView_(self.cards_scroll.contentView())
+        self._apply_scroll("cards", float(old_origin.y))
 
     def _button(self, title: str, action: str, tip: str):
         button = A.NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 28))
@@ -705,7 +858,7 @@ class LivePanel:
 
     @staticmethod
     def _scroll():
-        scroll = A.NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 100))
+        scroll = _FollowScroll.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 100))
         scroll.setHasVerticalScroller_(True)
         scroll.setAutohidesScrollers_(True)
         scroll.setBorderType_(A.NSNoBorder)
