@@ -153,3 +153,29 @@ def test_wav_gone_is_not_stuck(env):
 def test_missing_log_is_exit_2(env):
     log, tr = env
     assert run(log, tr, "2026-11-10 08:00:00") == 2
+
+
+# ---- escalation ladder (PR #32 review P1) --------------------------------
+
+ESCALATION_HANG = """\
+2026-11-09 22:37:00 - INFO - Starting Gemini processing: 2026-11-09_21-29-23.wav
+2026-11-09 22:38:39 - INFO - Sending to Gemini API...
+2026-11-09 22:50:00 - INFO - Gemini processing complete in 700.0s
+2026-11-09 22:50:01 - WARNING - Validation failed: coverage 40%
+2026-11-09 22:50:02 - INFO - Escalation: retrying fresh single-call on pro...
+"""
+
+
+def test_flags_hang_inside_escalation_after_processing_complete(env, capsys):
+    log, tr = env
+    log.write_text(ESCALATION_HANG)
+    assert run(log, tr, "2026-11-10 08:00:00") == 1
+    assert "2026-11-09_21-29-23" in capsys.readouterr().out
+
+
+def test_escalated_run_that_saved_is_ok(env):
+    log, tr = env
+    log.write_text(ESCALATION_HANG
+                   + "2026-11-09 22:58:00 - INFO - Escalation: fresh single-call retry passed validation\n"
+                   + "2026-11-09 22:59:00 - INFO - Saved result to: 2026-11-09_21-29-23.json\n")
+    assert run(log, tr, "2026-11-10 08:00:00") == 0

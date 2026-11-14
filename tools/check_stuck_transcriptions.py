@@ -14,7 +14,7 @@ the call and the save.
 
 Rule: a recording is STUCK when watcher.log's most recent processing attempt
 for it logged "Sending to Gemini API..." more than --max-hours ago (default 2),
-with no "Gemini processing complete" after it, Transcripts/<stem>.json does
+with no "Saved result to: <stem>.json" after it, Transcripts/<stem>.json does
 not exist, and Recordings/<stem>.wav still exists. (A recording whose WAV is
 gone cannot be re-queued by a watcher restart, so it is not "stuck in the
 pipeline"; prune_recordings.py only deletes WAVs that already have a JSON.)
@@ -55,7 +55,10 @@ TAIL_BYTES = 4 * 1024 * 1024
 LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) - \w+ - (.*)$")
 START_RE = re.compile(r"^Starting Gemini processing: (.+?)\.wav\s*$")
 SENDING = "Sending to Gemini API..."
-COMPLETE_PREFIX = "Gemini processing complete"
+# "Gemini processing complete" is logged after the FIRST Gemini call, before the
+# validation/escalation ladder, whose retries can hang without another
+# "Sending..." line. So only a saved transcript ends a pending attempt.
+SAVED_RE = re.compile(r"^Saved result to: (.+?)\.json\s*$")
 
 
 @dataclass
@@ -100,8 +103,11 @@ def pending_sends(lines: list[str]) -> dict[str, datetime]:
             continue
         if msg.startswith(SENDING):
             pending[current] = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-        elif msg.startswith(COMPLETE_PREFIX):
-            pending.pop(current, None)
+        else:
+            saved = SAVED_RE.match(msg)
+            if saved:
+                pending.pop(saved.group(1), None)
+                pending.pop(current, None)
     return pending
 
 
