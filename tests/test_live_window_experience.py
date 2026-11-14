@@ -258,3 +258,11 @@ def test_scrolled_up_view_is_not_pulled_back_and_jump_resumes(tmp_path, monkeypa
         assert panel._jump_buttons["transcript"].isHidden() is True
     finally:
         panel.close()
+
+
+def test_continuation_does_not_delete_other_settled_lines():
+    settled = [LiveLine(0.0, 3.5, "Ich", "alpha beta gamma delta"),
+               LiveLine(3.6, 8.0, "Ich", "critical omitted words here")]
+    incoming = LiveLine(0.0, 7.6, "Ich", "alpha beta gamma delta extra words")
+    lines, _added, _revised = commit_new_lines(settled, [incoming])
+    assert [l.text for l in lines] == [l.text for l in settled]

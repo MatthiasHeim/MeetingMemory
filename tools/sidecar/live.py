@@ -484,7 +484,8 @@ def commit_new_lines(
                 updated = True
             else:
                 extra = _continuation_words(previous.text, stored.text)
-                if extra and stored.end > previous.end + FRONTIER_SLACK_SECONDS:
+                # A continuation would also drop the swallowed lines: only when it swallows none.
+                if extra and not swallowed and stored.end > previous.end + FRONTIER_SLACK_SECONDS:
                     all_lines[match_at] = LiveLine(
                         previous.start,
                         max(previous.end, stored.end),
