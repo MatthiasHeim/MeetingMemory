@@ -163,6 +163,17 @@ except ImportError as e:
     SYSTEM_TRACK_ATTRIBUTION_AVAILABLE = False
     _SYSTEM_TRACK_IMPORT_ERROR = str(e)
 
+# Voice matching: WHICH person speaks, from a local speaker-embedding model and
+# a local voice library (biometric; never leaves this machine, never lands in
+# the transcript JSON or the database). Report-only unless
+# voice_matching.auto_apply is true.
+try:
+    import voice_match as _voice_match
+    VOICE_MATCH_AVAILABLE = True
+except ImportError as e:
+    VOICE_MATCH_AVAILABLE = False
+    _VOICE_MATCH_IMPORT_ERROR = str(e)
+
 # Semantic speaker-coherence gate: the repair path for the (common) case where
 # the mic channel bleeds and channel attribution is inadmissible. Runs after
 # transcription and BEFORE the JSON write, so no insight is ever extracted
@@ -1515,6 +1526,12 @@ class TranscribeWatcher:
             self._system_track_attribution_inplace(
                 result, channel_vad, cal_match, audio_duration
             )
+            # Step 4b2b: Voice matching (who, not just host/remote). Reads the
+            # same system-track activity and the aligned 3-channel file; logs
+            # to `_meta.voice_match`; renames only with auto_apply.
+            self._voice_matching_inplace(
+                result, audio_file, analysis_file, channel_vad, audio_duration
+            )
             save_trial_stage(self.config, audio_file, "before_coherence",
                              result.parsed_response, known_attendees=known_attendees,
                              audio_sha256=trial_audio_sha256)
@@ -2412,6 +2429,75 @@ class TranscribeWatcher:
                 )
         except Exception as e:
             self.logger.warning(f"System-track attribution failed: {e}")
+
+    def _voice_matching_inplace(self, result, audio_file: Path, analysis_file: Path,
+                                channel_vad, audio_duration: Optional[float]) -> None:
+        """Voice-fingerprint matching of transcript labels. Never raises.
+
+        Stores a names-and-scores-only log on `result.voice_match`. Changes
+        the transcript only with `voice_matching.auto_apply: true`, and then
+        only GENERIC labels with a clear, conflict-free match. Two-track
+        recordings only: single-source / in-room recordings are skipped.
+        """
+        try:
+            if not VOICE_MATCH_AVAILABLE:
+                self.logger.warning(
+                    f"voice_match unavailable; voices not matched ({_VOICE_MATCH_IMPORT_ERROR})")
+                return
+            if not _voice_match.voice_config(self.config)["enabled"]:
+                self.logger.info("voice_matching disabled in config; skipping")
+                return
+            remote = None
+            source = None
+            if channel_vad is not None and SYSTEM_TRACK_ATTRIBUTION_AVAILABLE:
+                remote = _RemoteActivity.from_vad(channel_vad)
+                # Aligned copy when alignment ran (mic and system share one
+                # timeline there); otherwise the original recording.
+                source = _voice_match.three_channel_source(analysis_file)
+            host_verified = False
+            try:
+                from speaker_integrity import system_track_verdict
+                host_verified = bool(system_track_verdict(
+                    getattr(result, "system_track_attribution", None))["satisfied"])
+            except Exception:
+                pass
+            names = [p.get("name") for p in (result.participants or []) if isinstance(p, dict)]
+            log, rename = _voice_match.process(
+                result.transcript, source=source, remote=remote,
+                duration_sec=audio_duration, participants=names, stem=audio_file.stem,
+                config=self.config, host_verified=host_verified,
+            )
+            if rename:
+                from speaker_review import rename_labels
+                view = {"transcript": result.transcript,
+                        "participants": copy.deepcopy(result.participants),
+                        "speaker_emotions": copy.deepcopy(result.speaker_emotions),
+                        "interruptions": copy.deepcopy(result.interruptions),
+                        "speaker_pacing": copy.deepcopy(result.speaker_pacing),
+                        "energy_levels": copy.deepcopy(result.energy_levels)}
+                changed = rename_labels(view, rename)
+                if changed:
+                    result.transcript = view["transcript"]
+                    result.participants = view["participants"]
+                    result.speaker_emotions = view["speaker_emotions"]
+                    result.interruptions = view["interruptions"]
+                    result.speaker_pacing = view["speaker_pacing"]
+                    result.energy_levels = view["energy_levels"]
+                log["lines_renamed"] = changed
+            result.voice_match = log
+            if not log.get("ran"):
+                self.logger.info(f"Voice matching not run: {log.get('reason')}")
+            else:
+                verdicts = [m["verdict"] for m in log["labels"].values()]
+                self.logger.info(
+                    f"Voice matching: {verdicts.count('clear')} clear, "
+                    f"{verdicts.count('possible')} possible, {verdicts.count('none')} none; "
+                    f"{len(log['conflicts'])} conflict(s), {len(rename)} rename(s), "
+                    f"host check {((log.get('host_check') or {}).get('reason') or 'ok')}, "
+                    f"{log.get('runtime_seconds')}s"
+                )
+        except Exception as e:
+            self.logger.warning(f"Voice matching failed: {e}")
 
     def _verify_speakers_inplace(self, result, channel_vad,
                                  cal_match: Optional[dict]) -> None:
