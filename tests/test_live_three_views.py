@@ -59,18 +59,20 @@ def test_view_persistence_roundtrip_and_old_values(tmp_path):
 # ---- visible controls ---------------------------------------------------------------
 
 def test_visible_controls_per_view():
-    for forbidden in ("audience", "speakers", "topic", "clip", "help", "copy_transcript", "transcript", "ctx_claude"):
+    for forbidden in ("audience", "speakers", "topic", "clip", "help", "ctx_claude", "recent"):
         assert forbidden not in MEETING_CONTROLS
-    assert {"window_mode", "state", "record", "cards", "recent", "marker"} <= MEETING_CONTROLS
+    for view in VIEWS:  # the transcript and its copy button are in every view
+        assert {"transcript", "transcript_label", "copy_transcript"} <= visible_controls(view)
+    assert {"window_mode", "state", "record", "cards", "marker"} <= MEETING_CONTROLS
     assert {"ctx_label", "ctx_range", "ctx_copy", "ctx_claude", "cards"} <= AMBIENT_CONTROLS
-    for forbidden in ("audience", "speakers", "topic", "clip", "help", "copy_transcript", "recent"):
+    for forbidden in ("audience", "speakers", "topic", "clip", "help", "recent"):
         assert forbidden not in AMBIENT_CONTROLS
     assert {"transcript", "copy_transcript", "audience", "help", "speakers", "topic", "clip", "cards"} <= INTERNAL_CONTROLS
     assert "ctx_claude" not in INTERNAL_CONTROLS and "recent" not in INTERNAL_CONTROLS
     for view in VIEWS:
         assert {"window_mode", "record", "state"} <= visible_controls(view)
     # full screen adds only what the roomier layout draws
-    assert "transcript" in visible_controls("ambient", fullscreen=True) and "transcript" not in visible_controls("ambient")
+    assert visible_controls("ambient", fullscreen=True) == AMBIENT_CONTROLS
     assert "rail" in visible_controls("internal", fullscreen=True)
     assert visible_controls("meeting", fullscreen=True) == MEETING_CONTROLS
 
@@ -141,7 +143,7 @@ def test_layout_rects_fit_and_content_areas_do_not_overlap(view, size):
         if name in {"state", "help", "status"}:
             continue  # optional on narrow windows
         assert name in rects, name
-    areas = [n for n in ("cards", "transcript", "recent", "rail", "ctx_range", "ctx_copy", "ctx_claude", "speakers",
+    areas = [n for n in ("cards", "transcript", "copy_transcript", "transcript_label", "rail", "ctx_range", "ctx_copy", "ctx_claude", "speakers",
                          "topic", "clip", "window_mode", "record") if n in rects]
     if view == "internal" and fullscreen:
         areas = [n for n in areas if n not in {"speakers", "topic", "clip"}]  # those sit on the rail
@@ -171,7 +173,20 @@ def test_fullscreen_layouts_are_roomier_and_view_specific():
     assert internal["rail"][0] > internal["transcript"][0] + internal["transcript"][2]
     for name in ("speakers", "topic", "clip"):
         assert inside(internal[name], *internal["rail"][2:]) or internal[name][0] >= internal["rail"][0]
-    assert "transcript" not in view_layout("meeting", 1440, 900, fullscreen=True)
+    mfull = view_layout("meeting", 1440, 900, fullscreen=True)     # three point columns, transcript band below
+    assert mfull["transcript"][1] + mfull["transcript"][3] < mfull["cards"][1] and mfull["transcript"][2] == mfull["cards"][2]
+    assert mfull["transcript"][3] > 100
+
+
+@pytest.mark.parametrize("view", ["meeting", "ambient"])
+def test_transcript_pane_in_meeting_and_ambient_by_size(view):
+    narrow = view_layout(view, 480, 760)                            # points on top, ~40% transcript below
+    body = narrow["cards"][1] + narrow["cards"][3] - narrow["transcript"][1]
+    assert narrow["transcript"][1] < narrow["cards"][1]
+    assert 0.3 < narrow["transcript"][3] / body < 0.5
+    assert narrow["copy_transcript"][1] > narrow["transcript"][1] + narrow["transcript"][3] - 1
+    wide = view_layout(view, 1000, 700)                             # transcript as right-hand column
+    assert wide["transcript"][0] >= wide["cards"][0] + wide["cards"][2]
 
 
 def test_narrow_window_has_room_for_switch_state_and_record():
@@ -313,6 +328,7 @@ def test_jump_default_http_call_is_not_used_when_injected(tmp_path, monkeypatch)
 def test_help_describes_three_views_and_not_the_removed_switches():
     for word in ("Meeting", "Ambient", "Intern", "Kontext für Claude", "Private Hinweise zeigen"):
         assert word in PANEL_HELP
+    assert "Zuletzt" not in PANEL_HELP
     for gone in ("Kompakt", "Präsentation", "Kundenansicht", "Vollbild-Knopf", "Vollbild)"):
         assert gone not in PANEL_HELP
     assert "ue" not in {w for w in PANEL_HELP.split() if w in {"fuer", "ueber", "Loesung"}}
@@ -349,15 +365,17 @@ def test_panel_controls_per_view(tmp_path, monkeypatch):
         panel.show()
         shown = lambda *views: all(v.isHidden() is False for v in views)
         hidden = lambda *views: all(v.isHidden() is True for v in views)
-        assert shown(panel._window_control, panel._record_button, panel.cards_scroll, panel._recent_label)
-        assert hidden(panel._ctx_claude, panel._transcript_scroll, panel._help_button, panel._audience_check)
+        assert shown(panel._window_control, panel._record_button, panel.cards_scroll, panel._transcript_scroll,
+                     panel._transcript_label, panel._copy_transcript_button)
+        assert hidden(panel._ctx_claude, panel._help_button, panel._audience_check)
         panel.set_window_mode("ambient")
-        assert shown(panel._ctx_claude, panel._ctx_copy, panel._ctx_range, panel.cards_scroll)
-        assert hidden(panel._recent_label, panel._transcript_scroll, panel._help_button, panel.topic_field)
+        assert shown(panel._ctx_claude, panel._ctx_copy, panel._ctx_range, panel.cards_scroll,
+                     panel._transcript_scroll, panel._copy_transcript_button)
+        assert hidden(panel._help_button, panel.topic_field)
         panel.set_window_mode("internal")
         assert shown(panel._transcript_scroll, panel._help_button, panel._audience_check, panel.topic_field,
                      panel.speakers_field, panel._copy_transcript_button)
-        assert hidden(panel._ctx_claude, panel._recent_label)
+        assert hidden(panel._ctx_claude)
         assert panel.view_mode in {"narrow", "wide"}
     finally:
         panel.close()
@@ -445,5 +463,24 @@ def test_panel_claude_start_failure_shows_a_message_and_never_raises(tmp_path, m
         while "nicht erreichbar" not in str(panel.status_field.stringValue()) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert "nicht erreichbar" in str(panel.status_field.stringValue())
+    finally:
+        panel.close()
+
+
+@pytest.mark.parametrize("view", VIEWS)
+@pytest.mark.parametrize("state", ["recording", "stopped"])
+def test_copy_transcript_works_in_every_view_during_and_after_recording(tmp_path, monkeypatch, view, state):
+    panel = _panel(tmp_path, monkeypatch)
+    try:
+        panel.show()
+        panel.set_window_mode(view)
+        panel.set_recording_state(state)
+        panel.apply_update(_lines(3), [], "")
+        assert panel._copy_transcript_button.isHidden() is False and panel._copy_transcript_button.isEnabled()
+        panel.copy_transcript()
+        deadline = time.monotonic() + 2
+        while not panel.copied and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert panel.copied and all(f"Satz {i}" in panel.copied[0] for i in range(3))
     finally:
         panel.close()

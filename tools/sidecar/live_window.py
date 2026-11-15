@@ -16,7 +16,7 @@ from .live import LiveCard, LiveLine
 from . import jump
 from .panel_layout import (COMPACT_SIZE, CONTEXT_RANGES, METRICS, MINIMUM_SIZE, PANEL_HELP, VIEW_LABELS, VIEWS,
                            card_columns, cards_for_view, context_range_label, context_text, is_at_bottom,
-                           latest_line_text, panel_mode, scroll_offset_after_update, source_ranges, split_columns,
+                           panel_mode, scroll_offset_after_update, source_ranges, split_columns,
                            transcript_content, transcript_copy_text, view_layout, visible_controls)
 from .recorder_support import PREFERENCE_FILENAME, read_window_mode, write_window_mode
 from .reveal import RevealState
@@ -415,9 +415,6 @@ class LivePanel:
         self._marker_button.setTarget_(self._target)
         self._marker_button.setAction_("revealPending:")
         self._marker_button.setToolTip_("Holt die neuen Punkte in die Liste. Bis dahin bleibt alles, wie es ist.")
-        self._recent_label = self._label("", 12.5)
-        self._recent_label.setTextColor_(_color("8A9496"))
-        self._recent_label.cell().setLineBreakMode_(A.NSLineBreakByTruncatingTail)
         self._ctx_label = self._label("KONTEXT FÜR CLAUDE", 11, utility=True)
         self._ctx_range = A.NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 140, 28), False)
         self._ctx_range.addItemsWithTitles_([title for _key, title in CONTEXT_RANGES])
@@ -430,7 +427,7 @@ class LivePanel:
         for view in (self._rail, self._state_label, self._window_control, self._help_button, self._audience_check,
                      self._transcript_label, self._copy_transcript_button, self._cards_label, self._transcript_scroll,
                      self.cards_scroll, self._help_scroll, self.status_field, self._speakers_label, self.speakers_field,
-                     self._topic_label, self.topic_field, self._clip_button, self._record_button, self._recent_label,
+                     self._topic_label, self.topic_field, self._clip_button, self._record_button,
                      self._ctx_label, self._ctx_range, self._ctx_copy, self._ctx_claude, self._marker_button,
                      *self._jump_buttons.values()):
             self._surface.addSubview_(view)
@@ -442,7 +439,7 @@ class LivePanel:
             "transcript_label": (self._transcript_label,), "copy_transcript": (self._copy_transcript_button,),
             "speakers": (self.speakers_field,), "speakers_label": (self._speakers_label,),
             "topic": (self.topic_field,), "topic_label": (self._topic_label,), "clip": (self._clip_button,),
-            "status": (self.status_field,), "recent": (self._recent_label,), "rail": (self._rail,),
+            "status": (self.status_field,), "rail": (self._rail,),
             "ctx_label": (self._ctx_label,), "ctx_range": (self._ctx_range,), "ctx_copy": (self._ctx_copy,),
             "ctx_claude": (self._ctx_claude,), "marker": (self._marker_button,)}
         self._built = True
@@ -485,8 +482,11 @@ class LivePanel:
             self._audience_check.setState_(1 if self.audience == "internal" else 0)
             self._state_label.setAlignment_(A.NSTextAlignmentRight)
             self.transcript_text.setFont_(_font(metrics["transcript"]))
-            self.transcript_text.setTextColor_(_color("22323B" if self._lines else "6D777A"))
+            self.transcript_text.setTextColor_(_color(
+                ("22323B" if view == "internal" else "8A9496") if self._lines else "6D777A"))
+            old_transcript_offset = float(self._transcript_scroll.contentView().bounds().origin.y)
             self._fit_text_view(self._transcript_scroll, self.transcript_text)
+            self._apply_scroll("transcript", old_transcript_offset)  # a resize keeps following the end
             self._fit_text_view(self._help_scroll, self._help_text)
             self._place_jump_buttons()
             self._render_cards()
@@ -762,8 +762,7 @@ class LivePanel:
         self._ctx_claude.setEnabled_(bool(self._lines))
         self._ctx_range.selectItemAtIndex_([key for key, _t in CONTEXT_RANGES].index(self._context_range))
         self._cards_label.setStringValue_(self._cards_label_text())
-        self._transcript_label.setStringValue_("TRANSKRIPT · IM HINTERGRUND" if self.window_mode == "ambient" else "TRANSKRIPT")
-        self._render_recent()
+        self._transcript_label.setStringValue_("TRANSKRIPT")
         if self.window_mode == "ambient":
             hint = "Beispieldaten · Mikrofon ist aus." if self._recording_state == "preview" else "Läuft nebenher."
         elif self._recording_state == "preview":
@@ -794,7 +793,7 @@ class LivePanel:
             value = ("Sobald du sprichst, erscheint hier das Transkript." if self._recording_state == "recording"
                      else "Starte die Aufnahme, wenn alle Beteiligten einverstanden sind.")
         self.transcript_text.setString_(value)
-        quiet = self.window_mode == "ambient"
+        quiet = self.window_mode != "internal"  # points stay the focus in Meeting and Ambient
         self.transcript_text.setTextColor_(_color(("8A9496" if quiet else "22323B") if self._lines else "6D777A"))
         self._fit_text_view(self._transcript_scroll, self.transcript_text)
         selected = next((card for card in self.rendered_cards if card.key == self._highlighted_key), None)
@@ -805,11 +804,6 @@ class LivePanel:
         # The highlight is shown once, when the reader opens a card's source
         # (toggle_source); a later update never pulls the view back to it.
         self._apply_scroll("transcript", old_offset)
-        self._render_recent()
-
-    def _render_recent(self) -> None:
-        recent = latest_line_text(self._lines)
-        self._recent_label.setStringValue_(f"Zuletzt   {recent}" if recent else "Zuletzt   noch nichts gehört")
 
     def _render_cards(self) -> None:
         if self.cards_document is None:

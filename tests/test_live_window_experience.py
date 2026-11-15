@@ -192,7 +192,7 @@ def test_panel_defaults_to_meeting_and_hides_internal_controls(tmp_path, monkeyp
         panel.show()
         assert panel._record_button.isHidden() is False
         for view in (panel.topic_field, panel.speakers_field, panel._clip_button, panel._audience_check,
-                     panel._help_button, panel._copy_transcript_button, panel._ctx_claude, panel._transcript_scroll):
+                     panel._help_button, panel._ctx_claude):
             assert view.isHidden() is True
         panel.set_window_mode("internal")
         assert panel.topic_field.isHidden() is False and panel._audience_check.isHidden() is False

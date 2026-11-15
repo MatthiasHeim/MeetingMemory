@@ -32,13 +32,13 @@ METRICS = {
 }
 
 # What each view shows. A name missing here is hidden (fail closed).
-_BASE = frozenset({"window_mode", "state", "record", "cards", "marker", "jump"})
-MEETING_CONTROLS = _BASE | {"recent"}
+# The transcript, with its copy button, is visible in every view.
+_BASE = frozenset({"window_mode", "state", "record", "cards", "marker", "jump",
+                   "transcript", "transcript_label", "copy_transcript"})
+MEETING_CONTROLS = _BASE
 AMBIENT_CONTROLS = _BASE | {"cards_label", "status", "ctx_label", "ctx_range", "ctx_copy", "ctx_claude"}
-INTERNAL_CONTROLS = _BASE | {"cards_label", "transcript", "transcript_label", "copy_transcript", "audience", "help",
-                             "speakers", "topic", "clip", "status"}
-_FULLSCREEN_EXTRA = {"ambient": frozenset({"transcript", "transcript_label"}),
-                     "internal": frozenset({"speakers_label", "topic_label", "rail"})}
+INTERNAL_CONTROLS = _BASE | {"cards_label", "audience", "help", "speakers", "topic", "clip", "status"}
+_FULLSCREEN_EXTRA = {"internal": frozenset({"speakers_label", "topic_label", "rail"})}
 
 
 def visible_controls(view: str, *, fullscreen: bool = False) -> frozenset:
@@ -132,6 +132,14 @@ def _header(rects, view, w, h, m):
     return h - hh
 
 
+def _transcript_block(rects, x, y, w, h):
+    """Label, copy button and a scrollable pane in the box (x, y, w, h)."""
+    label_h, btn_h = 18.0, 26.0
+    rects["transcript_label"] = (x, y + h - label_h - 2, max(40.0, w - 160), label_h)
+    rects["copy_transcript"] = (x + w - 150, y + h - btn_h, 150.0, btn_h)
+    rects["transcript"] = (x, y, w, max(40.0, h - btn_h - 6))
+
+
 def _marker(rects, x, w, y):
     rects["marker"] = (x + (w - MARKER_SIZE[0]) / 2, y, *MARKER_SIZE)
 
@@ -149,10 +157,25 @@ def view_layout(view: str, width: float, height: float, *, fullscreen: bool = Fa
     band = 56.0 if mode == "fullscreen" else 44.0
     label_h = 18.0
     if view == "meeting":
-        recent_h = 52.0 if mode == "fullscreen" else 34.0
-        rects["recent"] = (pad, 0.0, inner, recent_h)
-        _marker(rects, pad, inner, recent_h + (band - MARKER_SIZE[1]) / 2)
-        rects["cards"] = (pad, recent_h + band, inner, max(60.0, top - recent_h - band - 6))
+        bottom, body_top = 12.0 if mode != "fullscreen" else 28.0, top - 4
+        total = body_top - bottom
+        if mode == "narrow":  # points on top, transcript in the lower 40%
+            tr_h = max(120.0, total * 0.4)
+            _transcript_block(rects, pad, bottom, inner, tr_h)
+            cy = bottom + tr_h + 6
+            _marker(rects, pad, inner, cy + (band - MARKER_SIZE[1]) / 2)
+            rects["cards"] = (pad, cy + band, inner, max(60.0, body_top - cy - band))
+        elif mode == "wide":  # points left, transcript column right
+            left = round((inner - gap) * 0.56)
+            _transcript_block(rects, pad + left + gap, bottom, inner - left - gap, total)
+            _marker(rects, pad, left, bottom + (band - MARKER_SIZE[1]) / 2)
+            rects["cards"] = (pad, bottom + band, left, max(60.0, total - band))
+        else:  # full screen: three point columns, transcript as a band below (four columns get too tight)
+            tr_h = round(total * 0.28)
+            _transcript_block(rects, pad, bottom, inner, tr_h)
+            cy = bottom + tr_h + 10
+            _marker(rects, pad, inner, cy + (band - MARKER_SIZE[1]) / 2)
+            rects["cards"] = (pad, cy + band, inner, max(60.0, body_top - cy - band))
         return rects
     if view == "ambient":
         foot = 84.0 if mode == "narrow" else (76.0 if mode == "fullscreen" else 56.0)
@@ -168,15 +191,21 @@ def view_layout(view: str, width: float, height: float, *, fullscreen: bool = Fa
         if mode != "narrow":
             sx = x + 246 + 130 + 14
             rects["status"] = (sx, (foot - label_h) / 2, max(40.0, width - pad - sx), label_h)
-        list_w = inner if mode != "fullscreen" else round((inner - gap) * 0.58)
-        rects["cards_label"] = (pad, top - label_h - 4, list_w, label_h)
-        _marker(rects, pad, list_w, foot + (band - MARKER_SIZE[1]) / 2)
-        rects["cards"] = (pad, foot + band, list_w, max(60.0, top - label_h - 12 - foot - band))
-        if mode == "fullscreen":
+        body_top = top - 4
+        if mode == "narrow":  # list on top, transcript in the lower 40%
+            tr_h = max(110.0, (body_top - foot - 8) * 0.4)
+            _transcript_block(rects, pad, foot + 8, inner, tr_h)
+            cy = foot + 8 + tr_h + 4
+            rects["cards_label"] = (pad, body_top - label_h, inner, label_h)
+            _marker(rects, pad, inner, cy + (band - MARKER_SIZE[1]) / 2)
+            rects["cards"] = (pad, cy + band, inner, max(60.0, body_top - label_h - 8 - cy - band))
+        else:  # list left, pale transcript column right
+            list_w = round((inner - gap) * 0.58)
+            rects["cards_label"] = (pad, body_top - label_h, list_w, label_h)
+            _marker(rects, pad, list_w, foot + (band - MARKER_SIZE[1]) / 2)
+            rects["cards"] = (pad, foot + band, list_w, max(60.0, body_top - label_h - 8 - foot - band))
             tx = pad + list_w + gap
-            tw = width - pad - tx
-            rects["transcript_label"] = (tx, top - label_h - 4, tw, label_h)
-            rects["transcript"] = (tx, foot + 8, tw, max(60.0, top - label_h - 12 - foot - 8))
+            _transcript_block(rects, tx, foot + 8, width - pad - tx, body_top - foot - 8)
         return rects
     # internal
     btn_h = 26.0
@@ -267,11 +296,12 @@ PANEL_HELP = (
     "Drei Ansichten\n"
     "Der Schalter oben links wählt die Ansicht. Die Wahl bleibt gespeichert. "
     "Meeting ist die ruhige Ansicht zum Teilen: nur Entscheidungen, nächste Schritte und Anfragen, "
-    "ohne KI-Ideen, ohne private Hinweise, ohne Knöpfe an den Punkten. Das Transkript ist nur eine leise Zeile «Zuletzt». "
+    "ohne KI-Ideen, ohne private Hinweise, ohne Knöpfe an den Punkten. Das Transkript läuft gedämpft daneben oder darunter. "
     "Ambient läuft nebenher, wenn du allein arbeitest: eine Zeile pro Punkt und unten «Kontext für Claude» "
     "(letzte 10 Minuten oder ganze Sitzung). «Kopieren» legt diesen Ausschnitt in die Zwischenablage, "
     "«Claude starten» öffnet eine Claude-Sitzung, die den Ausschnitt nur als Hintergrund bekommt und zuerst nachfragt. "
-    "Intern zeigt das ganze Transkript, alle Karten samt KI-Ideen und die Werkzeuge.\n\n"
+    "Intern zeigt das Transkript in voller Stärke, alle Karten samt KI-Ideen und die Werkzeuge. "
+    "In allen drei Ansichten ist das Transkript sichtbar, scrollbar und markierbar; «Transkript kopieren» kopiert es ganz.\n\n"
     "Fenstergrösse\n"
     "Das Layout folgt dem Fenster: schmal eine Spalte, breit mehrere Spalten. "
     "Der grüne Fensterknopf öffnet das native Vollbild mit eigenem, grosszügigerem Layout. "
@@ -285,7 +315,7 @@ PANEL_HELP = (
     "Namen mit Komma trennen, Enter speichert. Vorschläge kommen aus der Kalendereinladung. "
     "Das finale Transkript ordnet die Stimmen diesen Namen zu; nicht genannte Eingeladene werden ignoriert. "
     "Am besten vor dem Stoppen eintragen.\n\n"
-    "Transkript kopieren (Intern)\n"
+    "Transkript kopieren\n"
     "Kopiert das ganze bisherige Transkript dieser Aufnahme, während und nach der Aufnahme.\n\n"
     "Themenauszug (Intern)\n"
     "Das Themenfeld und «Auszug kopieren» kopieren passende Textstellen der laufenden Aufnahme. "
