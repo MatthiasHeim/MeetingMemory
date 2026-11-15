@@ -22,6 +22,20 @@ The audio-only path covered 93% of the seconds the transcript path flagged; 8% o
 So a local first pass is good enough to decide what to cut before audio leaves the Mac. Spans not yet
 checked by a person against the recording.
 
+## Business meetings, false-alarm check (2026-11-15, transcript path)
+
+12 meetings from 03.–14.11. (6 h 40 min), including five with a health-industry client about
+patient-data systems: the health-industry meetings had **no** flagged second. Flags elsewhere:
+
+| Meeting (stem) | Length | Flagged | Kind |
+|---|---|---|---|
+| 2026-11-09_15-59-47 | 35 min | 31:56–32:52 (p 0.65) | health |
+| 2026-11-11_15-22-28 | 3 min | 0:58–1:53 (p 0.90) | family |
+| 2026-11-14_11-05-24 | 25 min | five spans, 6.7 min (p 0.81–0.99) | family |
+| the other 9 | | none | |
+
+Not yet checked by a person whether these are real private talk or false alarms.
+
 ## Not built yet
 
 - Silencing flagged spans in the audio before the Gemini call in `transcribe_watcher.py`
