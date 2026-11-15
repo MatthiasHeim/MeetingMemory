@@ -2632,6 +2632,7 @@ class TranscribeWatcher:
             log = _coherence_repair(
                 d, known_attendees=known_attendees, runner=runner,
                 max_parallel=int(cfg.get("max_parallel", 3)),
+                ref_prefix=audio_file.stem,
             )
             result.transcript = d.get("transcript") or result.transcript
             result.participants = d.get("participants") or result.participants

@@ -48,9 +48,13 @@ import logging
 import os
 import re
 import subprocess
-from typing import Callable, Optional
+import sys
+import threading
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+_lock = threading.Lock()
 
 SELF_NAME = "Matthias Heim"
 SELF_FIRST = "Matthias"
@@ -76,6 +80,98 @@ CONTEXT_LINES = 8
 MAX_PARALLEL_WINDOWS = 3
 MAX_LINE_CHARS = 600         # per-line truncation in the prompt
 DEFAULT_TIMEOUT_SEC = 900    # per window
+
+# Decider gate (see `_build_gate`). The local Decider answers "is any line in
+# this window misattributed?" before the Claude call; ~70% of meetings are
+# coherent, so a confident "no" saves a ~4 min headless session per window.
+# Mode/threshold come from ~/.config/lailix/decider-gates.json (shadow today).
+GATE_NAME = "speaker_coherence"
+GATE_MAX_STATE_CHARS = 15_000   # helper hard limit is 18k; stay well under
+_GATE_CRITERIA = {
+    "true": (
+        "At least one line's CONTENT does not fit the speaker named for it: "
+        "the person answering a question carries the same label as the one who "
+        "asked it; someone says we/our/us/mir/öis about a company but is "
+        "labelled as an outsider (or says ihr/euch to a company they work "
+        "for); a speaker describes their own role, product or biography under "
+        "another person's label; a speaker is addressed by name on their own "
+        "line; a speaker refers to themselves in the third person; or a line "
+        "continuing one person's argument has a different label with no "
+        "conversational turn. A question and its answer swapped between "
+        "speakers counts."
+    ),
+    "false": (
+        "Every line plausibly belongs to the speaker named: questions and "
+        "answers come from different people, company voice and self-"
+        "description match the labels, and turn-taking is natural. Ambiguous "
+        "or merely unusual phrasing is NOT misattribution."
+    ),
+}
+_GATE_QUESTION = {
+    "type": "noul",
+    "instructions": (
+        "The state is an excerpt of a meeting transcript (numbered lines: line "
+        "number, timestamp, speaker label, text) preceded by the attendee "
+        "list. Lines marked (context only) are background. Is any line in "
+        "this window attributed to the wrong speaker? Judge by content alone."
+    ),
+    "criteria": _GATE_CRITERIA,
+}
+
+
+def _load_decider_gate_module():
+    """Load the shared helper without writing __pycache__ into the skill dir."""
+    import importlib.util
+    if "decider_gate" in sys.modules:  # once per process: keeps the helper's "Decider is down" flag
+        return sys.modules["decider_gate"]
+    path = Path.home() / ".agents/skills/decider/scripts/decider_gate.py"
+    old, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec = importlib.util.spec_from_file_location("decider_gate", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["decider_gate"] = module  # dataclasses need the module registered
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = old
+    return module
+
+
+def _build_gate():
+    """The speaker_coherence Gate, or None if the helper is unavailable.
+
+    None means "no gate": Claude runs for every window exactly as before.
+    """
+    try:
+        mod = _load_decider_gate_module()
+        return mod.Gate(GATE_NAME, _GATE_QUESTION, skip_when="false",
+                        defaults={"mode": "shadow", "threshold": 0.05})
+    except Exception as e:  # never let the optimisation break the repair
+        logger.warning("speaker_coherence: Decider gate unavailable (%s); "
+                       "running Claude on every window", e)
+        return None
+
+
+def _roster_text(known_attendees: Optional[list[dict]]) -> str:
+    names = [f'{SELF_NAME} (host, label "{SELF_FIRST}")']
+    for p in known_attendees or []:
+        if not isinstance(p, dict):
+            continue
+        n = (p.get("name") or "").strip()
+        if not n or n.lower() == SELF_NAME.lower() \
+                or (p.get("role") or "").lower() == "self":
+            continue
+        c = (p.get("company") or "").strip()
+        names.append(f"{n} ({c})" if c else n)
+    return "Attendees: " + "; ".join(names)
+
+
+def gate_state(lines: list[dict], *, known_attendees: Optional[list[dict]],
+               start: int, editable_from: Optional[int]) -> str:
+    """What the Decider sees for one window: roster + the same numbered lines
+    the Claude prompt gets."""
+    return (_roster_text(known_attendees) + "\n\n"
+            + render_numbered(lines, start=start, editable_from=editable_from))
+
 
 # `[MM:SS] Label: text` / `[HH:MM:SS] Label: text`
 _LINE_RE = re.compile(r"^(\s*\[\d{1,2}(?::\d{2}){1,2}\]\s*)([^:\n]{1,60}?):(.*)$")
@@ -512,7 +608,9 @@ def check_and_repair(gemini_dict: dict, *,
                      known_attendees: Optional[list[dict]] = None,
                      runner: Optional[Callable[[str], str]] = None,
                      bind_identities: bool = True,
-                     max_parallel: int = MAX_PARALLEL_WINDOWS) -> dict:
+                     max_parallel: int = MAX_PARALLEL_WINDOWS,
+                     gate: Any = None,
+                     ref_prefix: str = "") -> dict:
     """Audit and repair speaker attribution in `gemini_dict` (mutates in place).
 
     Args:
@@ -523,6 +621,12 @@ def check_and_repair(gemini_dict: dict, *,
         runner: callable(prompt) -> response text. Defaults to the headless
             Claude CLI. Injected in tests so no network is required.
         bind_identities: rename generic labels to calendar-confirmed names.
+        gate: Decider `Gate` consulted per window before the Claude call
+            (default: built from the shared helper; pass `False` to disable).
+            In `act` mode a confident "no misattribution" skips Claude for
+            that window; in every other case Claude runs as before.
+        ref_prefix: meeting id / file stem; the gate ref is
+            `<ref_prefix>:<window index>`.
 
     Returns a forensic log (stored as `speaker_coherence` in the transcript
     JSON and in participant_resolution_log).
@@ -541,6 +645,8 @@ def check_and_repair(gemini_dict: dict, *,
         "refused_runaway": False,
         "windows": 0,
         "failed_windows": [],
+        "gate_skipped_windows": [],
+        "skipped": None,
         "error": None,
     }
     transcript = (gemini_dict or {}).get("transcript") or ""
@@ -552,6 +658,7 @@ def check_and_repair(gemini_dict: dict, *,
     log["lines_total"] = len(lines)
     if len(lines) < MIN_LINES:
         log["ok"] = True
+        log["skipped"] = "tiny_transcript"
         log["error"] = f"only {len(lines)} labelled lines — nothing to check"
         return log
 
@@ -560,16 +667,59 @@ def check_and_repair(gemini_dict: dict, *,
     run = runner or claude_cli_runner()
     windows = plan_windows(len(lines))
     log["windows"] = len(windows)
+    if gate is None:
+        gate = _build_gate()
+    elif gate is False:
+        gate = None
+    # A skipped window yields no `speakers`, which identity binding needs for
+    # generic labels ("Speaker 2"); keep Claude in the loop for those windows.
+    need_binding = bool(bind_identities and known_attendees)
 
     def audit(win: tuple[int, int, int]) -> dict:
         ctx_start, edit_start, end = win
+        ref = f"{ref_prefix or 'unknown'}:{windows.index(win)}"
+        checked = False
+        if gate is not None:
+            try:
+                state = gate_state(
+                    lines[ctx_start - 1:end], known_attendees=known_attendees,
+                    start=ctx_start,
+                    editable_from=edit_start if edit_start > ctx_start else None)
+                if len(state) <= GATE_MAX_STATE_CHARS:
+                    checked = True
+                    res = gate.check(state, ref=ref)
+                    keep = need_binding and any(
+                        _GENERIC_LABEL.match(ln["label"])
+                        for ln in lines[ctx_start - 1:end])
+                    if res.skip and not keep:
+                        with _lock:
+                            log["gate_skipped_windows"].append(
+                                {"lines": f"{edit_start}-{end}", "p": res.p})
+                        # Treated exactly as "Claude returned no changes". No outcome is
+                        # recorded: nobody checked, so it must not count as a true negative.
+                        return {"relabels": [], "speakers": [],
+                                "uncertain_regions": []}
+            except Exception as e:  # a broken gate must never block the repair
+                logger.warning("speaker_coherence: gate error on %s (%s); "
+                               "running Claude", ref, e)
+                checked = False
         prompt = build_prompt(
             lines[ctx_start - 1:end], known_attendees=known_attendees,
             allowed=allowed, start=ctx_start,
             editable_from=edit_start if edit_start > ctx_start else None,
             total_lines=len(lines),
         )
-        return parse_response(run(prompt))
+        data = parse_response(run(prompt))
+        if gate is not None and checked:
+            try:
+                own = [p for p in (data.get("relabels") or [])
+                       if isinstance(p, dict) and isinstance(p.get("line"), int)
+                       and edit_start <= p["line"] <= end]
+                changed, _rej = _screen(own, lines, allowed)
+                gate.outcome(ref, bool(changed))
+            except Exception as e:
+                logger.warning("speaker_coherence: gate outcome failed (%s)", e)
+        return data
 
     results: list[tuple[tuple[int, int, int], Optional[dict], Optional[str]]] = []
     if len(windows) == 1:

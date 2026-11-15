@@ -19,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from speaker_coherence import (  # noqa: E402
@@ -30,6 +32,14 @@ from speaker_coherence import (  # noqa: E402
     plan_windows,
     revert_verify_flips,
 )
+
+@pytest.fixture(autouse=True)
+def _isolate_decider(tmp_path, monkeypatch):
+    """Never reach the live Decider or write its real state/config in tests."""
+    monkeypatch.setenv("AGENT_SKILL_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("DECIDER_GATES_CONFIG", str(tmp_path / "gates.json"))
+    monkeypatch.setenv("DECIDER_GATES", "off")
+
 
 FIXTURE = Path(__file__).parent / "fixtures" / "source767_region.txt"
 
@@ -490,3 +500,139 @@ def test_same_first_name_different_people_are_not_merged():
     }))
     labels = set(labels_by_ts(g["transcript"]).values())
     assert {"Philipp Baltensperger", "Philipp Meier"} <= labels
+
+
+# ── Decider gate ──────────────────────────────────────────────────────────
+
+import speaker_coherence as sc  # noqa: E402
+
+
+def _gate_transcript(n=40):
+    people = ["Matthias", "Philipp"]
+    return "\n".join(f"[{i // 60:02d}:{i % 60:02d}] {people[i % 2]}: Satz {i}."
+                      for i in range(n))
+
+
+class FakeGate:
+    """Stands in for decider_gate.Gate: fixed p, skip only in act mode."""
+
+    def __init__(self, p, mode, threshold=0.05, raises=False):
+        self.p, self.mode, self.threshold, self.raises = p, mode, threshold, raises
+        self.checks, self.outcomes = [], []
+
+    def check(self, state, ref=""):
+        self.checks.append((ref, state))
+        if self.raises:
+            raise RuntimeError("decider down")
+        skip = self.mode == "act" and self.p < self.threshold
+        return type("R", (), {"skip": skip, "p": self.p})()
+
+    def outcome(self, ref, positive, **extra):
+        self.outcomes.append((ref, positive))
+
+
+class CountingRunner:
+    def __init__(self, relabels=None):
+        self.calls, self.relabels = 0, relabels or []
+
+    def __call__(self, _prompt):
+        self.calls += 1
+        return json.dumps({"speakers": [], "relabels": self.relabels,
+                           "uncertain_regions": []})
+
+
+def _run(gate, runner, n=40, **kw):
+    d = {"transcript": _gate_transcript(n)}
+    log = check_and_repair(d, known_attendees=ATTENDEES, runner=runner,
+                           gate=gate, ref_prefix="mtg", **kw)
+    return d, log
+
+
+def test_shadow_runs_claude_for_every_window_even_when_p_is_zero():
+    gate, runner = FakeGate(0.0, "shadow"), CountingRunner()
+    _d, log = _run(gate, runner)
+    assert log["windows"] >= 2
+    assert runner.calls == log["windows"]
+    assert log["gate_skipped_windows"] == []
+    assert [o[1] for o in gate.outcomes] == [False] * log["windows"]
+    assert sorted(r for r, _ in gate.outcomes) == sorted(
+        f"mtg:{i}" for i in range(log["windows"]))
+
+
+def test_act_confident_no_skips_claude_and_leaves_transcript_identical():
+    gate, runner = FakeGate(0.0, "act"), CountingRunner()
+    d, log = _run(gate, runner)
+    assert runner.calls == 0
+    assert len(log["gate_skipped_windows"]) == log["windows"]
+    assert d["transcript"] == _gate_transcript()
+    assert log["ok"] and not log["changed"]
+    assert all(o[1] is False for o in gate.outcomes)
+
+
+def test_act_unsure_window_calls_claude_and_applies_relabel():
+    relabel = [{"line": 3, "from": "Matthias", "to": "Philipp",
+                "confidence": "high", "reason": "answers own question"}]
+    gate, runner = FakeGate(0.5, "act"), CountingRunner(relabel)
+    d, log = _run(gate, runner, n=12)
+    assert log["windows"] == 1 and runner.calls == 1
+    assert log["changed"]
+    assert ("mtg:0", True) in gate.outcomes
+
+
+def test_outcome_negative_when_claude_proposes_nothing():
+    gate, runner = FakeGate(0.5, "act"), CountingRunner()
+    _run(gate, runner, n=12)
+    assert gate.outcomes == [("mtg:0", False)]
+
+
+def test_decider_failure_falls_back_to_claude():
+    gate, runner = FakeGate(0.0, "act", raises=True), CountingRunner()
+    _d, log = _run(gate, runner)
+    assert runner.calls == log["windows"]
+    assert log["ok"]
+
+
+def test_generic_label_window_keeps_claude_for_identity_binding():
+    gate, runner = FakeGate(0.0, "act"), CountingRunner()
+    t = "\n".join(f"[00:{i:02d}] {['Matthias', 'Speaker 2'][i % 2]}: Satz {i}."
+                  for i in range(12))
+    d = {"transcript": t}
+    check_and_repair(d, known_attendees=ATTENDEES, runner=runner, gate=gate)
+    assert runner.calls == 1
+
+
+def test_overlong_window_bypasses_gate():
+    gate, runner = FakeGate(0.0, "act"), CountingRunner()
+    big = "x" * 590
+    t = "\n".join(f"[00:{i:02d}] {['Matthias', 'Philipp'][i % 2]}: {big}"
+                  for i in range(30))
+    check_and_repair({"transcript": t}, known_attendees=ATTENDEES,
+                     runner=runner, gate=gate)
+    assert gate.checks == [] and runner.calls == 1
+
+
+def test_real_gate_module_loads_shadow_and_down_decider_runs_claude(monkeypatch):
+    """Default path: real helper, no Decider reachable -> Claude still runs."""
+    monkeypatch.delenv("DECIDER_GATES")
+    mod = sc._load_decider_gate_module()
+    monkeypatch.setattr(mod, "ask", lambda *a, **k: (_ for _ in ()).throw(
+        mod.DeciderError("unavailable")))
+    runner = CountingRunner()
+    _d, log = _run(None, runner, n=12)
+    assert runner.calls == 1 and log["ok"]
+
+
+def test_tiny_transcript_skips_without_calling_claude_or_gate():
+    gate, runner = FakeGate(0.5, "shadow"), CountingRunner()
+    d = {"transcript": _gate_transcript(5)}
+    log = check_and_repair(d, runner=runner, gate=gate)
+    assert log["skipped"] == "tiny_transcript" and runner.calls == 0
+    assert gate.checks == []
+
+
+def test_single_speaker_multi_attendee_transcript_still_audited():
+    runner = CountingRunner()
+    t = "\n".join(f"[00:{i:02d}] Matthias: Satz {i}." for i in range(8))
+    check_and_repair({"transcript": t}, known_attendees=ATTENDEES,
+                     runner=runner, gate=False)
+    assert runner.calls == 1
