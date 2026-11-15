@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recorder: drei Ansichten</title>
+<style>
+/* Layout: one section per view; each shows the small window (real size) beside full screen (scaled 62.5%). */
+:root{
+  --desk:#E3E6E0; --bg:#F7F8F4; --ink:#22323B; --mute:#59666A; --faint:#8A9496; --line:#DEE3DC;
+  --card:#FFFFFF; --ai:#EDF4F7; --rec:#A23F32; --mark:#F5E6AE; --ok:#2F6B4F; --new:#22323B;
+  --ui:-apple-system,"SF Pro Text","Helvetica Neue",Arial,sans-serif;
+  --mono:"SF Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--desk);color:var(--ink);font:15px/1.45 var(--ui);padding:28px max(16px,2vw) 60px}
+h1{font-size:28px;margin:0 0 6px;letter-spacing:-.01em}
+.lead{max-width:70ch;color:var(--mute);margin:0 0 8px}
+section{margin-top:38px}
+section>h2{font-size:21px;margin:0 0 2px}
+section>p{margin:0 0 14px;max-width:80ch;color:var(--mute)}
+.pair{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
+figure{margin:0}
+figcaption{font:11px var(--mono);color:var(--mute);margin-top:8px;letter-spacing:.04em;text-transform:uppercase}
+.notes{margin:14px 0 0;padding-left:18px;max-width:86ch;color:var(--ink)}
+.notes li{margin:3px 0}
+
+/* window chrome */
+.win,.fs{background:var(--bg);display:flex;flex-direction:column;overflow:hidden;position:relative}
+.win{width:480px;height:760px;border-radius:11px;box-shadow:0 14px 40px rgba(34,50,59,.22),0 0 0 1px rgba(34,50,59,.14)}
+.fswrap{width:900px;height:562.5px;border-radius:8px;overflow:hidden;box-shadow:0 14px 40px rgba(34,50,59,.22),0 0 0 1px rgba(34,50,59,.14)}
+.fs{width:1440px;height:900px;transform:scale(.625);transform-origin:0 0}
+.bar{height:28px;flex:none;background:#E9EBE7;border-bottom:1px solid #D6DAD4;display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:600;color:#9AA1A0;position:relative}
+.bar i{position:absolute;left:10px;top:8px;width:12px;height:12px;border-radius:50%;background:#C9CDC8;box-shadow:20px 0 #C9CDC8,40px 0 #C9CDC8}
+
+/* header: the one switch, state, record */
+.hd{flex:none;display:flex;align-items:center;gap:10px;padding:12px 16px 10px}
+.seg{display:inline-flex;background:#E7EAE5;border-radius:8px;padding:2px}
+.seg b{font-weight:500;font-size:13px;padding:4px 11px;border-radius:6px;color:var(--mute)}
+.seg b.on{background:#fff;color:var(--ink);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.14)}
+.sp{flex:1}
+.state{font:11.5px var(--mono);color:var(--rec);white-space:nowrap}
+.btn{font:500 12.5px var(--ui);background:#fff;border:1px solid #D3D8D2;border-radius:7px;padding:4px 10px;color:var(--ink);white-space:nowrap;box-shadow:0 1px 1px rgba(0,0,0,.05)}
+.btn.pri{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn.quiet{border-color:transparent;background:none;box-shadow:none;color:var(--mute)}
+.lbl{font:10.5px var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--mute)}
+.body{flex:1;min-height:0;display:flex;flex-direction:column;padding:4px 16px 0;gap:10px;position:relative}
+.scroll{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;gap:10px}
+
+/* meeting points: plain rows, no buttons */
+.pt{padding:13px 0 14px;border-top:1px solid var(--line)}
+.pt .lbl{display:block;margin-bottom:4px}
+.pt p{margin:0;font-size:18px;line-height:1.32}
+.k-d{color:#7A5A12}.k-a{color:var(--ok)}.k-r{color:#3A5D7C}
+
+/* cards with actions */
+.cd{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:11px 13px 10px}
+.cd.ai{background:var(--ai)}
+.cd p{margin:5px 0 9px;font-size:15px;line-height:1.36}
+.cd .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.cd .done{font-size:12.5px;color:var(--ok);font-weight:600}
+.cd .src{margin-left:auto;font-size:12px;color:var(--mute);text-decoration:underline;text-underline-offset:2px}
+.gone{font-size:12.5px;color:var(--faint);padding:2px 13px;display:flex;gap:8px}
+.gone s{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gone u{color:var(--mute)}
+.since{display:flex;align-items:center;gap:8px;font:10.5px var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--rec)}
+.since:before,.since:after{content:"";flex:1;height:1px;background:var(--rec);opacity:.35}
+.newpill{align-self:center;flex:none;background:var(--new);color:#fff;font-size:12.5px;font-weight:600;border-radius:99px;padding:6px 14px;box-shadow:0 4px 12px rgba(34,50,59,.3);margin:2px 0 4px}
+
+/* transcript in the background: one quiet line */
+.tick{flex:none;border-top:1px solid var(--line);padding:8px 16px 10px;display:flex;gap:10px;align-items:baseline;font-size:12.5px;color:var(--faint)}
+.tick span{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tick u{color:var(--mute);white-space:nowrap}
+.foot{flex:none;display:flex;gap:8px;align-items:center;padding:8px 16px 12px}
+
+/* transcript, full */
+.tr{font-size:14px;line-height:1.4;color:var(--ink)}
+.tr div{margin-bottom:11px}
+.tr em{display:block;font:11px var(--mono);font-style:normal;color:var(--mute)}
+.tr mark{background:var(--mark)}
+.dim .tr{color:var(--faint)}
+.fld{border:1px solid #D3D8D2;background:#fff;border-radius:6px;padding:5px 8px;font-size:13px;color:var(--faint);flex:1;min-width:0}
+.chk{font-size:13px;display:flex;gap:6px;align-items:center}
+.chk i{width:14px;height:14px;border:1px solid #AEB6B2;border-radius:3px;background:#fff;display:inline-block}
+
+/* full screen: roomier, its own layout */
+.fs .hd{padding:20px 44px 14px;gap:16px}
+.fs .seg b{font-size:15px;padding:6px 16px}
+.fs .state{font-size:14px}.fs .btn{font-size:14px;padding:6px 14px}
+.fs .lbl{font-size:12.5px}
+.fs .cols{flex:1;min-height:0;display:grid;gap:40px;padding:14px 44px 0}
+.fs .col{min-width:0;display:flex;flex-direction:column;gap:14px;min-height:0;overflow:hidden}
+.fs .pt p{font-size:27px;line-height:1.28}
+.fs .pt{padding:18px 0 20px}
+.fs .cd{padding:16px 20px 15px;border-radius:14px}
+.fs .cd p{font-size:20px;margin:7px 0 13px}
+.fs .tr{font-size:17px}.fs .tr em{font-size:12.5px}
+.fs .tick{padding:12px 44px 16px;font-size:15px}
+.fs .newpill{font-size:15px;padding:8px 20px}
+.fs h3{font-size:34px;margin:0;letter-spacing:-.015em}
+.fs .rail{background:#EEF0EB;border-radius:14px;padding:18px;gap:16px}
+.fs .fld{font-size:14px;flex:none}
+.tp{display:flex;gap:12px;padding:9px 0;border-top:1px solid var(--line);font-size:15px}
+.tp em{font:11.5px var(--mono);font-style:normal;color:var(--mute);padding-top:3px}
+.fs .tp{font-size:21px;padding:14px 0;gap:18px}.fs .tp em{font-size:14px;padding-top:6px}
+.ctx{flex:none;display:flex;gap:8px;align-items:center;padding:10px 16px 12px;border-top:1px solid var(--line)}
+.fs .ctx{padding:14px 44px 20px}
+</style>
+</head>
+<body>
+<h1>Recorder-Fenster: drei Ansichten</h1>
+<p class="lead">Mockup zur Freigabe, noch nichts gebaut. Ein einziger Schalter oben links wählt die Ansicht. Die Fenstergrösse ist keine Wahl mehr: das Layout folgt dem Fenster, Vollbild (grüner Fensterknopf) hat ein eigenes, grosszügigeres Layout. Inhalte sind Beispieldaten aus deiner Aufnahme vom 14.11., 11:05.</p>
+
+<section data-v="meeting">
+<h2>1 · Meeting</h2>
+<p>Ein Call mit anderen, zum Teilen. Nur Entscheidungen, nächste Schritte und Anfragen. Keine KI-Fragen, keine privaten Hinweise, keine Knöpfe an den Punkten.</p>
+<div class="pair">
+<figure><div class="win" id="m-win"></div><figcaption>Fenster · 480 × 760</figcaption></figure>
+<figure><div class="fswrap"><div class="fs" id="m-fs"></div></div><figcaption>Vollbild · 1440 × 900 (verkleinert)</figcaption></figure>
+</div>
+<ul class="notes">
+<li>Neue Punkte warten hinter «2 neue Punkte». Was schon da steht, bewegt sich nicht und verschwindet nicht.</li>
+<li>Das Transkript ist nur eine leise Zeile unten («Zuletzt»). Im Vollbild ordnen sich die Punkte in drei Spalten nach Art.</li>
+<li>Einzige Bedienung: Ansicht wechseln, Aufnahme stoppen.</li>
+</ul>
+</section>
+
+<section data-v="work">
+<h2>2 · Ambient</h2>
+<p>Läuft nebenher, während du arbeitest, und sammelt Kontext. Keine Karten, keine Aufgaben, nichts zu erledigen. Du siehst nur, welche Themen schon erfasst sind, und kannst den Kontext an Claude geben.</p>
+<div class="pair">
+<figure><div class="win" id="w-win"></div><figcaption>Fenster · 480 × 760</figcaption></figure>
+<figure><div class="fswrap"><div class="fs" id="w-fs"></div></div><figcaption>Vollbild · 1440 × 900 (verkleinert)</figcaption></figure>
+</div>
+<ul class="notes">
+<li>Die Themenliste ist nur eine Inhaltsangabe: eine Zeile pro Thema, ohne Knöpfe. Neue Themen warten hinter dem Marker; die Linie «Neu seit 11:02» zeigt, was dazugekommen ist.</li>
+<li>Zwei Aktionen für die ganze Sitzung statt pro Punkt: <b>Kopieren</b> und <b>Claude starten</b>, jeweils für die letzten 10 Minuten oder die ganze Sitzung.</li>
+<li>Aufgaben delegierst du weiter per Diktat direkt an den Agenten; hier entsteht nur der Kontext dazu.</li>
+</ul>
+</section>
+
+<section data-v="internal">
+<h2>3 · Intern</h2>
+<p>Prüfen und experimentieren. Transkript, alle Karten samt KI-Ideen, alle Schalter. Eine Zeile Werkzeuge statt drei Schalterreihen.</p>
+<div class="pair">
+<figure><div class="win" id="i-win"></div><figcaption>Fenster · 480 × 760</figcaption></figure>
+<figure><div class="fswrap"><div class="fs" id="i-fs"></div></div><figcaption>Vollbild · 1440 × 900 (verkleinert)</figcaption></figure>
+</div>
+<ul class="notes">
+<li>«Kompakt / Präsentation» und der Vollbild-Knopf entfallen. «Kundenansicht / Intern · privat» wird zum Häkchen «Private Hinweise zeigen», nur hier.</li>
+<li>Im Vollbild drei Spalten: Transkript, Karten, Werkzeuge. Das Roboter-Hintergrundbild entfällt.</li>
+</ul>
+</section>
+
+<script>
+const bar='<div class="bar"><i></i>MeetingRecorder</div>';
+const seg=a=>'<div class="seg">'+['Meeting','Ambient','Intern'].map((n,i)=>`<b class="${i==a?'on':''}">${n}</b>`).join('')+'</div>';
+const hd=(a,extra='')=>`<div class="hd">${seg(a)}<span class="sp"></span>${extra}<span class="state">● 11:14</span><span class="btn">Stopp</span></div>`;
+const pt=(k,l,t,ts)=>`<div class="pt"><span class="lbl k-${k}">${l} · ${ts}</span><p>${t}</p></div>`;
+const acts='<span class="btn pri">Task in Linear</span><span class="btn">Claude starten</span><span class="btn quiet">Verwerfen</span>';
+const cd=(l,t,row,cls='')=>`<div class="cd ${cls}"><span class="lbl">${l}</span><p>${t}</p><div class="row">${row}<span class="src">Bezug</span></div></div>`;
+const tick='<div class="tick"><b>Zuletzt</b><span>Actually the meeting mode would decide how it\'s presented. Like we\'re actually not in a meeting, we\'re just in a work session.</span><u>Transkript</u></div>';
+const P={
+ d1:pt('d','Entscheidung','Markus stellt jetzt die Fragen.','09:46'),
+ a1:pt('a','Nächster Schritt','Pagination in die neue Zeile einbauen, statt Pfeile zum Weiterblättern.','07:48'),
+ a2:pt('a','Nächster Schritt','Screencast und gesprochene Notizen gemeinsam durchgehen.','01:24'),
+ r1:pt('r','Anfrage','In der neuen Zeile soll Pagination sein, wie unten.','07:35'),
+ r2:pt('r','Anfrage','Die Oberfläche insgesamt verbessern.','00:52')};
+const W=[
+ cd('Deine Anfrage · 08:04','Fix the scroll bug: scrolling up must not jump back, and one button jumps to the end.','<span class="done">✓ Task erstellt</span><span class="btn quiet">In Linear öffnen</span>'),
+ '<div class="gone"><s>Mach den Code, den du jetzt hast.</s><span>verworfen</span><u>Zurückholen</u></div>',
+ cd('Deine Anfrage · 08:51','Make the meeting view super simple and clean, safe to screen share.',acts),
+ cd('Deine Anfrage · 09:28','Internal view with all buttons to experiment and check, but simplified.','<span class="done">✓ Claude gestartet 11:12</span>'),
+ '<div class="since">Neu seit 11:02</div>',
+ cd('Deine Anfrage · 11:05','Work session as its own view: we are not in a meeting.',acts)];
+const T=`<div class="tr">
+<div><em>[08:04] Ich</em>If I start scrolling, there should be an easy way to jump to the end and <mark>we don't want to always jump back here</mark>.</div>
+<div><em>[08:25] Ich</em>So, that's a bug that needs to be fixed.</div>
+<div><em>[08:51] Ich</em>One is meeting mode like this. In this mode it should be really simple and really something I could screen share during a meeting.</div>
+<div><em>[09:28] Ich</em>The internal mode should be with all the different buttons and things to experiment and check. But the meeting one needs to be super simple and clean.</div>
+<div><em>[09:45] Ich</em>Wir machen es aber so, dass der Markus jetzt die Fragen stellt.</div>
+<div><em>[11:05] Ich · wird ergänzt</em>Actually the meeting mode would decide how it's presented. Like we're actually not in a meeting, we're just in a work session.</div></div>`;
+const iacts='<span class="btn">Task in Linear</span><span class="btn">Claude starten</span><span class="btn">Kopieren</span>';
+const I=[
+ cd('Anfrage · 08:04','Fix the scroll bug: scrolling up must not jump back.',iacts),
+ cd('Entscheidung · 09:46','Markus stellt jetzt die Fragen.','<span class="btn">Kopieren</span>'),
+ cd('KI-Idee · Vorschlag, nicht gesagt · 00:43','Review the recorded screencast and prompts together to identify key interface fixes.','<span class="btn">Kopieren</span>','ai')];
+const pill=n=>`<div class="newpill">${n==1?'1 neuer Punkt':n+' neue Punkte'} ↓</div>`;
+const q=id=>document.getElementById(id);
+
+q('m-win').innerHTML=bar+hd(0)+`<div class="body"><div class="scroll">${P.d1+P.a1+P.a2+P.r1}</div>${pill(2)}</div>`+tick;
+q('m-fs').innerHTML=hd(0)+`<div class="cols" style="grid-template-columns:1fr 1fr 1fr">
+<div class="col"><h3>Entscheidungen</h3><div>${P.d1}</div></div>
+<div class="col"><h3>Nächste Schritte</h3><div>${P.a1+P.a2}</div>${pill(1)}</div>
+<div class="col"><h3>Anfragen</h3><div>${P.r1+P.r2}</div>${pill(1)}</div></div>`+tick;
+
+const tp=(ts,t)=>`<div class="tp"><em>${ts}</em><span>${t}</span></div>`;
+const TP=tp('00:52','Oberfläche des Recorders verbessern')+tp('02:31','End-Summary in CLAUDE.md, klar abgegrenzt')+tp('04:35','Hauptsitzung, die auch aus dem Portal erreichbar ist')+tp('07:35','Pagination statt Pfeile in der neuen Zeile')+tp('08:04','Scrollen springt zurück; Knopf zum Ende')+tp('08:51','Ansichten: Meeting einfach, Intern mit allen Schaltern')+'<div class="since">Neu seit 11:02</div>'+tp('11:05','Arbeitssitzung ist kein Meeting');
+const ctx='<div class="ctx"><span class="lbl">Kontext für Claude</span><span class="sp"></span><span class="btn">Letzte 10 Min ▾</span><span class="btn">Kopieren</span><span class="btn pri">Claude starten</span></div>';
+q('w-win').innerHTML=bar+hd(1)+`<div class="body"><span class="lbl">Themen bisher · 7</span><div class="scroll" style="gap:0">${TP}</div>${pill(1)}</div>`+ctx;
+q('w-fs').innerHTML=hd(1)+`<div class="cols" style="grid-template-columns:1.3fr 1fr">
+<div class="col" style="gap:0"><span class="lbl" style="margin-bottom:10px">Themen bisher · 7</span>${TP}<div style="height:14px"></div>${pill(1)}</div>
+<div class="col dim"><span class="lbl">Transkript · im Hintergrund</span>${T}</div></div>`+ctx;
+
+q('i-win').innerHTML=bar+hd(2,'<span class="btn quiet">?</span>')+`<div class="body">
+<div style="display:flex;align-items:center"><span class="lbl">Transkript</span><span class="sp"></span><span class="btn">Transkript kopieren</span></div>
+<div class="scroll" style="flex:.9">${T}</div>
+<div style="display:flex;align-items:center"><span class="lbl">Alle Karten · 11</span><span class="sp"></span><span class="chk"><i></i>Private Hinweise zeigen</span></div>
+<div class="scroll">${I.join('')}</div></div>
+<div class="foot"><span class="fld">Teilnehmende</span><span class="fld">Thema für Auszug</span><span class="btn">Auszug kopieren</span></div>`;
+q('i-fs').innerHTML=hd(2,'<span class="btn quiet">?</span>')+`<div class="cols" style="grid-template-columns:1.25fr 1fr 300px">
+<div class="col"><div style="display:flex;align-items:center"><span class="lbl">Transkript</span><span class="sp"></span><span class="btn">Transkript kopieren</span></div>${T}</div>
+<div class="col"><div style="display:flex;align-items:center"><span class="lbl">Alle Karten · 11</span><span class="sp"></span><span class="chk"><i></i>Private Hinweise zeigen</span></div>${I.join('')}</div>
+<div class="col rail"><span class="lbl">Teilnehmende</span><span class="fld">Namen, mit Komma getrennt</span>
+<span class="lbl">Themenauszug</span><span class="fld">Thema für einen Textauszug</span><span class="btn" style="align-self:flex-start">Auszug kopieren</span>
+<span class="lbl">Status</span><span style="font-size:14px;color:var(--mute)">228 Abschnitte · 11 Karten · letzte Aktualisierung vor 4 s</span></div></div><div style="height:28px"></div>`;
+
+const only=new URLSearchParams(location.search).get('v');
+if(only){document.querySelectorAll('section').forEach(s=>s.hidden=s.dataset.v!==only);document.querySelector('h1').hidden=document.querySelector('.lead').hidden=true;document.querySelectorAll('.notes').forEach(n=>n.hidden=true)}
+</script>
+</body>
+</html>

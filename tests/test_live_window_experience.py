@@ -132,9 +132,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-from sidecar.panel_layout import (  # noqa: E402
-    MEETING_CONTROLS, INTERNAL_CONTROLS, is_at_bottom, meeting_layout, scroll_offset_after_update, visible_controls,
-)
+from sidecar.panel_layout import is_at_bottom, scroll_offset_after_update  # noqa: E402
 from sidecar.recorder_support import (  # noqa: E402
     jev_preference_enabled, preference_path, read_window_mode, write_jev_preference, write_window_mode,
 )
@@ -152,30 +150,7 @@ def test_update_keeps_reader_position_unless_following():
     assert scroll_offset_after_update(False, 5000, 100, 1300) == 1200    # clamped if content shrank
 
 
-# ---- D: two modes ----------------------------------------------------------
-
-def test_meeting_mode_is_quiet_and_internal_has_everything():
-    assert visible_controls("meeting") == MEETING_CONTROLS
-    assert visible_controls("internal") == INTERNAL_CONTROLS
-    assert visible_controls("garbage") == MEETING_CONTROLS  # fails to the shareable set
-    assert MEETING_CONTROLS < INTERNAL_CONTROLS
-    for name in ("speakers", "topic", "clip", "audience", "fullscreen", "help", "status", "consent", "copy_transcript"):
-        assert name not in MEETING_CONTROLS and name in INTERNAL_CONTROLS
-
-
-@pytest.mark.parametrize("size", [(480, 760), (1000, 700), (700, 640), (1440, 900)])
-def test_meeting_layout_uses_the_whole_window_without_overlap(size):
-    width, height = size
-    rects = meeting_layout(width, height)
-    for name in ("transcript", "cards"):
-        x, y, w, h = rects[name]
-        assert x >= 0 and y >= 0 and x + w <= width + 1e-6 and y + h <= height + 1e-6 and w > 100 and h > 40
-    tx, ty, tw, th = rects["transcript"]
-    cx, cy, cw, ch = rects["cards"]
-    separate = tx + tw <= cx or cx + cw <= tx or ty + th <= cy or cy + ch <= ty
-    assert separate
-    assert (tw * th + cw * ch) / (width * height) > 0.7  # little wasted chrome
-
+# ---- D: views (layout and controls are covered in test_live_three_views.py) ----
 
 def test_window_mode_preference_roundtrip_and_legacy_compat(tmp_path):
     cfg = tmp_path / "config.yaml"
@@ -190,6 +165,10 @@ def test_window_mode_preference_roundtrip_and_legacy_compat(tmp_path):
     prefs.write_text("not json")
     assert read_window_mode(prefs) == "meeting"
     assert read_window_mode(None) == "meeting"
+    write_window_mode(prefs, "ambient")
+    assert read_window_mode(prefs) == "ambient"
+    prefs.write_text(json.dumps({"window_mode": "presentation"}))   # unknown or old value
+    assert read_window_mode(prefs) == "meeting"
     with pytest.raises(ValueError):
         write_window_mode(prefs, "presentation")
 
@@ -206,29 +185,29 @@ def _many_lines(count=120):
     return tuple(LiveLine(i * 5.0, i * 5.0 + 4, "Ich", f"Sentence number {i} is spoken here for the test.") for i in range(count))
 
 
-def test_panel_defaults_to_meeting_mode_and_hides_internal_controls(tmp_path, monkeypatch):
+def test_panel_defaults_to_meeting_and_hides_internal_controls(tmp_path, monkeypatch):
     panel = _panel(tmp_path, monkeypatch)
     try:
         assert panel.window_mode == "meeting"
         panel.show()
         assert panel._record_button.isHidden() is False
-        for view in (panel.topic_field, panel.speakers_field, panel._clip_button, panel._audience_control,
-                     panel._fullscreen_button, panel._help_button, panel._copy_transcript_button):
+        for view in (panel.topic_field, panel.speakers_field, panel._clip_button, panel._audience_check,
+                     panel._help_button, panel._copy_transcript_button, panel._ctx_claude, panel._transcript_scroll):
             assert view.isHidden() is True
         panel.set_window_mode("internal")
-        assert panel.topic_field.isHidden() is False and panel._audience_control.isHidden() is False
+        assert panel.topic_field.isHidden() is False and panel._audience_check.isHidden() is False
         assert read_window_mode(tmp_path / "sidecar-preferences.json") == "internal"
     finally:
         panel.close()
 
 
-def test_meeting_mode_forces_client_audience(tmp_path, monkeypatch):
+def test_leaving_internal_forces_client_audience(tmp_path, monkeypatch):
     panel = _panel(tmp_path, monkeypatch)
     try:
         panel.show()
         panel.set_window_mode("internal")
         panel.set_audience("internal")
-        panel.set_window_mode("meeting")
+        panel.set_window_mode("ambient")
         assert panel.audience == "client"
     finally:
         panel.close()
@@ -238,6 +217,7 @@ def test_scrolled_up_view_is_not_pulled_back_and_jump_resumes(tmp_path, monkeypa
     panel = _panel(tmp_path, monkeypatch)
     try:
         panel.show()
+        panel.set_window_mode("internal")                     # the transcript is a full panel only here
         lines = _many_lines()
         panel.apply_update(lines[:100], (), "")
         scroll = panel._transcript_scroll

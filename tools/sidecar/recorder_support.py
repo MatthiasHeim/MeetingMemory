@@ -224,12 +224,12 @@ def write_jev_preference(config_path: str | Path, enabled: bool) -> Path:
     return _write_preference_key(path, "use_decider", enabled)
 
 
-WINDOW_MODES = ("meeting", "internal")
+WINDOW_MODES = ("meeting", "ambient", "internal")
 DEFAULT_WINDOW_MODE = "meeting"
 
 
 def read_window_mode(path: str | Path | None) -> str:
-    """Live window mode from the preferences file. Missing, old or malformed means meeting mode."""
+    """Live window view from the preferences file. Missing, old, unknown or malformed means meeting."""
     if path is None:
         return DEFAULT_WINDOW_MODE
     value = _read_preferences(Path(path)).get("window_mode")
