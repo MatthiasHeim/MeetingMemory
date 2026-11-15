@@ -122,6 +122,8 @@ _GATE_QUESTION = {
 def _load_decider_gate_module():
     """Load the shared helper without writing __pycache__ into the skill dir."""
     import importlib.util
+    if "decider_gate" in sys.modules:  # once per process: keeps the helper's "Decider is down" flag
+        return sys.modules["decider_gate"]
     path = Path.home() / ".agents/skills/decider/scripts/decider_gate.py"
     old, sys.dont_write_bytecode = sys.dont_write_bytecode, True
     try:
@@ -693,8 +695,8 @@ def check_and_repair(gemini_dict: dict, *,
                         with _lock:
                             log["gate_skipped_windows"].append(
                                 {"lines": f"{edit_start}-{end}", "p": res.p})
-                        # Treated exactly as "Claude returned no changes".
-                        gate.outcome(ref, False, source="decider_skip")
+                        # Treated exactly as "Claude returned no changes". No outcome is
+                        # recorded: nobody checked, so it must not count as a true negative.
                         return {"relabels": [], "speakers": [],
                                 "uncertain_regions": []}
             except Exception as e:  # a broken gate must never block the repair
