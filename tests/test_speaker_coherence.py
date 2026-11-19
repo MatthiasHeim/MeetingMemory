@@ -611,6 +611,8 @@ def test_overlong_window_bypasses_gate():
     assert gate.checks == [] and runner.calls == 1
 
 
+@pytest.mark.skipif(not sc.DECIDER_GATE_PATH.exists(),
+                    reason="shared decider skill not installed (CI); covered by the missing-helper tests below")
 def test_real_gate_module_loads_shadow_and_down_decider_runs_claude(monkeypatch):
     """Default path: real helper, no Decider reachable -> Claude still runs."""
     monkeypatch.delenv("DECIDER_GATES")
@@ -620,6 +622,38 @@ def test_real_gate_module_loads_shadow_and_down_decider_runs_claude(monkeypatch)
     runner = CountingRunner()
     _d, log = _run(None, runner, n=12)
     assert runner.calls == 1 and log["ok"]
+
+
+def test_failed_helper_load_leaves_no_empty_module_behind(monkeypatch, tmp_path):
+    """A missing helper raises every time and never caches an empty shell."""
+    monkeypatch.delitem(sys.modules, "decider_gate", raising=False)
+    missing = tmp_path / "decider_gate.py"
+    with pytest.raises(FileNotFoundError):
+        sc._load_decider_gate_module(missing)
+    assert "decider_gate" not in sys.modules
+    with pytest.raises(FileNotFoundError):
+        sc._load_decider_gate_module(missing)
+
+
+def test_helper_loads_after_an_earlier_failed_attempt(monkeypatch, tmp_path):
+    """Two-sided: once the helper exists, the next load returns the real module."""
+    monkeypatch.delitem(sys.modules, "decider_gate", raising=False)
+    path = tmp_path / "decider_gate.py"
+    with pytest.raises(FileNotFoundError):
+        sc._load_decider_gate_module(path)
+    path.write_text("def ask(*a, **k):\n    return {}\n")
+    mod = sc._load_decider_gate_module(path)
+    assert callable(mod.ask) and sys.modules["decider_gate"] is mod
+
+
+def test_missing_helper_means_no_gate_and_claude_still_runs(monkeypatch, tmp_path):
+    monkeypatch.delitem(sys.modules, "decider_gate", raising=False)
+    monkeypatch.setattr(sc, "DECIDER_GATE_PATH", tmp_path / "absent.py")
+    assert sc._build_gate() is None
+    runner = CountingRunner()
+    _d, log = _run(None, runner, n=12)
+    assert runner.calls == 1 and log["ok"]
+    assert "decider_gate" not in sys.modules
 
 
 def test_tiny_transcript_skips_without_calling_claude_or_gate():
