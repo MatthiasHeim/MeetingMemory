@@ -167,28 +167,87 @@ def test_retired_session_finishes_no_more_queued_provider_work():
     assert updates == []
 
 
-def test_short_transcription_schedule_does_not_add_network_time_to_interval():
-    starts=[]
+class _FakeClock:
+    """Virtual time for the live loop: advances only when the code under test
+    waits or 'works', so a slow or loaded CI runner cannot change the result."""
+    def __init__(self):
+        self.now = 1000.0
+    def monotonic(self):
+        return self.now
+    def perf_counter(self):
+        return self.now
+
+
+class _ClockedStop:
+    """Stands in for LiveEngine._stop: wait(t) advances virtual time by t."""
+    def __init__(self, clock, done):
+        self.clock, self.done, self.flag = clock, done, False
+    def wait(self, timeout=None):
+        self.clock.now += max(0.0, timeout or 0.0)
+        self.flag = self.flag or self.done()
+        return self.flag
+    def is_set(self):
+        return self.flag
+    def set(self):
+        self.flag = True
+    def clear(self):
+        self.flag = False
+
+
+def _schedule_starts(monkeypatch, *, interval, work, ticks=6):
+    """Run the real LiveEngine._loop on virtual time; return tick start times."""
+    import types
+    import sidecar.live as live
+    clock = _FakeClock()
+    shim = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith('_')})
+    shim.monotonic, shim.perf_counter = clock.monotonic, clock.perf_counter
+    monkeypatch.setattr(live, 'time', shim)
+    starts = []
     class Transcriber:
-        def transcribe_tails(self,*args):
-            starts.append(time.monotonic())
-            time.sleep(.20)
+        def transcribe_tails(self, *args):
+            starts.append(clock.now)
+            clock.now += work  # the network request
             return []
-    # Starts every interval (gap .30), not interval + work (gap .50). The
-    # schedule is deadline-based, so a bug would lengthen EVERY gap; a macOS CI
-    # runner waking one timer late lengthens one (seen: .50 once, .214 at
-    # .14/.08). Judge the MEAN gap: deadlines do not accumulate, so one late
-    # wake-up shifts the mean by jitter/5, while added network time shifts it
-    # by the full .20 (.50 vs .30). Midpoint limit .40.
-    engine=LiveEngine(snapshot=lambda _:TailSnapshot(np.zeros(16),16000,None,16000,0,5),
-                      transcriber=Transcriber(), interval=.30)
-    engine.start()
-    deadline=time.monotonic()+6
-    while len(starts)<6 and time.monotonic()<deadline: time.sleep(.01)
-    engine.retire(); engine._thread.join(2)
-    assert len(starts)>=6
-    gaps=[b-a for a,b in zip(starts,starts[1:])]
-    assert sum(gaps)/len(gaps) < .40
+    engine = LiveEngine(snapshot=lambda _: TailSnapshot(np.zeros(16), 16000, None, 16000, 0, 5),
+                        transcriber=Transcriber(), interval=interval)
+    engine._stop = _ClockedStop(clock, lambda: len(starts) >= ticks)
+    engine._loop()
+    return starts
+
+
+def test_short_transcription_schedule_does_not_add_network_time_to_interval(monkeypatch):
+    # Starts every interval (gap .30), not interval + work (gap .50). Virtual
+    # time makes this exact: the old real-clock version measured macOS runner
+    # load (mean gaps .43-.48 on 2026-11-15) instead of the schedule.
+    starts = _schedule_starts(monkeypatch, interval=.30, work=.20)
+    gaps = [round(b - a, 6) for a, b in zip(starts, starts[1:])]
+    assert len(gaps) >= 5
+    assert gaps == [.30] * len(gaps)
+
+
+def test_slow_transcription_runs_back_to_back_without_catch_up_burst(monkeypatch):
+    # Work longer than the interval: the next start follows the end of the
+    # request after the small breather (interval/6), never a burst of overdue
+    # ticks and never a full extra interval.
+    starts = _schedule_starts(monkeypatch, interval=.30, work=.50)
+    gaps = [round(b - a, 6) for a, b in zip(starts, starts[1:])]
+    assert gaps and all(g == .55 for g in gaps)
+
+
+def test_fake_clock_detects_interval_plus_work_schedule(monkeypatch):
+    # Two-sided: the same harness flags a loop that sleeps a full interval after
+    # each request (the bug the schedule test guards against).
+    import sidecar.live as live
+    def buggy_loop(self):
+        self._ensure_runtime()
+        while not self._stop.is_set():
+            if self._stop.wait(self.interval):
+                break
+            self._safe_tick()
+    monkeypatch.setattr(live.LiveEngine, '_loop', buggy_loop)
+    starts = _schedule_starts(monkeypatch, interval=.30, work=.20)
+    gaps = [round(b - a, 6) for a, b in zip(starts, starts[1:])]
+    assert gaps and all(g == .50 for g in gaps)
 
 
 def test_suggestions_require_valid_source_ids_and_copy_as_suggestions():

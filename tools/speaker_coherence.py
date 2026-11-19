@@ -119,18 +119,30 @@ _GATE_QUESTION = {
 }
 
 
-def _load_decider_gate_module():
-    """Load the shared helper without writing __pycache__ into the skill dir."""
+DECIDER_GATE_PATH = Path.home() / ".agents/skills/decider/scripts/decider_gate.py"
+
+
+def _load_decider_gate_module(path: Optional[Path] = None):
+    """Load the shared helper without writing __pycache__ into the skill dir.
+
+    A failed load must not leave a half-initialised module in sys.modules:
+    every later call in the process would get that empty shell (no Gate, no
+    ask) instead of a clean error. Seen on CI, where the skill is absent.
+    """
     import importlib.util
     if "decider_gate" in sys.modules:  # once per process: keeps the helper's "Decider is down" flag
         return sys.modules["decider_gate"]
-    path = Path.home() / ".agents/skills/decider/scripts/decider_gate.py"
+    path = Path(path) if path is not None else DECIDER_GATE_PATH
     old, sys.dont_write_bytecode = sys.dont_write_bytecode, True
     try:
         spec = importlib.util.spec_from_file_location("decider_gate", path)
         module = importlib.util.module_from_spec(spec)
         sys.modules["decider_gate"] = module  # dataclasses need the module registered
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop("decider_gate", None)
+            raise
     finally:
         sys.dont_write_bytecode = old
     return module
