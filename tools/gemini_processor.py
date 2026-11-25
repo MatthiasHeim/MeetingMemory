@@ -27,6 +27,53 @@ from transcript_validator import validate_transcript
 
 logger = logging.getLogger(__name__)
 
+# Transcription model defaults. Kept in one place so no code path silently
+# falls back to a deprecated model (gemini-2.5-pro / gemini-2.5-flash are
+# auto-routed by Google from 2026-12-01). The choice and the evidence behind
+# it: docs/model-eval-2026-11.md.
+DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_THINKING_LEVEL = "low"
+DEPRECATED_MODELS = frozenset({
+    "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash",
+    "gemini-1.5-pro", "gemini-1.5-flash",
+})
+
+
+class GeminiFatalError(RuntimeError):
+    """A request error that no retry can fix (invalid/revoked API key,
+    permission denied, billing disabled, unknown model).
+
+    Retrying these only burns the retry ladder and the periodic rescan
+    attempts (2026-11-17: an invalid key ran 3 full ladders + alerts before a
+    restart picked up the new key). Raised through every retry layer so the
+    watcher can stop immediately and alert once."""
+
+
+_BAD_KEY_MARKERS = ("API key not valid", "API_KEY_INVALID", "API key expired")
+_FATAL_STATUS_MARKERS = (
+    "PERMISSION_DENIED", "BILLING_DISABLED", "UNAUTHENTICATED",
+    # 429 for the project's monthly spending cap does not clear on retry for
+    # days; failing fast surfaces "raise the cap" in the alert instead of
+    # burning the ladder (2026-11-25).
+    "monthly spending cap",
+)
+
+
+def is_fatal_gemini_error(exc: BaseException) -> bool:
+    """True for errors a retry cannot fix. Conservative: 429/500/503,
+    disconnects, timeouts and malformed JSON stay retryable."""
+    if isinstance(exc, GeminiFatalError):
+        return True
+    text = str(exc)
+    code = getattr(exc, "code", None)
+    if code in (401, 403):
+        return True
+    if code == 404 and "models/" in text:
+        return True  # unknown / retired model name
+    if any(m in text for m in _BAD_KEY_MARKERS):
+        return True
+    return any(m in text for m in _FATAL_STATUS_MARKERS)
+
 
 # Audio-only analysis prompt. Single-shot path uses this on raw audio. Chunked
 # path runs each chunk through this, then runs a separate text-only reduce-pass
@@ -343,10 +390,14 @@ class GeminiResult:
 
     # Processing metadata
     input_tokens: int = 0
+    # Visible output only (candidates_token_count). Thinking tokens are
+    # billed at the output rate on top of this; see thinking_tokens.
     output_tokens: int = 0
+    thinking_tokens: int = 0
+    thinking_level: Optional[str] = None
     audio_duration_seconds: float = 0.0
     processing_time_seconds: float = 0.0
-    model: str = "gemini-2.5-flash"
+    model: str = DEFAULT_MODEL
     chunked: bool = False
     chunk_count: int = 1
     reduce_pass_used: bool = False
@@ -395,6 +446,13 @@ class GeminiResult:
     # channel-verified" from "the channel oracle was unusable and skipped".
     channel_separation: Optional[dict] = None
     speaker_attribution: Optional[dict] = None
+    # speech_trim.TrimPlan.to_dict() when no-speech stretches were cut before
+    # the Gemini call (timestamps are already mapped back to original time).
+    speech_trim: Optional[dict] = None
+    # Totals over every billed call for this recording (retries, escalation
+    # steps, reduce pass), set by the watcher: the real cost, not just the
+    # call that was kept.
+    billed_usage: Optional[dict] = None
 
     @property
     def parsed_response(self) -> dict:
@@ -416,6 +474,8 @@ class GeminiResult:
                 "reduce_pass_used": self.reduce_pass_used,
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
+                "thinking_tokens": self.thinking_tokens,
+                "thinking_level": self.thinking_level,
                 "processing_time_seconds": self.processing_time_seconds,
                 "audio_duration_seconds": self.audio_duration_seconds,
                 "missing_time_ranges": [list(r) for r in self.missing_time_ranges],
@@ -438,28 +498,40 @@ class GeminiResult:
             out["_meta"]["voice_match"] = self.voice_match
         if self.speaker_attribution is not None:
             out["_meta"]["speaker_attribution"] = self.speaker_attribution
+        if self.speech_trim is not None:
+            out["_meta"]["speech_trim"] = self.speech_trim
+        if self.billed_usage is not None:
+            out["_meta"]["billed_usage"] = self.billed_usage
         return out
 
 
 class GeminiAudioProcessor:
-    """Processor for audio files using Gemini 2.5 Flash."""
+    """Processor for audio files using a Gemini Flash model (see DEFAULT_MODEL)."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gemini-2.5-flash",
+        model: str = DEFAULT_MODEL,
         max_output_tokens: int = 65536,
         temperature: float = 0.1,
-        timeout_seconds: int = 600
+        timeout_seconds: int = 600,
+        thinking_level: Optional[str] = DEFAULT_THINKING_LEVEL,
+        allow_deprecated: bool = False,
     ):
         """Initialize the Gemini processor.
 
         Args:
             api_key: Google AI API key. If None, reads from GEMINI_API_KEY env var.
-            model: Gemini model to use (default: gemini-2.5-flash)
+            model: Gemini model to use (default: DEFAULT_MODEL)
             max_output_tokens: Maximum output tokens (default: 65536 for full transcripts)
             temperature: Generation temperature (default: 0.1 for accuracy)
             timeout_seconds: Request timeout in seconds (default: 600 for long audio)
+            thinking_level: "minimal" | "low" | "medium" | "high", or None
+                for the model's default. Thinking tokens are billed as output
+                AND count against max_output_tokens, so a high level on a long
+                meeting can truncate the JSON. Per-model levels:
+                docs/model-eval-2026-11.md.
+            allow_deprecated: only for tools/model_eval.py reference runs.
         """
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
@@ -468,7 +540,17 @@ class GeminiAudioProcessor:
                 "or pass api_key parameter."
             )
 
+        if model in DEPRECATED_MODELS and not allow_deprecated:
+            raise ValueError(
+                f"{model} is deprecated (Google auto-routes it from 2026-12-01); "
+                f"use {DEFAULT_MODEL} or see docs/model-eval-2026-11.md"
+            )
         self.model = model
+        self.thinking_level = thinking_level or None
+        # One entry per completed generate call, INCLUDING attempts whose
+        # JSON was unusable and got retried — those are billed too. Lets the
+        # eval and the watcher log report true cost, not just the kept call.
+        self.usage_log: list[dict] = []
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
         # A missing/zero timeout is exactly the hang class this guards
@@ -566,7 +648,10 @@ class GeminiAudioProcessor:
         if duration <= self.CHUNK_THRESHOLD_SEC and not force_chunk:
             return [(audio_path, 0.0)]
 
-        temp_dir = Path(tempfile.gettempdir()) / f"gemini_chunks_{audio_path.stem}"
+        # Unique per call: a fixed per-stem name let two runs on the same
+        # recording (escalation retry + rescan, or an eval) delete each
+        # other's chunks mid-flight ("No such file ... chunk_08.mp3").
+        temp_dir = Path(tempfile.mkdtemp(prefix=f"gemini_chunks_{audio_path.stem}_"))
         temp_dir.mkdir(exist_ok=True)
         chunks = []
         start = 0.0
@@ -659,6 +744,8 @@ class GeminiAudioProcessor:
                 channel_segments=channel_segments,
                 diarization_segments=diarization_segments,
             )
+        except GeminiFatalError:
+            raise
         except Exception as e:
             if total_duration > self.CHUNK_DURATION_SEC:
                 # F2 (docs/SPEC-error-path-escalation-2026-07-10.md RC2):
@@ -759,6 +846,8 @@ class GeminiAudioProcessor:
 
         except Exception as e:
             logger.error(f"Files API upload failed: {e}")
+            if is_fatal_gemini_error(e):
+                raise GeminiFatalError(str(e)) from e
             # Fallback to inline data for small files
             if file_size_mb < 5:
                 logger.info("Falling back to inline data...")
@@ -800,6 +889,31 @@ class GeminiAudioProcessor:
 
         return result
 
+    def _generate_config(self):
+        kwargs = dict(temperature=self.temperature,
+                      max_output_tokens=self.max_output_tokens)
+        # getattr: tests (and old pickles) build processors without __init__.
+        level = getattr(self, "thinking_level", None)
+        if level:
+            kwargs["thinking_config"] = self.types.ThinkingConfig(thinking_level=level)
+        return self.types.GenerateContentConfig(**kwargs)
+
+    def _record_usage(self, response, attempt: int, with_audio: bool) -> None:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return
+        if not hasattr(self, "usage_log"):
+            self.usage_log = []
+        self.usage_log.append({
+            "model": self.model,
+            "thinking_level": getattr(self, "thinking_level", None),
+            "attempt": attempt,
+            "audio": with_audio,
+            "input_tokens": usage.prompt_token_count or 0,
+            "output_tokens": usage.candidates_token_count or 0,
+            "thinking_tokens": getattr(usage, "thoughts_token_count", 0) or 0,
+        })
+
     def _generate_with_retry(self, prompt: str, audio_content: Optional[Any] = None,
                               max_attempts: int = 3, validate_json: bool = True) -> tuple:
         """Stream generate_content with retry on transient disconnects.
@@ -824,10 +938,7 @@ class GeminiAudioProcessor:
                 stream = self.client.models.generate_content_stream(
                     model=self.model,
                     contents=contents,
-                    config=self.types.GenerateContentConfig(
-                        temperature=self.temperature,
-                        max_output_tokens=self.max_output_tokens,
-                    ),
+                    config=self._generate_config(),
                 )
                 final_response = None
                 for chunk in stream:
@@ -835,6 +946,7 @@ class GeminiAudioProcessor:
                         chunks.append(chunk.text)
                     final_response = chunk  # last chunk carries usage_metadata
                 text = ''.join(chunks)
+                self._record_usage(final_response, attempt, audio_content is not None)
                 if not text:
                     raise RuntimeError("Empty response from Gemini")
                 if validate_json:
@@ -847,6 +959,9 @@ class GeminiAudioProcessor:
                 return text, final_response
             except Exception as e:
                 last_error = e
+                if is_fatal_gemini_error(e):
+                    logger.error(f"Gemini request failed permanently (not retrying): {e}")
+                    raise GeminiFatalError(str(e)) from e
                 logger.warning(
                     f"Gemini attempt {attempt}/{max_attempts} failed after "
                     f"{len(''.join(chunks))} chars: {e}"
@@ -926,6 +1041,8 @@ class GeminiAudioProcessor:
                     diarization_segments=diarization_segments,
                     continuity_context=continuity_context,
                 )
+            except GeminiFatalError:
+                raise
             except Exception as e:
                 logger.warning(
                     f"    Chunk attempt {attempt}/{self.CHUNK_RETRY_ATTEMPTS} "
@@ -997,6 +1114,7 @@ class GeminiAudioProcessor:
         merged_transcript_parts = []
         input_tokens_total = 0
         output_tokens_total = 0
+        thinking_tokens_total = 0
         chunk_results: list['GeminiResult'] = []
         chunk_offsets: list[float] = []
         chunk_language = "unknown"
@@ -1063,6 +1181,7 @@ class GeminiAudioProcessor:
 
             input_tokens_total += chunk_result.input_tokens
             output_tokens_total += chunk_result.output_tokens
+            thinking_tokens_total += chunk_result.thinking_tokens
 
             # Pick first non-empty language and participants list (these don't
             # benefit from reduce-pass; they're stable across chunks).
@@ -1123,6 +1242,7 @@ class GeminiAudioProcessor:
             if reduce_response and reduce_response.usage_metadata:
                 input_tokens_total += reduce_response.usage_metadata.prompt_token_count or 0
                 output_tokens_total += reduce_response.usage_metadata.candidates_token_count or 0
+                thinking_tokens_total += getattr(reduce_response.usage_metadata, "thoughts_token_count", 0) or 0
             reduce_pass_ok = True
         except Exception as e:
             logger.warning(f"Reduce-pass failed ({e}); falling back to chunk-1 analysis")
@@ -1148,6 +1268,8 @@ class GeminiAudioProcessor:
             energy_levels=reduce_data.get("energy_levels") or self._merge_energy_levels(chunk_results),
             input_tokens=input_tokens_total,
             output_tokens=output_tokens_total,
+            thinking_tokens=thinking_tokens_total,
+            thinking_level=getattr(self, "thinking_level", None),
             audio_duration_seconds=total_duration,
             processing_time_seconds=processing_time,
             model=self.model,
@@ -1299,6 +1421,7 @@ class GeminiAudioProcessor:
         usage = response.usage_metadata
         input_tokens = usage.prompt_token_count if usage else 0
         output_tokens = usage.candidates_token_count if usage else 0
+        thinking_tokens = (getattr(usage, "thoughts_token_count", 0) or 0) if usage else 0
 
         if text is None:
             text = response.text
@@ -1314,6 +1437,8 @@ class GeminiAudioProcessor:
                 language="unknown",
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                thinking_tokens=thinking_tokens,
+                thinking_level=getattr(self, "thinking_level", None),
                 processing_time_seconds=processing_time,
                 model=self.model,
                 error=f"JSONDecodeError: {e}",
@@ -1332,6 +1457,8 @@ class GeminiAudioProcessor:
             energy_levels=data.get("energy_levels", {}) or {},
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            thinking_tokens=thinking_tokens,
+            thinking_level=getattr(self, "thinking_level", None),
             processing_time_seconds=processing_time,
             model=self.model,
             raw_response=data,

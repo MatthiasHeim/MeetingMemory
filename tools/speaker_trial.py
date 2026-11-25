@@ -358,7 +358,8 @@ def retry_audits(state: Path, limit: int = 2) -> dict:
     key = os.environ.get(cfg.get("gemini", {}).get("api_key_env", "GEMINI_API_KEY"))
     if not key:
         raise RuntimeError("Configured Gemini API key unavailable")
-    model = cfg.get("gemini", {}).get("model", "gemini-2.5-pro")
+    from gemini_processor import DEFAULT_MODEL
+    model = cfg.get("gemini", {}).get("model", DEFAULT_MODEL)
     client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=180000))
     outcomes = []
     for queue_path in sorted((state / "recordings").glob("*/verification_queue.json")):

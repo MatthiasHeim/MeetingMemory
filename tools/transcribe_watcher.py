@@ -89,10 +89,20 @@ try:
         get_audio_duration,
         get_channel_count,
     )
-    from gemini_processor import GeminiAudioProcessor, GeminiResult
+    from gemini_processor import (
+        DEFAULT_MODEL as GEMINI_DEFAULT_MODEL,
+        DEFAULT_THINKING_LEVEL as GEMINI_DEFAULT_THINKING,
+        DEPRECATED_MODELS as GEMINI_DEPRECATED_MODELS,
+        GeminiAudioProcessor,
+        GeminiFatalError,
+        GeminiResult,
+    )
     GEMINI_AVAILABLE = True
 except ImportError as e:
     GEMINI_AVAILABLE = False
+
+    class GeminiFatalError(RuntimeError):  # keeps except clauses valid
+        pass
     _GEMINI_IMPORT_ERROR = str(e)
 
 # Import neon_insert for programmatic InsightBase source creation +
@@ -136,10 +146,18 @@ except ImportError as e:
 # that flips confidently-misattributed turns.
 try:
     from channel_vad import compute_channel_vad as _compute_channel_vad
+    from channel_vad import compute_speech_activity as _compute_speech_activity
     CHANNEL_VAD_AVAILABLE = True
 except ImportError as e:
     CHANNEL_VAD_AVAILABLE = False
     _CHANNEL_VAD_IMPORT_ERROR = str(e)
+
+try:
+    import speech_trim as _speech_trim
+    SPEECH_TRIM_AVAILABLE = True
+except ImportError as e:
+    SPEECH_TRIM_AVAILABLE = False
+    _SPEECH_TRIM_IMPORT_ERROR = str(e)
 
 try:
     from speaker_verify import verify as _verify_speakers, SELF_NAME as _SELF_FULL_NAME
@@ -497,6 +515,16 @@ def _apply_missing_ranges(validation, missing: list) -> None:
         )
 
 
+def _summarize_usage(usage_log: list) -> dict:
+    """Totals over GeminiAudioProcessor.usage_log entries (one per call)."""
+    return {
+        "calls": len(usage_log),
+        "input_tokens": sum(u.get("input_tokens", 0) for u in usage_log),
+        "output_tokens": sum(u.get("output_tokens", 0) for u in usage_log),
+        "thinking_tokens": sum(u.get("thinking_tokens", 0) for u in usage_log),
+    }
+
+
 def _validate_gemini_result(result, audio_duration_seconds: float):
     """transcript_validator.validate_transcript, plus a GeminiResult-specific
     check the text-only validator can't see: a chunk that failed after
@@ -738,31 +766,40 @@ class TranscribeWatcher:
         self.gemini_processor = None
         if self.processing_mode in ('gemini', 'both') and GEMINI_AVAILABLE:
             gemini_config = config.get('gemini', {})
-            api_key = os.environ.get(gemini_config.get('api_key_env', 'GEMINI_API_KEY'))
+            self._gemini_api_key_env = gemini_config.get('api_key_env', 'GEMINI_API_KEY')
+            api_key = os.environ.get(self._gemini_api_key_env)
             if api_key:
+                # Length-based model routing: meetings longer than
+                # `long_duration_min` use `model_long`, shorter ones `model`,
+                # each with its own thinking level. Applied per file in
+                # _process_with_gemini. Defaults and the evidence for them:
+                # docs/model-eval-2026-11.md. A deprecated model in the
+                # config (gemini-2.5-pro / -flash, auto-routed by Google from
+                # 2026-12-01) is refused loudly instead of silently used.
+                self._gemini_model_short, self._gemini_thinking_short = self._configured_model(
+                    gemini_config, 'model', 'thinking_level')
+                self._gemini_model_long, self._gemini_thinking_long = self._configured_model(
+                    gemini_config, 'model_long', 'thinking_level_long',
+                    fallback=(self._gemini_model_short, self._gemini_thinking_short))
+                self._gemini_long_min = float(gemini_config.get('long_duration_min', 30))
                 self.gemini_processor = GeminiAudioProcessor(
                     api_key=api_key,
-                    model=gemini_config.get('model', 'gemini-2.5-flash'),
+                    model=self._gemini_model_short,
+                    thinking_level=self._gemini_thinking_short,
                     max_output_tokens=gemini_config.get('max_output_tokens', 65536),
                     temperature=gemini_config.get('temperature', 0.1),
                     timeout_seconds=gemini_config.get('timeout', 600)
                 )
-                self.logger.info(f"Gemini processor initialized with model: {gemini_config.get('model', 'gemini-2.5-flash')}")
-                # Length-based model routing. The flash models intermittently
-                # fail long multi-source recordings with "Server disconnected
-                # without sending a response" (0 bytes back, all retries +
-                # chunk fallback exhausted -> the recording is silently
-                # dropped). gemini-2.5-pro is reliable on that same audio, so
-                # meetings longer than `long_duration_min` are routed to it;
-                # shorter meetings stay on the cheap/fast `model`. Applied
-                # per-file in _process_with_gemini.
-                self._gemini_model_short = gemini_config.get('model', 'gemini-2.5-flash')
-                self._gemini_model_long = gemini_config.get('model_long', 'gemini-2.5-pro')
-                self._gemini_long_min = float(gemini_config.get('long_duration_min', 30))
-                if self._gemini_model_long != self._gemini_model_short:
+                self.logger.info(
+                    f"Gemini processor initialized with model: {self._gemini_model_short} "
+                    f"(thinking={self._gemini_thinking_short})"
+                )
+                if (self._gemini_model_long, self._gemini_thinking_long) != (
+                        self._gemini_model_short, self._gemini_thinking_short):
                     self.logger.info(
                         f"Model routing enabled: >{self._gemini_long_min:.0f}min -> "
-                        f"{self._gemini_model_long}, else {self._gemini_model_short}"
+                        f"{self._gemini_model_long} ({self._gemini_thinking_long}), "
+                        f"else {self._gemini_model_short} ({self._gemini_thinking_short})"
                     )
             else:
                 self.logger.error(f"GEMINI_API_KEY not found in environment. Gemini processing disabled.")
@@ -788,6 +825,85 @@ class TranscribeWatcher:
         self._rescan_state_path = self.transcripts_dir / RESCAN_STATE_FILENAME
         self._rescan_state = _load_rescan_state(self._rescan_state_path)
         self._last_rescan_monotonic = time.time()
+
+    def _configured_model(self, gemini_config: dict, model_key: str,
+                          thinking_key: str, fallback=None) -> tuple:
+        """(model, thinking_level) from config, never a deprecated model."""
+        default_model, default_thinking = fallback or (
+            GEMINI_DEFAULT_MODEL, GEMINI_DEFAULT_THINKING)
+        model = gemini_config.get(model_key) or default_model
+        thinking = gemini_config.get(thinking_key, default_thinking
+                                     if model == default_model else None)
+        if model in GEMINI_DEPRECATED_MODELS:
+            self.logger.error(
+                f"gemini.{model_key}={model} is deprecated (Google auto-routes it "
+                f"from 2026-12-01); using {GEMINI_DEFAULT_MODEL} instead. Fix config.yaml."
+            )
+            model, thinking = GEMINI_DEFAULT_MODEL, GEMINI_DEFAULT_THINKING
+        return model, (thinking or None)
+
+    def _reload_gemini_key(self) -> bool:
+        """Re-read .env after the API rejected the key; True if it changed.
+
+        2026-11-17: the key in .env was rotated while the watcher ran on the
+        old one, and every call failed until a manual restart."""
+        if not self.gemini_processor:
+            return False
+        env_name = getattr(self, "_gemini_api_key_env", "GEMINI_API_KEY")
+        try:
+            from dotenv import dotenv_values
+            new_key = dotenv_values(Path(__file__).parent.parent / '.env').get(env_name)
+        except Exception:
+            new_key = None
+        if not new_key or new_key == self.gemini_processor.api_key:
+            return False
+        os.environ[env_name] = new_key
+        self.gemini_processor.api_key = new_key
+        self.gemini_processor.client = self.gemini_processor.genai.Client(
+            api_key=new_key,
+            http_options=self.gemini_processor.types.HttpOptions(
+                timeout=int(self.gemini_processor.timeout_seconds * 1000)),
+        )
+        self.logger.warning(f"Reloaded {env_name} from .env after the API rejected the old key")
+        return True
+
+    def _speech_trim_plan(self, analysis_file: Path):
+        """Speech activity -> TrimPlan, or None when unavailable (then the
+        whole recording is sent, as before). Reads the raw/aligned WAV:
+        on the loudnormed MP3 room tone looks like speech."""
+        if not (SPEECH_TRIM_AVAILABLE and CHANNEL_VAD_AVAILABLE):
+            return None
+        if not (self.config.get('speech_trim', {}) or {}).get('enabled', True):
+            return None
+        try:
+            # Always decoded fresh (a few seconds): the skip decision needs
+            # the level statistics ChannelVAD doesn't keep, and in-room /
+            # mono recordings have no ChannelVAD at all.
+            return _speech_trim.plan_from_activity(_compute_speech_activity(analysis_file))
+        except Exception as e:
+            self.logger.warning(f"Speech trim unavailable for {analysis_file.name}: {e}")
+            return None
+
+    def _save_no_speech_outcome(self, audio_file: Path, json_path: Path,
+                                gate: str, trim_plan=None, audio_sha256=None,
+                                start_time: float = 0.0) -> None:
+        """Explicit skipped outcome: no generative model is allowed to invent
+        a meeting from a capture with (almost) no speech, and nothing is billed."""
+        empty = GeminiResult(transcript="", language="unknown",
+                             audio_duration_seconds=get_audio_duration(audio_file))
+        empty.speaker_attribution = {
+            "status": "no_speech", "identity_basis": "none",
+            "speaker_dependent_actions": "hold", "missing_stages": [],
+            "accuracy_measured": False,
+        }
+        data = empty.parsed_response
+        data["_meta"]["speech_gate"] = gate
+        if trim_plan is not None:
+            data["_meta"]["speech_trim"] = trim_plan.to_dict()
+        atomic_json(json_path, data)
+        save_trial_stage(self.config, audio_file, "candidate", data,
+                         audio_sha256=audio_sha256,
+                         elapsed_seconds=time.time() - start_time)
 
     def start(self):
         """Start watching for new files."""
@@ -1274,19 +1390,9 @@ class TranscribeWatcher:
             if digital_silence(audio_file):
                 # No generative model is allowed to invent a meeting from
                 # an all-zero capture. Persist the explicit skipped outcome.
-                empty = GeminiResult(transcript="", language="unknown",
-                                     audio_duration_seconds=get_audio_duration(audio_file))
-                empty.speaker_attribution = {
-                    "status": "no_speech", "identity_basis": "none",
-                    "speaker_dependent_actions": "hold", "missing_stages": [],
-                    "accuracy_measured": False,
-                }
-                data = empty.parsed_response
-                data["_meta"]["speech_gate"] = "digital_silence"
-                atomic_json(json_path, data)
-                save_trial_stage(self.config, audio_file, "candidate", data,
-                                 audio_sha256=trial_audio_sha256,
-                                 elapsed_seconds=time.time() - start_time)
+                self._save_no_speech_outcome(audio_file, json_path, "digital_silence",
+                                             audio_sha256=trial_audio_sha256,
+                                             start_time=start_time)
                 self.logger.info("Digital silence: saved no-speech outcome, no extraction")
                 return
 
@@ -1375,18 +1481,56 @@ class TranscribeWatcher:
             audio_duration = get_audio_duration(mp3_path)
             self.logger.info(f"Audio duration: {audio_duration / 60:.1f} minutes")
 
-            # Route long recordings to the reliable model (see __init__).
-            _routed_model = (
-                self._gemini_model_long
-                if audio_duration / 60 > self._gemini_long_min
-                else self._gemini_model_short
-            )
-            if _routed_model != self.gemini_processor.model:
+            # Step 2d: Don't pay for audio nobody speaks in (speech_trim.py).
+            # Skip a recording with almost no speech; otherwise cut long
+            # no-speech stretches from what Gemini hears and map every
+            # timestamp back to the original recording afterwards.
+            trim_plan = self._speech_trim_plan(analysis_file)
+            if trim_plan is not None and trim_plan.skip:
+                self.logger.warning(
+                    f"Speech gate: skipping {audio_file.name} without a Gemini call "
+                    f"({trim_plan.reason}); saved no-speech outcome"
+                )
+                self._save_no_speech_outcome(audio_file, json_path, "vad_no_speech",
+                                             trim_plan=trim_plan,
+                                             audio_sha256=trial_audio_sha256,
+                                             start_time=start_time)
+                return
+            processor = self.gemini_processor
+            billed_duration = audio_duration
+            validation_duration = audio_duration
+            trimmed_mp3 = None
+            if trim_plan is not None and trim_plan.trimmed:
+                trimmed_mp3 = mp3_path.with_name(f"{mp3_path.stem}.speech.mp3")
+                try:
+                    _speech_trim.render_trimmed_mp3(mp3_path, trim_plan, trimmed_mp3)
+                    processor = _speech_trim.TimeMappedProcessor(
+                        self.gemini_processor, trim_plan, trimmed_mp3)
+                    billed_duration = trim_plan.kept_sec
+                    validation_duration = trim_plan.effective_end
+                    self.logger.info(
+                        f"Speech trim: sending {trim_plan.kept_sec / 60:.1f} of "
+                        f"{audio_duration / 60:.1f} min ({trim_plan.reason}; "
+                        f"speech {trim_plan.speech_sec / 60:.1f} min)"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Speech trim failed ({e}); sending full audio")
+                    trim_plan, trimmed_mp3 = None, None
+
+            # Route long recordings (by the audio actually sent) to model_long.
+            _long = billed_duration / 60 > self._gemini_long_min
+            _routed_model = self._gemini_model_long if _long else self._gemini_model_short
+            _routed_thinking = (getattr(self, "_gemini_thinking_long", None) if _long
+                                else getattr(self, "_gemini_thinking_short", None))
+            if (_routed_model, _routed_thinking) != (
+                    self.gemini_processor.model,
+                    getattr(self.gemini_processor, "thinking_level", None)):
                 self.logger.info(
-                    f"Model routing: {audio_duration / 60:.1f}min -> {_routed_model} "
-                    f"(was {self.gemini_processor.model})"
+                    f"Model routing: {billed_duration / 60:.1f}min -> {_routed_model} "
+                    f"(thinking={_routed_thinking})"
                 )
                 self.gemini_processor.model = _routed_model
+                self.gemini_processor.thinking_level = _routed_thinking
 
             diarization_segments = None
             diarization_cfg = self.config.get("diarization", {}) or {}
@@ -1437,11 +1581,23 @@ class TranscribeWatcher:
                 channel_vad.segments if (channel_vad and channel_admissible)
                 else None
             )
-            result = self.gemini_processor.process_audio(
-                mp3_path, known_attendees=known_attendees or None,
-                channel_segments=channel_segments,
-                diarization_segments=diarization_segments,
-            )
+            usage_mark = len(getattr(self.gemini_processor, "usage_log", None) or [])
+            try:
+                result = processor.process_audio(
+                    mp3_path, known_attendees=known_attendees or None,
+                    channel_segments=channel_segments,
+                    diarization_segments=diarization_segments,
+                )
+            except GeminiFatalError as e:
+                # A rotated key is the one fatal error a retry CAN fix.
+                if not self._reload_gemini_key():
+                    raise
+                self.logger.info(f"Retrying once with the reloaded key after: {e}")
+                result = processor.process_audio(
+                    mp3_path, known_attendees=known_attendees or None,
+                    channel_segments=channel_segments,
+                    diarization_segments=diarization_segments,
+                )
 
             processing_time = time.time() - start_time
             self.logger.info(f"Gemini processing complete in {processing_time:.1f}s")
@@ -1469,10 +1625,11 @@ class TranscribeWatcher:
             # fix for the silent-truncation and undeduped-overlap failure
             # modes, neither of which raises `result.error` above.
             result, validation, partial = self._validate_and_escalate(
-                analysis_file, mp3_path, audio_duration, result,
+                analysis_file, mp3_path, validation_duration, result,
                 known_attendees=known_attendees or None,
                 channel_segments=channel_segments,
                 diarization_segments=diarization_segments,
+                processor=processor,
             )
             if result is None:
                 # F1 junk guard: every ladder step produced no usable
@@ -1483,6 +1640,12 @@ class TranscribeWatcher:
                 return
             result.validation_report = validation.to_dict()
             result.partial = partial
+            if trim_plan is not None:
+                result.speech_trim = trim_plan.to_dict()
+            # Every billed call for this recording, including retries and
+            # escalation steps (thinking tokens are billed as output).
+            result.billed_usage = _summarize_usage(
+                (getattr(self.gemini_processor, "usage_log", None) or [])[usage_mark:])
             pre_attribution = copy.deepcopy(result.parsed_response)
             save_trial_stage(self.config, audio_file, "before_attribution",
                              pre_attribution, known_attendees=known_attendees,
@@ -1490,7 +1653,13 @@ class TranscribeWatcher:
 
             # Log some stats
             if result.input_tokens and result.output_tokens:
-                self.logger.info(f"Tokens - Input: {result.input_tokens}, Output: {result.output_tokens}")
+                self.logger.info(
+                    f"Tokens - Input: {result.input_tokens}, Output: {result.output_tokens}, "
+                    f"Thinking: {result.thinking_tokens}; billed across "
+                    f"{result.billed_usage['calls']} call(s): "
+                    f"in {result.billed_usage['input_tokens']}, "
+                    f"out+thinking {result.billed_usage['output_tokens'] + result.billed_usage['thinking_tokens']}"
+                )
 
             # Step 4b: Speaker reconciliation safety net. Even with attendees
             # in the prompt, Gemini may still emit "Speaker A/B" for unclear
@@ -1624,6 +1793,10 @@ class TranscribeWatcher:
             # is ~550MB per offset recording in a temp dir nothing prunes, so
             # delete it on every exit path including failure.
             self._discard_aligned_copy(locals().get("analysis_file"), audio_file)
+            # The speech-only MP3 is likewise derived; the full MP3 stays.
+            _trimmed = locals().get("trimmed_mp3")
+            if _trimmed is not None:
+                Path(_trimmed).unlink(missing_ok=True)
 
     @staticmethod
     def _calendar_for_publication(result, inferred, verified):
@@ -1705,7 +1878,7 @@ class TranscribeWatcher:
             "started_at": "2025-01-01T00:00:00Z",
             "duration_seconds": 1800,
             "processing_time_seconds": 45.2,
-            "gemini_model": "gemini-2.5-flash",
+            "gemini_model": "<model>",
             "gemini_input_tokens": 57600,
             "gemini_output_tokens": 8500,
             "transcript_text": "Full transcript...",
@@ -2824,7 +2997,8 @@ class TranscribeWatcher:
                                 audio_duration: float, result,
                                 known_attendees: Optional[list[dict]],
                                 channel_segments: Optional[list],
-                                diarization_segments: Optional[list]):
+                                diarization_segments: Optional[list],
+                                processor=None):
         """Coverage/completeness gate + escalation ladder
         (docs/RELIABILITY_PLAN_2026-07.md Phase 1). Never store a
         failed-validation transcript as a clean success:
@@ -2847,7 +3021,13 @@ class TranscribeWatcher:
         Returns (result, validation, partial). `result` is the result to
         persist, or None if the junk guard fired (nothing should be
         persisted). `partial` is True iff `result` did not pass validation.
+
+        `processor` defaults to self.gemini_processor; for a speech-trimmed
+        recording it is the TimeMappedProcessor, so retries hear the same
+        trimmed audio and return original-time results. A GeminiFatalError
+        (bad key, permission, billing) is never retried here.
         """
+        processor = processor or self.gemini_processor
         self._last_live_fill = None
         validation = _validate_gemini_result(result, audio_duration)
         if validation.passed:
@@ -2862,9 +3042,9 @@ class TranscribeWatcher:
         )
         best_result, best_validation = result, validation
 
-        self.logger.info("Escalation: retrying fresh single-call on pro...")
+        self.logger.info("Escalation: retrying a fresh single call...")
         try:
-            retry_result = self.gemini_processor._process_single_shot(
+            retry_result = processor._process_single_shot(
                 mp3_path, None, audio_duration,
                 known_attendees=known_attendees,
                 channel_segments=channel_segments,
@@ -2881,13 +3061,15 @@ class TranscribeWatcher:
             )
             if retry_validation.coverage_pct > best_validation.coverage_pct:
                 best_result, best_validation = retry_result, retry_validation
+        except GeminiFatalError:
+            raise
         except Exception as e:
             self.logger.warning(f"Escalation: fresh single-call retry raised: {e}")
 
-        if audio_duration > self.gemini_processor.CHUNK_DURATION_SEC:
+        if audio_duration > processor.CHUNK_DURATION_SEC:
             self.logger.info("Escalation: trying drift-proof chunked mode...")
             try:
-                chunked_result = self.gemini_processor._process_chunked(
+                chunked_result = processor._process_chunked(
                     mp3_path, None, audio_duration,
                     known_attendees=known_attendees,
                     channel_segments=channel_segments,
@@ -2905,6 +3087,8 @@ class TranscribeWatcher:
                 )
                 if chunked_validation.coverage_pct > best_validation.coverage_pct:
                     best_result, best_validation = chunked_result, chunked_validation
+            except GeminiFatalError:
+                raise
             except Exception as e:
                 self.logger.warning(f"Escalation: chunked mode raised: {e}")
         else:
