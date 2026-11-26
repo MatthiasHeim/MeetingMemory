@@ -560,6 +560,71 @@ def compute_channel_vad(wav_path: Path,
         return None
 
 
+@dataclass
+class SpeechActivity:
+    """Per-window "is anyone speaking" for ANY channel layout.
+
+    Used by speech_trim to cut no-speech stretches before the paid Gemini
+    call. Unlike ChannelVAD it carries no host/remote split and applies no
+    topology gate: a mono or in-room recording needs trimming just as much.
+    """
+
+    window_sec: float
+    duration_sec: float
+    active: "object"  # np.ndarray[bool]
+    # Loudest channel's 95th-percentile window level (dBFS, speech band).
+    # The skip decision's second, independent witness: None = unknown.
+    p95_db: Optional[float] = None
+
+    @property
+    def speech_sec(self) -> float:
+        return float(self.active.sum()) * self.window_sec
+
+    @classmethod
+    def from_channel_vad(cls, vad: ChannelVAD) -> "SpeechActivity":
+        return cls(vad.window_sec, vad.duration_sec,
+                   vad.host_active | vad.remote_active)
+
+
+def compute_speech_activity(audio_path: Path,
+                            window_sec: float = WINDOW_SEC) -> Optional[SpeechActivity]:
+    """Speech activity from the same detector channel_vad uses.
+
+    Thresholds are relative to each channel's own noise floor (20th
+    percentile + 10 dB), never absolute dBFS: room tone, a loudnorm-lifted
+    MP3 or a quiet mic all sit at their own floor, and only speech rises
+    clearly above it. (Absolute silencedetect at -45 / -32 dB found nothing
+    on recordings that were 90 % room tone.) Channel 0 keeps channel_vad's
+    speech-anchored host threshold so breathing and key clicks don't count;
+    channels 1+ (system audio) use the plain floor threshold. A window is
+    active when any channel is. Returns None on decode failure.
+    """
+    audio_path = Path(audio_path)
+    try:
+        import numpy as np
+        channels = _channel_count(audio_path)
+        frames = _decode_bandpassed(audio_path, channels)
+        win_samples = int(window_sec * TARGET_SR)
+        if len(frames) < win_samples:
+            return None
+        host_db = _window_rms_db(frames[:, 0], win_samples)
+        p95 = float(np.percentile(host_db, 95))
+        if channels > 1:
+            remote_db = _window_rms_db(np.max(np.abs(frames[:, 1:]), axis=1), win_samples)
+            p95 = max(p95, float(np.percentile(remote_db, 95)))
+            remote_active = _activity(remote_db, _noise_floor_threshold(remote_db), "remote")
+            # Digitally silent system channels (in-room / mic-only capture)
+            # have a floor near -100 dB; ABS_MIN_THRESHOLD_DB keeps them off.
+        else:
+            remote_active = np.zeros(len(host_db), dtype=bool)
+        host_active = _activity(host_db, _host_threshold(host_db, remote_active), "host")
+        active = host_active | remote_active
+        return SpeechActivity(window_sec, len(active) * window_sec, active, p95_db=p95)
+    except Exception as e:
+        logger.warning(f"speech activity failed for {audio_path.name}: {e}")
+        return None
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.DEBUG)

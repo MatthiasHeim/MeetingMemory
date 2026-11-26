@@ -85,8 +85,14 @@ processing:
   mode: gemini   # whisper | gemini | both — gemini is the supported path
 
 gemini:
-  model: gemini-2.5-flash
+  model: gemini-3.8-flash        # see docs/model-eval-2026-11.md
+  thinking_level: low
+  model_long: gemini-3.8-flash   # meetings > long_duration_min
+  thinking_level_long: low
   api_key_env: GEMINI_API_KEY
+
+speech_trim:
+  enabled: true   # skip near-empty recordings, cut long no-speech stretches
 
 claude_trigger:
   enabled: true

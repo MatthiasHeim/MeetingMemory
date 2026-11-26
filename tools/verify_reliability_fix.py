@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone verification for docs/RELIABILITY_PLAN_2026-07.md Phases 1+3.
 
-Re-transcribes a real meeting MP3 through the FIXED pipeline (gemini-2.5-pro
-+ transcript_validator coverage gate + escalation ladder + drift-proof
+Re-transcribes a real meeting MP3 through the FIXED pipeline (the default
+transcription model, gemini_processor.DEFAULT_MODEL, + transcript_validator coverage gate + escalation ladder + drift-proof
 chunking) exactly as _process_with_gemini would, WITHOUT touching the live
 watcher, launchd, or config.yaml. Reuses TranscribeWatcher._validate_and_escalate
 directly (not a reimplementation) so this exercises the real code path.
@@ -100,10 +100,9 @@ def main() -> None:
     elif args.wav:
         print(f"WAV not found, proceeding without channel_vad: {args.wav}")
 
-    processor = GeminiAudioProcessor(api_key=api_key, model="gemini-2.5-pro",
-                                      max_output_tokens=32768)
+    processor = GeminiAudioProcessor(api_key=api_key, max_output_tokens=32768)
 
-    print("\nRunning initial process_audio() (gemini-2.5-pro)...")
+    print(f"\nRunning initial process_audio() ({processor.model})...")
     result = processor.process_audio(mp3_path, channel_segments=channel_segments)
     if result.error:
         print(f"Initial call errored: {result.error}")
