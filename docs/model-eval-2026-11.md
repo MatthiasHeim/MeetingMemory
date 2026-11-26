@@ -1,6 +1,6 @@
 # Transcription model eval, November 2026
 
-**Decision (2026-11-25):** `gemini-3.8-flash` with `thinking_level: low` for short and long meetings. It is the default in `tools/gemini_processor.py` (`DEFAULT_MODEL`, `DEFAULT_THINKING_LEVEL`), and the watcher refuses `gemini-2.5-pro` / `gemini-2.5-flash`. Status: **provisional**. The long-meeting runs were contaminated (see caveats), so the audio-judge pass and a clean re-run are still open and need the API spending cap raised first.
+**Decision (2026-11-25):** `gemini-3.8-flash` with `thinking_level: low` for short and long meetings. It is the default in `tools/gemini_processor.py` (`DEFAULT_MODEL`, `DEFAULT_THINKING_LEVEL`), and the watcher refuses `gemini-2.5-pro` / `gemini-2.5-flash`. Status: **confirmed on completeness, judge pending**. The clean re-run on 2026-11-26 did not change the ranking (see Results). Still open: the audio-judge pass and a 3.8 Flash low run on the 121-min meeting. Run them at the start of a billing month or after raising the spending cap, because the key is shared with the live watcher.
 
 ## Why this came up
 
@@ -38,19 +38,21 @@ The main metric is **words relative to production** (3.8 Flash, medium). The val
 
 Words relative to production. "ok" means final-valid after the ladder. 429 means the run was killed by the spending cap.
 
-| Candidate | 18 min | 60 min | 66 min | Verdict |
-|---|---|---|---|---|
-| **3.8 Flash, low** | 1.01 ok | 1.00 ok | 1.00 ok | complete everywhere; 0-600 thinking tokens per meeting |
-| 3.8 Flash, medium (production) | 1.02 ok | 0.89 ok | 429 | 4-8k thinking tokens per call |
-| 3.6 Flash, low | **0.86** ok | 0.99 ok | 0.98 ok | close, but dropped 14% on the short meeting |
-| 3.6 Flash, minimal | **0.41** ok | 0.99, duplicate span | 1.01 ok | condenses silently and passes the validator; rejected |
-| Gemini 4 Hydrogen, low | 0.96 ok | 1.02 ok | 429 | complete; ~2× the cost now, 10-11k thinking tokens on long meetings even at low |
-| 3.5 Flash-Lite, minimal | **0.00** | **0.00** | 0.98 ok | repetition loops: 86-148k output tokens of junk, paid in full; rejected |
-| 3.5 Flash-Lite, low | **0.12** | 429 | 0.87, chunk lost | rejected |
-| 3.5 transcribe | 0.74 | **0.00** (2 chunks disconnected) | **0.04** | 9 of 20 thirty-min requests "Server disconnected" (two runs), one silently near-empty with `status: completed`; text only (no analysis JSON, no names); needs google-genai ≥ 2 (Interactions API, production venv is 1.60). Rejected. |
-| 2.5 Pro (reference) | 1.00 ok | not run (collision) | not run | deprecated |
+| Candidate | 18 min | 60 min | 66 min | 121 min | Verdict |
+|---|---|---|---|---|---|
+| **3.8 Flash, low** | 1.01 ok | 1.00 ok | 1.00 ok | incomplete (API) | complete everywhere; 0-600 thinking tokens per meeting |
+| 3.8 Flash, medium (production) | 1.02 ok | 0.89 ok | not re-run | production = 1.00 | 4-8k thinking tokens per call |
+| 3.6 Flash, low | **0.86** ok | 0.99 ok | 0.98 ok | 1.01 ok | close, but dropped 14% on the short meeting |
+| 3.6 Flash, minimal | **0.41** ok | 0.99, duplicate span | 1.01 ok | - | condenses silently and passes the validator; rejected |
+| Gemini 4 Hydrogen, low | 0.96 ok | 0.98 ok (re-run) | 0.95 ok (re-run) | not run | complete but slightly shorter; $0.64-1.19 per meeting-hour now (15-23k thinking tokens per long meeting even at low), 2-4× 3.8 Flash |
+| 3.5 Flash-Lite, minimal | **0.00** | **0.00** | 0.98 ok | - | repetition loops: 86-148k output tokens of junk, paid in full; rejected |
+| 3.5 Flash-Lite, low | **0.12** | 429 | 0.87, chunk lost | - | rejected |
+| 3.5 transcribe | 0.74 | **0.00** (2 chunks disconnected) | **0.04** | - | 9 of 20 thirty-min requests "Server disconnected" (two runs), one silently near-empty with `status: completed`; text only (no analysis JSON, no names); needs google-genai ≥ 2 (Interactions API, production venv is 1.60). Rejected. |
+| 2.5 Pro (reference) | 1.00 ok | not run (collision) | not run | - | deprecated |
 
-The 121-min meeting did not complete for any model (spending cap).
+**Re-run 2026-11-26** (one process per recording, no chunk collisions): Hydrogen on the 60- and 66-min meetings, and 3.6 Flash low plus 3.8 Flash low on the 121-min meeting. Hydrogen and 3.6 low completed. The 3.8 Flash low run on the 121-min meeting did not: the API was unstable that morning (broken pipe, "Server disconnected", one 39-min read timeout, truncated JSON on chunk 4). The spending cap then throttled the project again after about $3.30 of re-run spend. The Hydrogen run on the 121-min meeting and the audio-judge pass were not run, to keep headroom for the live watcher.
+
+What the re-run changes: nothing in the decision. Hydrogen stays complete but costs 2-4× more now and is not more complete. 3.6 Flash low was complete on all three long meetings and is the runner-up at the same price, but it dropped 14% on the short meeting. 3.8 Flash has been the production model on the 121-min class since September (production transcript = 1.00), so the missing low run there is a gap in the evidence, not a known failure.
 
 ### Caveats
 
@@ -69,18 +71,18 @@ Production, November: 80 meetings, 53.5 h; about 100k input and 21k visible outp
 
 MeetingMemory costs roughly $4-6 a month. The model choice saves the thinking share, and likely some truncated-JSON retries, which were frequent (12 "Unterminated string" / "Expecting ','" retries on 18.-19.11. alone, each re-paying the full audio). The bigger lever is the 2027-01-01 doubling. The only cheaper model, 3.5 Flash-Lite, is not usable.
 
-## Open: finish the eval once the cap is raised
+## Open: audio judge and the 121-min low run
 
 ```bash
 R=~/.local/share/meetingmemory-model-eval/2026-11-25_eval
-# re-run only the missing or contaminated runs, one model per recording at a time
-rm $R/runs/*2026-11-05_17-01-23* $R/runs/*4-hydrogen* $R/runs/*3.8-flash__medium*
-venv/bin/python tools/model_eval.py run --run-dir $R --jobs 3 \
-  --stems 2026-11-04_17-01-10 2026-11-18_16-31-24 2026-11-05_17-01-23 \
-  --candidates gemini-3.8-flash:low gemini-4-hydrogen:low gemini-3.6-flash:low
+# one process per recording; stop at the first 429 (key is shared with the watcher)
+venv/bin/python tools/model_eval.py run --run-dir $R --jobs 1 \
+  --stems 2026-11-05_17-01-23 --candidates gemini-3.8-flash:low   # ~$0.40
 venv/bin/python tools/model_eval.py judge --run-dir $R --windows 5    # ~$1
 venv/bin/python tools/model_eval.py report --run-dir $R
 ```
+
+Runs that were contaminated or killed by the cap were moved to `$R/runs_removed_2026-11-26/`; the run script skips a candidate whose output file already exists.
 
 Re-check Hydrogen in December. From 2027-01-01 it costs the same as 3.8 Flash and is newer. It only wins if the judge rates it better, because its thinking tokens at low still add about 15-20% output cost.
 
