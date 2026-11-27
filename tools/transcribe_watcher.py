@@ -1813,8 +1813,11 @@ class TranscribeWatcher:
         """Fire-and-forget tools/speaker_review.py propose for this source.
 
         Stores sources.metadata.speaker_review (who each label probably is,
-        from the transcript and the CRM). Matthias confirms or corrects it in
-        the Brain Portal; confirming is what releases a held meeting.
+        from the transcript and the CRM). When the suggestion passes the
+        auto-confirm rule (speaker_review.AUTO_CONFIRM) on a held meeting it
+        is applied right there as `auto_confirmed` and the meeting is handed
+        to /meeting-actions; otherwise Matthias confirms or corrects it in the
+        Brain Portal, which is what releases a held meeting.
         """
         cfg = (getattr(self, "config", None) or {}).get("speaker_review", {}) or {}
         if source_id is None or not cfg.get("enabled", True):
