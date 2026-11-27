@@ -1,0 +1,326 @@
+{
+ "1572": {
+  "voice_match": {
+   "ran": true,
+   "ok": true,
+   "labels": {
+    "Andere": {
+     "segments": 14,
+     "seconds": 174.0,
+     "best": {
+      "name": "Matthias Heim",
+      "score": 0.677,
+      "role": "self"
+     },
+     "runner_up": {
+      "name": "Library Person A",
+      "score": 0.315,
+      "role": "other",
+      "crm_contact_id": 9069
+     },
+     "verdict": "possible",
+     "reason": "score_below_clear_threshold",
+     "margin": 0.362,
+     "segment_votes": {
+      "Matthias Heim": 3
+     }
+    },
+    "Ich": {
+     "segments": 14,
+     "seconds": 217.0,
+     "best": {
+      "name": "Matthias Heim",
+      "score": 0.841,
+      "role": "self"
+     },
+     "runner_up": {
+      "name": "Library Person A",
+      "score": 0.241,
+      "role": "other",
+      "crm_contact_id": 9069
+     },
+     "verdict": "clear",
+     "reason": null,
+     "margin": 0.6,
+     "segment_votes": {
+      "Matthias Heim": 7
+     }
+    },
+    "Lukas": {
+     "segments": 5,
+     "seconds": 51.0,
+     "best": {
+      "name": "Matthias Heim",
+      "score": 0.49,
+      "role": "self"
+     },
+     "runner_up": {
+      "name": "Library Person A",
+      "score": 0.337,
+      "role": "other",
+      "crm_contact_id": 9069
+     },
+     "verdict": "none",
+     "reason": "below_possible_threshold",
+     "margin": 0.154,
+     "segment_votes": {}
+    }
+   },
+   "host_check": {
+    "ran": true,
+    "reason": "host_voice_does_not_match_self_profile",
+    "segments_checked": 4,
+    "centroid_similarity": 0.19,
+    "suspicious": []
+   },
+   "conflicts": [
+    {
+     "type": "remote_label_matches_host",
+     "label": "Ich",
+     "score": 0.841
+    }
+   ],
+   "renames": []
+  },
+  "system_track_attribution": {
+   "ran": true,
+   "ok": true,
+   "windows": [
+    {
+     "index": 0,
+     "start": 0.0,
+     "end": 900.0,
+     "labels": {
+      "Andere": {
+       "role": "remote",
+       "remote_share": 0.835,
+       "scorable_sec": 632.0,
+       "turns": 20,
+       "class": "remote"
+      },
+      "Ich": {
+       "role": "remote",
+       "remote_share": 0.674,
+       "scorable_sec": 135.0,
+       "turns": 9,
+       "class": "remote"
+      }
+     },
+     "orientation": "undecided",
+     "swapped": false
+    },
+    {
+     "index": 1,
+     "start": 900.0,
+     "end": 1800.0,
+     "labels": {
+      "Andere": {
+       "role": "remote",
+       "remote_share": 0.882,
+       "scorable_sec": 640.0,
+       "turns": 36,
+       "class": "remote"
+      },
+      "Ich": {
+       "role": "remote",
+       "remote_share": 0.851,
+       "scorable_sec": 190.0,
+       "turns": 12,
+       "class": "remote"
+      }
+     },
+     "orientation": "undecided",
+     "swapped": false
+    },
+    {
+     "index": 2,
+     "start": 1800.0,
+     "end": null,
+     "labels": {
+      "Child": {
+       "role": "remote",
+       "remote_share": 0.5,
+       "scorable_sec": 5.0,
+       "turns": 1,
+       "class": "insufficient"
+      },
+      "Lukas": {
+       "role": "remote",
+       "remote_share": 0.813,
+       "scorable_sec": 111.0,
+       "turns": 12,
+       "class": "remote"
+      },
+      "Matthias": {
+       "role": "host",
+       "remote_share": 0.211,
+       "scorable_sec": 109.0,
+       "turns": 4,
+       "class": "host"
+      }
+     },
+     "orientation": "consistent",
+     "swapped": false
+    }
+   ]
+  }
+ },
+ "1587": {
+  "voice_match": {
+   "ran": true,
+   "ok": true,
+   "labels": {
+    "Speaker 1": {
+     "segments": 14,
+     "seconds": 102.0,
+     "best": {
+      "name": "Library Person A",
+      "score": 0.381,
+      "role": "other",
+      "crm_contact_id": 9069
+     },
+     "runner_up": {
+      "name": "Matthias Heim",
+      "score": 0.319,
+      "role": "self"
+     },
+     "verdict": "none",
+     "reason": "below_possible_threshold",
+     "margin": 0.062,
+     "segment_votes": {}
+    }
+   },
+   "host_check": {
+    "ran": true,
+    "reason": null,
+    "segments_checked": 13,
+    "centroid_similarity": 0.887,
+    "suspicious": []
+   },
+   "conflicts": [],
+   "renames": []
+  },
+  "system_track_attribution": {
+   "ran": true,
+   "ok": true,
+   "windows": [
+    {
+     "index": 0,
+     "start": 0.0,
+     "end": null,
+     "labels": {
+      "Matthias": {
+       "role": "host",
+       "remote_share": 0.08,
+       "scorable_sec": 363.0,
+       "turns": 27,
+       "class": "host"
+      },
+      "Speaker 1": {
+       "role": "remote",
+       "remote_share": 0.869,
+       "scorable_sec": 256.0,
+       "turns": 33,
+       "class": "remote"
+      }
+     },
+     "orientation": "consistent",
+     "swapped": false
+    }
+   ]
+  }
+ },
+ "1583": {
+  "voice_match": {
+   "ran": true,
+   "ok": true,
+   "labels": {
+    "Marc": {
+     "segments": 1,
+     "seconds": 25.0,
+     "best": {
+      "name": "Library Person B",
+      "score": 0.18,
+      "role": "other",
+      "crm_contact_id": 9080
+     },
+     "runner_up": {
+      "name": "Matthias Heim",
+      "score": 0.152,
+      "role": "self"
+     },
+     "verdict": "none",
+     "reason": "below_possible_threshold",
+     "margin": 0.028,
+     "segment_votes": {}
+    }
+   },
+   "host_check": {
+    "ran": false,
+    "reason": "no_host_segments",
+    "segments_checked": 0,
+    "centroid_similarity": null,
+    "suspicious": []
+   },
+   "conflicts": [],
+   "renames": []
+  },
+  "system_track_attribution": {
+   "ran": false,
+   "ok": false,
+   "windows": []
+  },
+  "calendar_search": {
+   "match_count": 1,
+   "chosen_event_id": "evt-1583",
+   "identity_authoritative": true,
+   "ambiguous": false,
+   "candidates": [
+    {
+     "event_id": "evt-1583",
+     "title": "Ask Matthias (Lailix)",
+     "start": "2026-11-26T16:00:00+08:00",
+     "attendees": [
+      {
+       "name": "Matthias Heim",
+       "email": "matthias@lailix.com",
+       "company": "Lailix",
+       "role": "self"
+      },
+      {
+       "name": "Muster, Robert",
+       "email": "robert.muster@example-group.test",
+       "company": null,
+       "role": "participant"
+      },
+      {
+       "name": "Keller, Marc",
+       "email": "marc.keller@example-group.test",
+       "company": null,
+       "role": "participant"
+      },
+      {
+       "name": "Graf, Lukas",
+       "email": "lukas.graf@example-group.test",
+       "company": null,
+       "role": "participant"
+      },
+      {
+       "name": "Frei, Alex",
+       "email": "alex.frei@example-group.test",
+       "company": null,
+       "role": "participant"
+      },
+      {
+       "name": "Huber, Karsten",
+       "email": "karsten.huber@example-group.test",
+       "company": null,
+       "role": "participant"
+      }
+     ],
+     "company": null
+    }
+   ]
+  }
+ }
+}
